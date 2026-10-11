@@ -11,28 +11,46 @@
   "historical_plan_note": "Dated specifications and execution plans retain their original scope; current implementation and qualification boundaries are in the bundle research/STATUS.md. Links to included research point to the compact bundle; links to unpublished local sources or historical evidence are rendered as source paths, with transformations recorded per file.",
   "files": [
     {
+      "source": "deliverables/checkpoint-patches-research-20261010.zip",
+      "published": "deliverables/checkpoint-patches-research-20261010.zip",
+      "source_sha256": "e11dde037137772e1ade96ef946986495e2351aafd2cb4fae5e10d391758e6a9",
+      "sha256": "e11dde037137772e1ade96ef946986495e2351aafd2cb4fae5e10d391758e6a9"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010.zip.sha256",
+      "published": "deliverables/checkpoint-patches-research-20261010.zip.sha256",
+      "source_sha256": "dcf5b871c7d68d13b033cf766b8db45e0ce5cd0508771363df7be30cf112ae0e",
+      "sha256": "dcf5b871c7d68d13b033cf766b8db45e0ce5cd0508771363df7be30cf112ae0e"
+    },
+    {
       "source": "deliverables/checkpoint-patches-research-20261010/APPLY.md",
       "published": "deliverables/checkpoint-patches-research-20261010/APPLY.md",
-      "source_sha256": "16e60fc8f70b8e8f3b5e8423c80aeffb6cfb06915dc412dabc83b9c367ad6bfe",
-      "sha256": "16e60fc8f70b8e8f3b5e8423c80aeffb6cfb06915dc412dabc83b9c367ad6bfe"
+      "source_sha256": "74d6e7305ec9a6397204a9553e7bf5d4aa2a9fea74ec8b48bae5fb58cc626519",
+      "sha256": "74d6e7305ec9a6397204a9553e7bf5d4aa2a9fea74ec8b48bae5fb58cc626519"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/DRIVER_DEVELOPMENT.md",
+      "published": "deliverables/checkpoint-patches-research-20261010/DRIVER_DEVELOPMENT.md",
+      "source_sha256": "9e13911cc1068ad6a712b5f2cb100646f004b583d0927851e3b7736b98e9bc07",
+      "sha256": "9e13911cc1068ad6a712b5f2cb100646f004b583d0927851e3b7736b98e9bc07"
     },
     {
       "source": "deliverables/checkpoint-patches-research-20261010/MANIFEST.json",
       "published": "deliverables/checkpoint-patches-research-20261010/MANIFEST.json",
-      "source_sha256": "0ea0c6abbba119f279118e892a7165b9d489e650a2a4b84794d617a9d4fe489c",
-      "sha256": "0ea0c6abbba119f279118e892a7165b9d489e650a2a4b84794d617a9d4fe489c"
+      "source_sha256": "679a5b065b47ed49d45966c048df3889c1e96eb8dab28e2a918342d8446c485f",
+      "sha256": "679a5b065b47ed49d45966c048df3889c1e96eb8dab28e2a918342d8446c485f"
     },
     {
       "source": "deliverables/checkpoint-patches-research-20261010/README.md",
       "published": "deliverables/checkpoint-patches-research-20261010/README.md",
-      "source_sha256": "b30af43cb33d9784e030c68a7a89dcca63ff8d1d50e1a7d7f5c776ee326d2e41",
-      "sha256": "b30af43cb33d9784e030c68a7a89dcca63ff8d1d50e1a7d7f5c776ee326d2e41"
+      "source_sha256": "e28fb91d063b4ec17adb0062abefe3c0185da0f9f4b70de09142df525ead3895",
+      "sha256": "e28fb91d063b4ec17adb0062abefe3c0185da0f9f4b70de09142df525ead3895"
     },
     {
       "source": "deliverables/checkpoint-patches-research-20261010/SHA256SUMS",
       "published": "deliverables/checkpoint-patches-research-20261010/SHA256SUMS",
-      "source_sha256": "381c126611cf9a7cfbd30dd92f7970d652d0c435d83862c57a311a6e92ac4a33",
-      "sha256": "381c126611cf9a7cfbd30dd92f7970d652d0c435d83862c57a311a6e92ac4a33"
+      "source_sha256": "69df6263bc24150fce174c5a82b06713c76dc0c42fd0066cd2c401e90e622c3f",
+      "sha256": "69df6263bc24150fce174c5a82b06713c76dc0c42fd0066cd2c401e90e622c3f"
     },
     {
       "source": "deliverables/checkpoint-patches-research-20261010/VERIFICATION.json",
@@ -361,8 +379,8 @@
     {
       "source": "deliverables/checkpoint-patches-research-20261010/research/STATUS.md",
       "published": "deliverables/checkpoint-patches-research-20261010/research/STATUS.md",
-      "source_sha256": "392af86ab71e89a8ea29ea1fe5785e3a6dbf9f1f83762c9f70de7cd6d863e46b",
-      "sha256": "392af86ab71e89a8ea29ea1fe5785e3a6dbf9f1f83762c9f70de7cd6d863e46b"
+      "source_sha256": "afb45fb1408ce924d936a191b1f8f2bf64a3a9820268a46cb8b90c11c33694ac",
+      "sha256": "afb45fb1408ce924d936a191b1f8f2bf64a3a9820268a46cb8b90c11c33694ac"
     },
     {
       "source": "deliverables/checkpoint-patches-research-20261010/research/openstack_ram_checkpoint_dorado_tatlin_conclusion.md",
@@ -381,6 +399,12 @@
       "published": "deliverables/checkpoint-patches-research-20261010/research/validation-summary.json",
       "source_sha256": "f5e85bdbed6999408c5f5658ef7232b63417b4426986af9eaa3cb6c71ab7339b",
       "sha256": "f5e85bdbed6999408c5f5658ef7232b63417b4426986af9eaa3cb6c71ab7339b"
+    },
+    {
+      "source": "docs/driver-development.md",
+      "published": "docs/driver-development.md",
+      "source_sha256": "1ed5da878b4c8cbadcb3c231bc09484cad8d0361548710a516d070ec9c6e08d3",
+      "sha256": "1ed5da878b4c8cbadcb3c231bc09484cad8d0361548710a516d070ec9c6e08d3"
     },
     {
       "source": "docs/superpowers/plans/2026-10-06-cinder-checkpoint-contract.md",
@@ -753,18 +777,13 @@
           "published_target": "../../../deliverables/checkpoint-patches-research-20261010/research/2026-10-08-dorado-without-hardware.evidence.json"
         }
       ]
-    },
-    {
-      "source": "deliverables/checkpoint-patches-research-20261010.zip",
-      "published": "deliverables/checkpoint-patches-research-20261010.zip",
-      "source_sha256": "7dd39a46a560eb57354bd07760f764ad1a836a0a14a0c14b8333e9359565899b",
-      "sha256": "7dd39a46a560eb57354bd07760f764ad1a836a0a14a0c14b8333e9359565899b"
-    },
-    {
-      "source": "deliverables/checkpoint-patches-research-20261010.zip.sha256",
-      "published": "deliverables/checkpoint-patches-research-20261010.zip.sha256",
-      "source_sha256": "d8974f303e7c2a8df0d975fc619f80760460530f8e7cc22aa4bc937c584feaca",
-      "sha256": "d8974f303e7c2a8df0d975fc619f80760460530f8e7cc22aa4bc937c584feaca"
     }
-  ]
+  ],
+  "documentation_update": {
+    "date": "2026-10-11",
+    "guide": "docs/driver-development.md",
+    "guide_in_bundle": "deliverables/checkpoint-patches-research-20261010/DRIVER_DEVELOPMENT.md",
+    "product_patches_changed": false,
+    "new_runtime_run": false
+  }
 }

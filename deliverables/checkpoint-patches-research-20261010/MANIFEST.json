@@ -335,14 +335,22 @@
       "external_source_links_rendered_as_paths": [
         "../../work/cinder-checkpoint-continuation/cinder/checkpoints/continuation_manager.py"
       ]
+    },
+    {
+      "original": "docs/driver-development.md",
+      "original_sha256": "1ed5da878b4c8cbadcb3c231bc09484cad8d0361548710a516d070ec9c6e08d3",
+      "packaged": "DRIVER_DEVELOPMENT.md",
+      "packaged_sha256": "9e13911cc1068ad6a712b5f2cb100646f004b583d0927851e3b7736b98e9bc07",
+      "external_source_links_rendered_as_paths": [],
+      "document_links_rebased": true
     }
   ],
   "patch_bytes": 2221920,
   "note": "Original product patches preserved. Three existing Nova amendment messages split without byte changes. Historical tests are not rerun.",
   "documentation_update": {
     "date": "2026-10-11",
-    "scope": "existing_vendor_drivers_and_missing_checkpoint_overrides",
-    "note": "Huawei and YADRO TATLIN drivers are already included in cinder-pvs.zip. The next step is extending existing drivers to implement the checkpoint contract. Product patches and historical verification results are unchanged.",
+    "scope": "existing_drivers_and_detailed_checkpoint_driver_development_guide",
+    "note": "Clarified existing Huawei/TATLIN drivers and added a source-based development guide: vendor documentation, hooks, recovery, local tests and separate hardware qualification. Product patches and historical verification results are unchanged.",
     "product_patches_changed": false,
     "new_runtime_run": false,
     "new_tests_run": false
