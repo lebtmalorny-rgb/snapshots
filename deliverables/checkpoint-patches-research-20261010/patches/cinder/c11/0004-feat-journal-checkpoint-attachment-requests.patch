@@ -1,0 +1,1115 @@
+From d5670843b84cf3bb9198dcdefc83e2bff463cb39 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 16:29:59 +0300
+Subject: [PATCH 4/7] feat: journal checkpoint attachment requests
+
+---
+ cinder/api/schemas/checkpoint_continuation.py |  31 +++
+ cinder/api/v3/checkpoint_continuation.py      |  17 ++
+ cinder/api/v3/router.py                       |   4 +
+ cinder/checkpoints/attachment_intents.py      |  43 +++
+ cinder/checkpoints/continuation_api.py        |  35 +++
+ cinder/db/api.py                              |  22 ++
+ ...082e1_add_checkpoint_attachment_intents.py |  48 ++++
+ cinder/db/sqlalchemy/api.py                   |  30 +++
+ .../db/sqlalchemy/checkpoint_continuation.py  | 227 ++++++++++++++++
+ cinder/db/sqlalchemy/checkpoints.py           |   3 +-
+ cinder/db/sqlalchemy/models.py                |  24 ++
+ cinder/objects/base.py                        |   2 +
+ cinder/objects/checkpoint_continuation.py     |  33 +++
+ .../api/v3/test_checkpoint_continuation.py    |  88 +++++++
+ .../checkpoints/test_attachment_intents.py    | 246 ++++++++++++++++++
+ .../unit/checkpoints/test_continuation_db.py  |   4 +-
+ cinder/tests/unit/db/test_migrations.py       |  10 +
+ cinder/tests/unit/objects/test_objects.py     |   2 +
+ 18 files changed, 867 insertions(+), 2 deletions(-)
+ create mode 100644 cinder/checkpoints/attachment_intents.py
+ create mode 100644 cinder/db/migrations/versions/95b6d7f082e1_add_checkpoint_attachment_intents.py
+ create mode 100644 cinder/tests/unit/checkpoints/test_attachment_intents.py
+
+diff --git a/cinder/api/schemas/checkpoint_continuation.py b/cinder/api/schemas/checkpoint_continuation.py
+index 4f58e8f..6ca873e 100644
+--- a/cinder/api/schemas/checkpoint_continuation.py
++++ b/cinder/api/schemas/checkpoint_continuation.py
+@@ -16,6 +16,7 @@ import copy
+ 
+ from cinder.api.schemas import checkpoints
+ from cinder.api.validation import parameter_types
++from cinder.checkpoints import continuation_contracts as contracts
+ 
+ 
+ payload = copy.deepcopy(checkpoints.payload)
+@@ -30,3 +31,33 @@ payload['dependencies'] = {
+ create = copy.deepcopy(checkpoints.create)
+ create['properties']['checkpoint_operation'] = payload
+ action = copy.deepcopy(checkpoints.action)
++
++_text = {'type': 'string', 'minLength': 1, 'maxLength': 255}
++_connector_properties = {
++    key: _text for key in (
++        'host', 'ip', 'initiator', 'platform', 'os_type',
++        'nqn', 'uuid', 'system uuid')}
++_connector_properties.update({key: {'type': 'boolean'} for key in (
++    'multipath', 'enforce_multipath', 'nvme_native_multipath')})
++_connector_properties.update({key: {
++    'type': 'array', 'items': _text, 'minItems': 1, 'maxItems': 64,
++    'uniqueItems': True} for key in ('wwpns', 'wwnns')})
++_attachment_properties = {
++    'id': parameter_types.uuid,
++    'generation': {'type': 'integer', 'minimum': 1, 'maximum': 1},
++    'volume_id': parameter_types.uuid,
++    'action': {'enum': list(contracts.ACTIONS)},
++    'attachment_id': {'anyOf': [parameter_types.uuid, {'type': 'null'}]},
++    'connector': {'type': ['object', 'null'],
++                  'properties': _connector_properties,
++                  'additionalProperties': False},
++    'mountpoint': {'anyOf': [_text, {'type': 'null'}]},
++}
++attachment = {
++    'type': 'object', 'additionalProperties': False,
++    'required': ['attachment_request'],
++    'properties': {'attachment_request': {
++        'type': 'object', 'properties': _attachment_properties,
++        'required': list(_attachment_properties),
++        'additionalProperties': False}},
++}
+diff --git a/cinder/api/v3/checkpoint_continuation.py b/cinder/api/v3/checkpoint_continuation.py
+index 3db7537..ce8be68 100644
+--- a/cinder/api/v3/checkpoint_continuation.py
++++ b/cinder/api/v3/checkpoint_continuation.py
+@@ -44,6 +44,23 @@ class CheckpointContinuationController(wsgi.Controller):
+         return {'checkpoint_capabilities': self.api.capabilities(
+             req.environ['cinder.context'], id, volume_id)}
+ 
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTINUATION)
++    @wsgi.response(HTTPStatus.ACCEPTED)
++    @validation.schema(schema.attachment)
++    def submit_attachment(self, req, id, body):
++        return {'attachment_request': self.api.submit_attachment(
++            req.environ['cinder.context'], id, body)}
++
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTINUATION)
++    def attachment_request(self, req, id, child_id):
++        return {'attachment_request': self.api.get_attachment_request(
++            req.environ['cinder.context'], id, child_id)}
++
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTINUATION)
++    def attachment(self, req, id, attachment_id):
++        return {'attachment': self.api.get_attachment(
++            req.environ['cinder.context'], id, attachment_id)}
++
+ 
+ def create_resource():
+     return wsgi.Resource(CheckpointContinuationController())
+diff --git a/cinder/api/v3/router.py b/cinder/api/v3/router.py
+index ac0487f..da09092 100644
+--- a/cinder/api/v3/router.py
++++ b/cinder/api/v3/router.py
+@@ -75,6 +75,10 @@ class APIRouter(cinder.api.openstack.APIRouter):
+         for prefix in ['/{project_id}', '']:
+             for suffix, action, method in (
+                     ('', 'show', 'GET'), ('/action', 'operate', 'POST'),
++                    ('/attachment-requests', 'submit_attachment', 'POST'),
++                    ('/attachment-requests/{child_id}',
++                     'attachment_request', 'GET'),
++                    ('/attachments/{attachment_id}', 'attachment', 'GET'),
+                     ('/volumes/{volume_id}/capabilities',
+                      'capabilities', 'GET')):
+                 mapper.connect(
+diff --git a/cinder/checkpoints/attachment_intents.py b/cinder/checkpoints/attachment_intents.py
+new file mode 100644
+index 0000000..6c8f392
+--- /dev/null
++++ b/cinder/checkpoints/attachment_intents.py
+@@ -0,0 +1,43 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Durable attachment intent submission, separated from backend dispatch."""
++
++import json
++
++from cinder.checkpoints import continuation_contracts as contracts
++from cinder import db
++
++
++class AttachmentIntents:
++    def submit(self, context, scope, request):
++        return contracts.AttachmentResult.from_primitive(
++            db.checkpoint_attachment_intent_prepare(
++                context, scope.to_primitive(), request.to_primitive()))
++
++    def get(self, context, scope, child_id):
++        return contracts.AttachmentResult.from_primitive(
++            db.checkpoint_attachment_intent_get(
++                context, scope.to_primitive(), child_id))
++
++    def get_attachment(self, context, scope, attachment_id):
++        row = db.checkpoint_continuation_attachment(
++            context, scope.to_primitive(), attachment_id)
++        # Match the stock Cinder attachment detail names without constructing
++        # VolumeAttachment OVO, whose loader may run an online data migration.
++        return dict(id=row['id'], volume_id=row['volume_id'],
++                    instance=row['instance_uuid'], status=row['attach_status'],
++                    attach_mode=row['attach_mode'],
++                    attached_at=row['attach_time'],
++                    detached_at=row['detach_time'],
++                    connection_info=json.loads(row['connection_info'])
++                    if row['connection_info'] else None)
+diff --git a/cinder/checkpoints/continuation_api.py b/cinder/checkpoints/continuation_api.py
+index a304f30..593a9d6 100644
+--- a/cinder/checkpoints/continuation_api.py
++++ b/cinder/checkpoints/continuation_api.py
+@@ -15,6 +15,7 @@
+ from cinder.api.schemas import checkpoint_continuation as schema
+ from cinder.api.v3.views import checkpoints as views
+ from cinder.api.validation import validators
++from cinder.checkpoints import attachment_intents
+ from cinder.checkpoints import continuation
+ from cinder.checkpoints import continuation_contracts
+ from cinder.checkpoints import contracts
+@@ -82,3 +83,37 @@ class ContinuationAPI:
+         except exception.CheckpointNotSupported:
+             return contracts.unsupported_capabilities(
+                 'unverified_capabilities')
++
++    @staticmethod
++    def _attachment_result(result):
++        result = result.to_primitive()
++        result.pop('schema_version')
++        return result
++
++    def submit_attachment(self, context, nova_operation_id, body):
++        validators._SchemaValidator(schema.attachment).validate(body)
++        try:
++            request = continuation_contracts.validate_attachment(
++                body['attachment_request'])
++        except ValueError:
++            raise exception.InvalidInput(
++                reason='invalid_checkpoint_attachment_request') from None
++        scope = continuation.authorize(
++            context, _id(nova_operation_id), request.generation, 'attachment',
++            request.volume_id)
++        return self._attachment_result(
++            attachment_intents.AttachmentIntents().submit(
++                context, scope, request))
++
++    def get_attachment_request(self, context, nova_operation_id, child_id):
++        scope = continuation.authorize(context, _id(nova_operation_id), 1,
++                                       'read')
++        return self._attachment_result(
++            attachment_intents.AttachmentIntents().get(
++                context, scope, _id(child_id)))
++
++    def get_attachment(self, context, nova_operation_id, attachment_id):
++        scope = continuation.authorize(context, _id(nova_operation_id), 1,
++                                       'attachment')
++        return attachment_intents.AttachmentIntents().get_attachment(
++            context, scope, _id(attachment_id))
+diff --git a/cinder/db/api.py b/cinder/db/api.py
+index 3bf27f2..cc50f2f 100644
+--- a/cinder/db/api.py
++++ b/cinder/db/api.py
+@@ -2023,6 +2023,28 @@ def checkpoint_continuation_transition(context, nova_operation_id, generation,
+         context, nova_operation_id, generation, action, outcome)
+ 
+ 
++def checkpoint_attachment_intent_prepare(context, scope, request):
++    return IMPL.checkpoint_attachment_intent_prepare(context, scope, request)
++
++
++def checkpoint_attachment_intent_get(context, scope, child_id):
++    return IMPL.checkpoint_attachment_intent_get(context, scope, child_id)
++
++
++def checkpoint_attachment_intent_claim(context, child_id, executor_id):
++    return IMPL.checkpoint_attachment_intent_claim(
++        context, child_id, executor_id)
++
++
++def checkpoint_attachment_intent_finish(context, child_id, result):
++    return IMPL.checkpoint_attachment_intent_finish(context, child_id, result)
++
++
++def checkpoint_continuation_attachment(context, scope, attachment_id):
++    return IMPL.checkpoint_continuation_attachment(
++        context, scope, attachment_id)
++
++
+ def checkpoint_get(context, operation_id):
+     return IMPL.checkpoint_get(context, operation_id)
+ 
+diff --git a/cinder/db/migrations/versions/95b6d7f082e1_add_checkpoint_attachment_intents.py b/cinder/db/migrations/versions/95b6d7f082e1_add_checkpoint_attachment_intents.py
+new file mode 100644
+index 0000000..76ee1b7
+--- /dev/null
++++ b/cinder/db/migrations/versions/95b6d7f082e1_add_checkpoint_attachment_intents.py
+@@ -0,0 +1,48 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Journal one attachment cycle per delegated revert operation."""
++
++from alembic import op
++import sqlalchemy as sa
++
++revision = '95b6d7f082e1'
++down_revision = '83d4e2a671c0'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    op.create_table(
++        'checkpoint_attachment_intents',
++        sa.Column('id', sa.String(36), primary_key=True, nullable=False),
++        sa.Column('operation_id', sa.String(36), sa.ForeignKey(
++            'checkpoint_operations.id'), nullable=False),
++        sa.Column('generation', sa.Integer, nullable=False),
++        sa.Column('volume_id', sa.String(36), nullable=False),
++        sa.Column('action', sa.String(16), nullable=False),
++        sa.Column('request_hash', sa.String(64), nullable=False),
++        sa.Column('target_attachment_id', sa.String(36)),
++        sa.Column('result_attachment_id', sa.String(36)),
++        sa.Column('connector_json', sa.Text),
++        sa.Column('mountpoint', sa.String(255)),
++        sa.Column('executor_id', sa.String(255)),
++        sa.Column('status', sa.String(32), nullable=False),
++        sa.Column('error_code', sa.String(64)),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        sa.Column('deleted_at', sa.DateTime),
++        sa.Column('deleted', sa.Boolean, default=False),
++        sa.UniqueConstraint(
++            'operation_id', 'generation', 'volume_id', 'action',
++                            name='checkpoint_attachment_cycle_uc'),
++        mysql_engine='InnoDB')
+diff --git a/cinder/db/sqlalchemy/api.py b/cinder/db/sqlalchemy/api.py
+index 414d148..4935db6 100644
+--- a/cinder/db/sqlalchemy/api.py
++++ b/cinder/db/sqlalchemy/api.py
+@@ -1939,6 +1939,11 @@ def reservation_expire(context):
+ @main_context_manager.writer
+ def volume_attach(context, values):
+     _checkpoint_guards().guard_attachment_create(context, values)
++    return _attachment_insert(context, values)
++
++
++def _attachment_insert(context, values):
++    """Insert after the caller has authorized and locked the parent volume."""
+     volume_attachment_ref = models.VolumeAttachment()
+     if not values.get('id'):
+         values['id'] = str(uuid.uuid4())
+@@ -8778,6 +8783,31 @@ def checkpoint_continuation_transition(context, nova_operation_id, generation,
+         context, nova_operation_id, generation, action, outcome)
+ 
+ 
++def checkpoint_attachment_intent_prepare(context, scope, request):
++    from cinder.db.sqlalchemy import checkpoint_continuation as continuation
++    return continuation.attachment_prepare(context, scope, request)
++
++
++def checkpoint_attachment_intent_get(context, scope, child_id):
++    from cinder.db.sqlalchemy import checkpoint_continuation as continuation
++    return continuation.attachment_get(context, scope, child_id)
++
++
++def checkpoint_attachment_intent_claim(context, child_id, executor_id):
++    from cinder.db.sqlalchemy import checkpoint_continuation as continuation
++    return continuation.attachment_claim(context, child_id, executor_id)
++
++
++def checkpoint_attachment_intent_finish(context, child_id, result):
++    from cinder.db.sqlalchemy import checkpoint_continuation as continuation
++    return continuation.attachment_finish(context, child_id, result)
++
++
++def checkpoint_continuation_attachment(context, scope, attachment_id):
++    from cinder.db.sqlalchemy import checkpoint_continuation as continuation
++    return continuation.current_attachment(context, scope, attachment_id)
++
++
+ def checkpoint_get(context, operation_id):
+     from cinder.db.sqlalchemy import checkpoints
+     return checkpoints.get(context, operation_id)
+diff --git a/cinder/db/sqlalchemy/checkpoint_continuation.py b/cinder/db/sqlalchemy/checkpoint_continuation.py
+index ad9794f..33ce102 100644
+--- a/cinder/db/sqlalchemy/checkpoint_continuation.py
++++ b/cinder/db/sqlalchemy/checkpoint_continuation.py
+@@ -14,6 +14,7 @@
+ 
+ import json
+ 
++from oslo_db import api as oslo_db_api
+ from oslo_utils import uuidutils
+ 
+ from cinder.checkpoints import continuation
+@@ -207,3 +208,229 @@ def transition(context, nova_operation_id, generation, action, outcome=None):
+         project_id=authorized.owner_project_id).one()
+     return journal._release(context, operation, instance,
+                             _volumes(context, authorized), outcome)
++
++
++def _checked_scope(context, primitive, action='attachment'):
++    supplied = contracts.ContinuationScope.from_primitive(primitive)
++    current = _scope(context, supplied.nova_operation_id,
++                     supplied.generation, action)
++    if supplied != current:
++        raise exception.CheckpointOperationNotFound()
++    return current
++
++
++def _intent(context, scope, child_id):
++    row = journal._current(journal._query(
++        context, models.CheckpointAttachmentIntent).filter_by(
++            id=child_id, operation_id=scope.operation_id,
++            generation=scope.generation)).first()
++    if row is None or row.volume_id not in scope.volume_ids:
++        raise exception.CheckpointOperationNotFound()
++    return row
++
++
++def _result(row):
++    return contracts.AttachmentResult(
++        id=row.id, operation_id=row.operation_id, generation=row.generation,
++        volume_id=row.volume_id, action=row.action, status=row.status,
++        attachment_id=row.result_attachment_id or row.target_attachment_id,
++        error_code=row.error_code).to_primitive()
++
++
++def _cycle(context, scope, volume_id, action):
++    return journal._query(
++        context, models.CheckpointAttachmentIntent).filter_by(
++        operation_id=scope.operation_id, generation=scope.generation,
++        volume_id=volume_id, action=action).first()
++
++
++def _attachment_scope(context, scope, volume_id, action, attachment_id=None):
++    if scope.kind != 'revert' or volume_id not in scope.volume_ids:
++        raise exception.CheckpointOperationNotFound()
++    steps = journal._steps(context, scope.operation_id)
++    if steps and all(step.status == 'prepared' for step in steps):
++        stage = 'disconnect'
++    elif steps and all(step.status == 'succeeded' for step in steps):
++        stage = 'reconnect'
++    else:
++        journal._conflict('attachment_phase_not_ready')
++    expected = ('disconnect' if action == 'delete' else 'reconnect')
++    if action != 'read' and stage != expected:
++        journal._conflict('attachment_phase_not_ready')
++    volume = journal._query(context, models.Volume).filter_by(
++        id=volume_id, project_id=scope.owner_project_id).one()
++    if action == 'create':
++        if volume.status != 'available' or journal._attachments(
++                context, volume_id):
++            journal._conflict('attachment_conflict')
++        return volume, None
++    row = journal._current(journal._query(
++        context, models.VolumeAttachment).filter_by(
++            id=attachment_id, volume_id=volume_id,
++            instance_uuid=scope.instance_uuid)).first()
++    if row is None:
++        raise exception.CheckpointOperationNotFound()
++    if stage == 'disconnect':
++        resource = next(resource for resource in journal._resources(
++            context, scope.checkpoint_id) if resource.volume_id == volume_id)
++        step = next(step for step in steps if step.resource_id == resource.id)
++        if row.id not in json.loads(step.original_attachment_ids_json):
++            raise exception.CheckpointOperationNotFound()
++    else:
++        created = _cycle(context, scope, volume_id, 'create')
++        if (created is None or created.status != 'succeeded' or
++                created.result_attachment_id != row.id):
++            raise exception.CheckpointOperationNotFound()
++    return volume, row
++
++
++@api.require_context
++@oslo_db_api.wrap_db_retry(
++    max_retries=5, retry_on_deadlock=True, exception_checker=api._is_duplicate)
++@api.main_context_manager.writer
++def attachment_prepare(context, scope, request):
++    scope = _checked_scope(context, scope)
++    request = contracts.AttachmentRequest.from_primitive(request)
++    if (request.generation != scope.generation or
++            request.volume_id not in scope.volume_ids):
++        raise exception.CheckpointOperationNotFound()
++    payload_hash = contracts.body_hash(request.to_primitive())
++    previous = journal._current(journal._query(
++        context, models.CheckpointAttachmentIntent).filter_by(
++            id=request.id)).first()
++    if previous is not None:
++        if previous.operation_id != scope.operation_id:
++            raise exception.CheckpointOperationNotFound()
++        if previous.request_hash != payload_hash:
++            journal._conflict('request_payload_changed')
++        return _result(previous)
++    if _cycle(context, scope, request.volume_id, request.action) is not None:
++        journal._conflict('attachment_action_already_registered')
++    volume, attachment = _attachment_scope(
++        context, scope, request.volume_id, request.action,
++        request.attachment_id)
++    if request.action == 'complete':
++        updated = _cycle(context, scope, request.volume_id, 'update')
++        if (updated is None or updated.status != 'succeeded' or
++                updated.target_attachment_id != attachment.id or
++                attachment.attach_status != 'attaching' or
++                not attachment.connection_info):
++            journal._conflict('attachment_connection_not_confirmed')
++    row = models.CheckpointAttachmentIntent(
++        id=request.id, operation_id=scope.operation_id,
++        generation=scope.generation, volume_id=request.volume_id,
++        action=request.action, request_hash=payload_hash,
++        target_attachment_id=request.attachment_id,
++        connector_json=json.dumps(request.to_primitive()['connector'],
++                                  sort_keys=True)
++        if request.connector is not None else None,
++        mountpoint=request.mountpoint, status='prepared')
++    context.session.add(row)
++    if request.action == 'create':
++        volume.status = 'reserved'
++        attachment = api._attachment_insert(context, {
++            'id': uuidutils.generate_uuid(), 'volume_id': volume.id,
++            'instance_uuid': scope.instance_uuid, 'attach_status': 'reserved',
++            'attach_mode': 'rw'})
++        row.result_attachment_id = attachment.id
++        row.status = 'succeeded'
++    elif request.action == 'complete':
++        attachment.attach_status = 'attached'
++        volume.status = 'in-use'
++        volume.attach_status = 'attached'
++        row.result_attachment_id = attachment.id
++        row.status = 'succeeded'
++    context.session.flush()
++    return _result(row)
++
++
++@api.require_context
++@api.main_context_manager.writer
++def attachment_get(context, scope, child_id):
++    scope = _checked_scope(context, scope, 'read')
++    return _result(_intent(context, scope, child_id))
++
++
++def _intent_scope(context, child_id):
++    executor = continuation.require_executor(context)
++    row = journal._query(context, models.CheckpointAttachmentIntent).filter_by(
++        id=child_id).first()
++    if row is None:
++        raise exception.CheckpointOperationNotFound()
++    grant = journal._query(
++        context, models.CheckpointContinuationGrant).filter_by(
++            operation_id=row.operation_id,
++            executor_service_user_id=executor).first()
++    if grant is None:
++        raise exception.CheckpointOperationNotFound()
++    scope = _scope(context, grant.nova_operation_id, row.generation,
++                   'attachment')
++    return scope, _intent(context, scope, child_id)
++
++
++@api.require_context
++@api.main_context_manager.writer
++def attachment_claim(context, child_id, executor_id):
++    scope, row = _intent_scope(context, child_id)
++    if row.status != 'prepared':
++        return None
++    volume, attachment = _attachment_scope(
++        context, scope, row.volume_id, row.action, row.target_attachment_id)
++    if (not isinstance(executor_id, str) or not executor_id or
++            len(executor_id) > 255 or
++            volume.host.split('#')[0] != executor_id.split('#')[0]):
++        journal._conflict('wrong_attachment_executor')
++    row.executor_id = executor_id
++    row.status = 'dispatching'
++    context.session.flush()
++    return dict(row)
++
++
++@api.require_context
++@api.main_context_manager.writer
++def attachment_finish(context, child_id, result):
++    scope, row = _intent_scope(context, child_id)
++    result = contracts.AttachmentResult.from_primitive(result)
++    expected = contracts.AttachmentResult.from_primitive(_result(row))
++    if any(getattr(result, key) != getattr(expected, key) for key in (
++            'id', 'operation_id', 'generation', 'volume_id', 'action',
++            'attachment_id')):
++        journal._conflict('attachment_result_scope_changed')
++    if row.status in ('succeeded', 'failed_no_effect'):
++        if result != expected:
++            journal._conflict('terminal_attachment_result_changed')
++        return _result(row)
++    if (row.status == 'prepared' or
++            result.status not in ('pending', 'unknown', 'failed_no_effect')):
++        journal._conflict('attachment_result_not_confirmed')
++    row.status, row.error_code = result.status, result.error_code
++    context.session.flush()
++    return _result(row)
++
++
++@api.require_context
++@api.main_context_manager.writer
++def current_attachment(context, scope, attachment_id):
++    scope = _checked_scope(context, scope)
++    row = journal._query(context, models.VolumeAttachment).filter_by(
++        id=attachment_id, instance_uuid=scope.instance_uuid).first()
++    if row is None or row.volume_id not in scope.volume_ids:
++        raise exception.CheckpointOperationNotFound()
++    volume, row = _attachment_scope(context, scope, row.volume_id,
++                                    'read', attachment_id)
++    # Do not instantiate an attachment OVO here: its loader mutates old specs.
++    return dict(row)
++
++
++def check_attachment_release(context, operation):
++    intents = journal._current(journal._query(
++        context, models.CheckpointAttachmentIntent).filter_by(
++            operation_id=operation.id)).all()
++    if any(row.status not in ('succeeded', 'failed_no_effect')
++           for row in intents):
++        journal._conflict('attachment_result_not_confirmed')
++    completed = {row.volume_id for row in intents
++                 if row.action == 'complete' and row.status == 'succeeded'}
++    if any(row.action == 'create' and row.status == 'succeeded' and
++           row.volume_id not in completed for row in intents):
++        journal._conflict('attachment_complete_required')
+diff --git a/cinder/db/sqlalchemy/checkpoints.py b/cinder/db/sqlalchemy/checkpoints.py
+index 40c529a..1f24867 100644
+--- a/cinder/db/sqlalchemy/checkpoints.py
++++ b/cinder/db/sqlalchemy/checkpoints.py
+@@ -492,6 +492,8 @@ def _release(context, operation, instance, volumes, outcome):
+         if outcome != operation.release_outcome:
+             _conflict('release_outcome_changed')
+         return _as_dict(context, operation)
++    from cinder.db.sqlalchemy import checkpoint_continuation as continuation
++    continuation.check_attachment_release(context, operation)
+     steps = _steps(context, operation_id)
+     if outcome == 'commit':
+         if any(s.status != 'succeeded' for s in steps):
+@@ -539,7 +541,6 @@ def _release(context, operation, instance, volumes, outcome):
+     instance.active_operation_id = None
+     operation.status = 'released'
+     operation.release_outcome = outcome
+-    from cinder.db.sqlalchemy import checkpoint_continuation as continuation
+     continuation.mark_released(context, operation)
+     return _as_dict(context, operation)
+ 
+diff --git a/cinder/db/sqlalchemy/models.py b/cinder/db/sqlalchemy/models.py
+index 1c400a9..ccb8f35 100644
+--- a/cinder/db/sqlalchemy/models.py
++++ b/cinder/db/sqlalchemy/models.py
+@@ -1343,6 +1343,30 @@ class CheckpointContinuationGrant(BASE, CinderBase):
+     payload_hash = sa.Column(sa.String(64), nullable=False)
+ 
+ 
++class CheckpointAttachmentIntent(BASE, CinderBase):
++    __tablename__ = 'checkpoint_attachment_intents'
++    __table_args__ = (
++        sa.UniqueConstraint(
++            'operation_id', 'generation', 'volume_id', 'action',
++                            name='checkpoint_attachment_cycle_uc'),
++        CinderBase.__table_args__,
++    )
++    id = sa.Column(sa.String(36), primary_key=True)
++    operation_id = sa.Column(sa.String(36), sa.ForeignKey(
++        'checkpoint_operations.id'), nullable=False)
++    generation = sa.Column(sa.Integer, nullable=False)
++    volume_id = sa.Column(sa.String(36), nullable=False)
++    action = sa.Column(sa.String(16), nullable=False)
++    request_hash = sa.Column(sa.String(64), nullable=False)
++    target_attachment_id = sa.Column(sa.String(36))
++    result_attachment_id = sa.Column(sa.String(36))
++    connector_json = sa.Column(sa.Text)
++    mountpoint = sa.Column(sa.String(255))
++    executor_id = sa.Column(sa.String(255))
++    status = sa.Column(sa.String(32), nullable=False)
++    error_code = sa.Column(sa.String(64))
++
++
+ class CheckpointResource(BASE, CinderBase):
+     __tablename__ = 'checkpoint_resources'
+     __table_args__ = (
+diff --git a/cinder/objects/base.py b/cinder/objects/base.py
+index 124398d..b63a35a 100644
+--- a/cinder/objects/base.py
++++ b/cinder/objects/base.py
+@@ -154,6 +154,8 @@ OBJ_VERSIONS.add('1.41', {
+     'CheckpointOperation': '1.1',
+     'CheckpointContinuationGrant': '1.0',
+     'CheckpointContinuationGrantList': '1.0',
++    'CheckpointAttachmentIntent': '1.0',
++    'CheckpointAttachmentIntentList': '1.0',
+ })
+ 
+ 
+diff --git a/cinder/objects/checkpoint_continuation.py b/cinder/objects/checkpoint_continuation.py
+index a048c47..530bf3c 100644
+--- a/cinder/objects/checkpoint_continuation.py
++++ b/cinder/objects/checkpoint_continuation.py
+@@ -54,3 +54,36 @@ class CheckpointContinuationGrantList(base.ObjectListBase, base.CinderObject):
+ 
+     fields = {
+         'objects': fields.ListOfObjectsField('CheckpointContinuationGrant')}
++
++
++@base.CinderObjectRegistry.register
++class CheckpointAttachmentIntent(checkpoint._CheckpointObject):
++    VERSION = '1.0'
++
++    fields = {
++        'id': fields.UUIDField(),
++        'operation_id': fields.UUIDField(),
++        'generation': fields.IntegerField(),
++        'volume_id': fields.UUIDField(),
++        'action': fields.StringField(),
++        'request_hash': fields.StringField(),
++        'target_attachment_id': fields.UUIDField(nullable=True),
++        'result_attachment_id': fields.UUIDField(nullable=True),
++        'connector_json': fields.StringField(nullable=True),
++        'mountpoint': fields.StringField(nullable=True),
++        'executor_id': fields.StringField(nullable=True),
++        'status': fields.StringField(),
++        'error_code': fields.StringField(nullable=True),
++    }
++
++    def save(self):
++        raise exception.ObjectActionError(
++            action='save', reason='read-only checkpoint attachment intent')
++
++
++@base.CinderObjectRegistry.register
++class CheckpointAttachmentIntentList(base.ObjectListBase, base.CinderObject):
++    VERSION = '1.0'
++
++    fields = {
++        'objects': fields.ListOfObjectsField('CheckpointAttachmentIntent')}
+diff --git a/cinder/tests/unit/api/v3/test_checkpoint_continuation.py b/cinder/tests/unit/api/v3/test_checkpoint_continuation.py
+index 6cd9df8..0b3b777 100644
+--- a/cinder/tests/unit/api/v3/test_checkpoint_continuation.py
++++ b/cinder/tests/unit/api/v3/test_checkpoint_continuation.py
+@@ -23,6 +23,7 @@ from cinder.checkpoints import continuation_api
+ from cinder import db
+ from cinder.db.sqlalchemy import models
+ from cinder.tests.unit.api import fakes
++from cinder.tests.unit.checkpoints import test_attachment_intents
+ from cinder.tests.unit.checkpoints import test_continuation_db
+ from cinder.tests.unit.checkpoints import test_contracts
+ from cinder.tests.unit.checkpoints import test_db
+@@ -208,3 +209,90 @@ class CheckpointContinuationAPITest(test_continuation_db.ContinuationHelpers,
+                      self.service_path + '/attachments'):
+             response = self.request_as(self.service_ctx, 'GET', path)
+             self.assertEqual(404, response.status_int, response.text)
++
++
++class CheckpointAttachmentAPITest(
++        test_attachment_intents.AttachmentHelpers,
++        test_continuation_db.ContinuationHelpers, test.TestCase):
++    request_as = CheckpointContinuationAPITest.request_as
++
++    def setUp(self):
++        super().setUp()
++        self.prepare_continuation()
++        self.prepare_attachments()
++        self.service_path = ('/checkpoint-service-operations/' +
++                             uuids.nova_operation)
++        self.requests_path = self.service_path + '/attachment-requests'
++        self.service_api = continuation_api.ContinuationAPI(rpc=mock.Mock())
++        self.mock_object(api, 'API', return_value=self.api)
++        self.mock_object(continuation_api, 'ContinuationAPI',
++                         return_value=self.service_api)
++        self.application = fakes.urlmap.URLMap()
++        self.application['/v3'] = router.APIRouter()
++        self.application = fault.FaultWrapper(self.application)
++
++    def post_request(self, request):
++        body = request.to_primitive()
++        body.pop('schema_version')
++        return self.request_as(self.service_ctx, 'POST', self.requests_path,
++                               {'attachment_request': body})
++
++    def test_create_replay_and_query_return_same_safe_result(self):
++        self.enter_reconnect()
++        first = self.post_request(self.create_request)
++        self.assertEqual(202, first.status_int, first.text)
++        second = self.post_request(self.create_request)
++        queried = self.request_as(self.service_ctx, 'GET',
++                                  self.requests_path + '/' +
++                                  self.create_request.id)
++        self.assertEqual(200, queried.status_int, queried.text)
++        self.assertEqual(first.json, second.json)
++        self.assertEqual(first.json, queried.json)
++        result = first.json['attachment_request']
++        self.assertEqual('succeeded', result['status'])
++        self.assertEqual(1, self.count_volume_attachments(result['volume_id']))
++        for field in ('schema_version', 'connector', 'connection_info',
++                      'request_hash', 'executor_id'):
++            self.assertNotIn(field, result)
++
++    def test_delete_is_prepared_and_query_does_not_dispatch(self):
++        request = self.request_for('delete', self.original[0])
++        response = self.post_request(request)
++        self.assertEqual(202, response.status_int, response.text)
++        self.assertEqual('prepared', response.json['attachment_request'][
++            'status'])
++        self.service_api.rpc.reset_mock()
++        response = self.request_as(self.service_ctx, 'GET',
++                                   self.requests_path + '/' + request.id)
++        self.assertEqual(200, response.status_int, response.text)
++        self.assertEqual([], self.service_api.rpc.mock_calls)
++
++    def test_closed_payload_rejects_credentials_and_extra_fields(self):
++        self.enter_reconnect()
++        created = self.submit(self.create_request)
++        body = self.request_for('update', created.attachment_id,
++                                connector={'host': 'compute-one'}
++                                ).to_primitive()
++        body.pop('schema_version')
++        for change in ({'force': True},
++                       {'connector': {'host': 'compute-one',
++                                      'password': 'not-a-secret'}}):
++            response = self.request_as(
++                self.service_ctx, 'POST', self.requests_path,
++                {'attachment_request': dict(body, **change)})
++            self.assertEqual(400, response.status_int, response.text)
++        self.assertEqual(0, self.count_attachment_intents('update'))
++
++    def test_attachment_read_is_scoped_and_versioned(self):
++        path = self.service_path + '/attachments/' + self.original[0]
++        response = self.request_as(self.service_ctx, 'GET', path)
++        self.assertEqual(200, response.status_int, response.text)
++        self.assertEqual(
++            self.instance, response.json['attachment']['instance'])
++        for path in (self.service_path + '/attachments/' + uuids.foreign,
++                     self.requests_path + '/' + uuids.foreign):
++            response = self.request_as(self.service_ctx, 'GET', path)
++            self.assertEqual(404, response.status_int, response.text)
++        response = self.request_as(self.service_ctx, 'GET', path,
++                                   version='3.72')
++        self.assertEqual(404, response.status_int, response.text)
+diff --git a/cinder/tests/unit/checkpoints/test_attachment_intents.py b/cinder/tests/unit/checkpoints/test_attachment_intents.py
+new file mode 100644
+index 0000000..5e2532b
+--- /dev/null
++++ b/cinder/tests/unit/checkpoints/test_attachment_intents.py
+@@ -0,0 +1,246 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import dataclasses
++import json
++
++import eventlet
++from oslo_db.sqlalchemy import test_fixtures
++from oslo_utils.fixture import uuidsentinel as uuids
++from oslotest import base as test_base
++
++from cinder.checkpoints import attachment_intents
++from cinder.checkpoints import continuation
++from cinder.checkpoints import continuation_contracts as contracts
++from cinder import context
++from cinder import db
++from cinder.db.sqlalchemy import api as sqla_api
++from cinder.db.sqlalchemy import models
++from cinder import exception
++from cinder import objects
++from cinder.tests.unit.checkpoints import test_continuation_contracts
++from cinder.tests.unit.checkpoints import test_continuation_db
++from cinder.tests.unit.checkpoints import test_db
++from cinder.tests.unit import test
++
++
++class AttachmentHelpers:
++    def prepare_attachments(self):
++        legacy = {key: value for key, value in self.payload.items()
++                  if key not in ('nova_operation_id',
++                                 'allow_service_continuation')}
++        create = self.api.reserve(self.ctxt, legacy)
++        self.succeed(db.checkpoint_get(self.ctxt, create.id))
++        db.checkpoint_release(self.ctxt, create.id, 1, 'commit')
++        self.payload.update(kind='revert', request_id=uuids.revert_request,
++                            nova_operation_id=uuids.nova_operation,
++                            allow_service_continuation=True)
++        self.operation = self.api.reserve_with_continuation(
++            self.ctxt, self.payload)
++        self.service_ctx = context.RequestContext(
++            test_db.SERVICE_ID, uuids.service_project,
++            roles=['service'], is_admin=False)
++        self.scope = continuation.authorize(
++            self.service_ctx, uuids.nova_operation, 1, 'attachment')
++        self.intents = attachment_intents.AttachmentIntents()
++        self.original = [objects.Volume.get_by_id(
++            self.ctxt, vid).volume_attachment[0].id for vid in self.volumes]
++        self.create_request = contracts.validate_attachment(
++            test_continuation_contracts.attachment_request(
++                volume_id=self.volumes[0]))
++
++    def enter_reconnect(self):
++        # DB fixture models a confirmed disconnect; the original scoped HTTP
++        # workflow and driver effects are exercised in test_attachment_scope.
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            self.ctxt.session.query(models.VolumeAttachment).filter(
++                models.VolumeAttachment.volume_id.in_(self.volumes)).update(
++                    {'deleted': True}, synchronize_session=False)
++            self.ctxt.session.query(models.Volume).filter(
++                models.Volume.id.in_(self.volumes)).update(
++                    {'status': 'available', 'attach_status': 'detached'},
++                    synchronize_session=False)
++        self.succeed(db.checkpoint_get(self.ctxt, self.operation.id))
++
++    def count_volume_attachments(self, volume_id):
++        with sqla_api.main_context_manager.reader.using(self.ctxt):
++            return self.ctxt.session.query(models.VolumeAttachment).filter_by(
++                volume_id=volume_id, deleted=False).count()
++
++    def count_attachment_intents(self, action):
++        with sqla_api.main_context_manager.reader.using(self.ctxt):
++            return self.ctxt.session.query(
++                models.CheckpointAttachmentIntent).filter_by(
++                    operation_id=self.operation.id, action=action).count()
++
++    def submit(self, request):
++        return self.intents.submit(self.service_ctx, self.scope, request)
++
++    def request_for(self, action, attachment_id, **changes):
++        values = test_continuation_contracts.attachment_request(
++            id=getattr(uuids, action + '_child'), action=action,
++            attachment_id=attachment_id, volume_id=self.volumes[0], **changes)
++        return contracts.validate_attachment(values)
++
++
++class AttachmentIntentTest(AttachmentHelpers,
++                           test_continuation_db.ContinuationHelpers,
++                           test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_continuation()
++        self.prepare_attachments()
++
++    def test_create_reply_loss_reuses_attachment(self):
++        self.enter_reconnect()
++        first = self.submit(self.create_request)
++        replay = self.submit(self.create_request)
++        self.assertEqual('succeeded', first.status)
++        self.assertEqual(first.attachment_id, replay.attachment_id)
++        self.assertEqual(1, self.count_volume_attachments(first.volume_id))
++        self.assertEqual(1, self.count_attachment_intents('create'))
++        volume = objects.Volume.get_by_id(self.ctxt, first.volume_id)
++        self.assertEqual('reserved', volume.status)
++        self.assertEqual(self.instance,
++                         volume.volume_attachment[0].instance_uuid)
++
++    def test_changed_connector_does_not_create_second_intent(self):
++        self.enter_reconnect()
++        attachment_id = self.submit(self.create_request).attachment_id
++        request = self.request_for('update', attachment_id,
++                                   connector={'host': 'compute-one'})
++        accepted = self.submit(request)
++        self.assertEqual('prepared', accepted.status)
++        changed = dataclasses.replace(request,
++                                      connector={'host': 'other-compute'})
++        self.assertRaises(exception.CheckpointConflict, self.submit, changed)
++        observed = self.intents.get(self.service_ctx, self.scope, accepted.id)
++        self.assertEqual(accepted.id, observed.id)
++        self.assertEqual(1, self.count_attachment_intents('update'))
++
++    def test_new_id_for_same_action_is_rejected(self):
++        self.enter_reconnect()
++        self.submit(self.create_request)
++        self.assertRaises(exception.CheckpointConflict, self.submit,
++                          dataclasses.replace(self.create_request,
++                                              id=uuids.another_child))
++        self.assertEqual(1, self.count_volume_attachments(self.volumes[0]))
++
++    def test_reconnect_waits_for_all_disk_results(self):
++        self.assertRaises(exception.CheckpointConflict, self.submit,
++                          self.create_request)
++        self.assertEqual(0, self.count_attachment_intents('create'))
++
++    def test_disconnect_accepts_only_original_attachment(self):
++        wrong = self.request_for('delete', self.original[1])
++        self.assertRaises(exception.CheckpointOperationNotFound,
++                          self.submit, wrong)
++        request = self.request_for('delete', self.original[0])
++        result = self.submit(request)
++        self.assertEqual('prepared', result.status)
++        self.assertEqual(self.original[0], result.attachment_id)
++        self.assertEqual(1, self.count_volume_attachments(self.volumes[0]))
++
++    def test_complete_before_valid_connection_is_rejected(self):
++        self.enter_reconnect()
++        attachment_id = self.submit(self.create_request).attachment_id
++        self.assertRaises(exception.CheckpointConflict, self.submit,
++                          self.request_for('complete', attachment_id))
++        self.assertEqual(0, self.count_attachment_intents('complete'))
++
++    def test_query_never_claims_or_dispatches(self):
++        request = self.request_for('delete', self.original[0])
++        first = self.submit(request)
++        claim = self.mock_object(db, 'checkpoint_attachment_intent_claim')
++        result = self.intents.get(self.service_ctx, self.scope, first.id)
++        self.assertEqual('prepared', result.status)
++        claim.assert_not_called()
++
++    def test_unknown_delete_holds_lock_and_cannot_be_claimed_again(self):
++        result = self.submit(self.request_for('delete', self.original[0]))
++        host = objects.Volume.get_by_id(self.ctxt, self.volumes[0]).host
++        self.assertIsNotNone(db.checkpoint_attachment_intent_claim(
++            self.service_ctx, result.id, host))
++        unknown = dataclasses.replace(result, status='unknown',
++                                      error_code='attachment_result_unknown')
++        db.checkpoint_attachment_intent_finish(
++            self.service_ctx, result.id, unknown.to_primitive())
++        self.assertIsNone(db.checkpoint_attachment_intent_claim(
++            self.service_ctx, result.id, host))
++        self.assertEqual('unknown', self.intents.get(
++            self.service_ctx, self.scope, result.id).status)
++        self.assertRaises(exception.CheckpointConflict,
++                          db.checkpoint_continuation_transition,
++                          self.service_ctx, uuids.nova_operation, 1,
++                          'release', 'abort')
++        self.assertEqual(2, len(self.locks()))
++
++    def test_forged_scope_does_not_reserve_attachment(self):
++        self.enter_reconnect()
++        forged = dataclasses.replace(self.scope, actor_user_id=uuids.attacker)
++        self.assertRaises(exception.CheckpointOperationNotFound,
++                          self.intents.submit, self.service_ctx, forged,
++                          self.create_request)
++        self.assertEqual(0, self.count_volume_attachments(self.volumes[0]))
++
++    def test_attachment_current_read_is_scoped_and_transient(self):
++        expected = {'driver_volume_type': 'fake', 'secret': 'test-sensitive'}
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            row = self.ctxt.session.query(models.VolumeAttachment).filter_by(
++                id=self.original[0]).one()
++            row.connection_info = json.dumps(expected)
++        attachment = self.intents.get_attachment(
++            self.service_ctx, self.scope, self.original[0])
++        self.assertEqual(expected, attachment['connection_info'])
++        self.assertEqual(self.volumes[0], attachment['volume_id'])
++        result = self.submit(self.request_for('delete', self.original[0]))
++        self.assertNotIn('test-sensitive', str(result.to_primitive()))
++        self.assertRaises(exception.CheckpointOperationNotFound,
++                          self.intents.get_attachment, self.service_ctx,
++                          self.scope, uuids.foreign_attachment)
++
++
++class AttachmentRaceTests(AttachmentHelpers,
++                          test_continuation_db.ContinuationRaceSetup):
++    def setUp(self):
++        super().setUp()
++        self.prepare_attachments()
++        self.enter_reconnect()
++
++    def test_two_sessions_create_exactly_one_attachment(self):
++        gate = eventlet.event.Event()
++
++        def create():
++            ctxt = self.service_ctx.deepcopy()
++            gate.wait()
++            return self.intents.submit(ctxt, self.scope, self.create_request)
++
++        tasks = [eventlet.spawn(create) for unused in range(2)]
++        gate.send()
++        self.assertEqual(tasks[0].wait().attachment_id,
++                         tasks[1].wait().attachment_id)
++        self.assertEqual(1, self.count_volume_attachments(self.volumes[0]))
++        self.assertEqual(1, self.count_attachment_intents('create'))
++
++
++class AttachmentMySQLTest(AttachmentRaceTests,
++                          test_fixtures.OpportunisticDBTestMixin,
++                          test_base.BaseTestCase):
++    FIXTURE = test_fixtures.MySQLOpportunisticFixture
++    SKIP_ON_UNAVAILABLE_DB = False
++
++
++class AttachmentPostgreSQLTest(AttachmentRaceTests,
++                               test_fixtures.OpportunisticDBTestMixin,
++                               test_base.BaseTestCase):
++    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
++    SKIP_ON_UNAVAILABLE_DB = False
+diff --git a/cinder/tests/unit/checkpoints/test_continuation_db.py b/cinder/tests/unit/checkpoints/test_continuation_db.py
+index 34346d0..ae33b36 100644
+--- a/cinder/tests/unit/checkpoints/test_continuation_db.py
++++ b/cinder/tests/unit/checkpoints/test_continuation_db.py
+@@ -225,7 +225,7 @@ class ContinuationDBTest(ContinuationHelpers, test.TestCase):
+         self.assertRaises(exception.ObjectActionError, grant.save)
+ 
+ 
+-class ContinuationRaceTests(test_db.CheckpointDBHelpers):
++class ContinuationRaceSetup(test_db.CheckpointDBHelpers):
+     def setUp(self):
+         super().setUp()
+         cfg = self.useFixture(config_fixture.Config())
+@@ -254,6 +254,8 @@ class ContinuationRaceTests(test_db.CheckpointDBHelpers):
+             test_contracts.supported_capabilities())
+         self.api = api.API(rpc=rpc)
+ 
++
++class ContinuationRaceTests(ContinuationRaceSetup):
+     def test_two_connections_same_nova_uuid_one_winner(self):
+         gate = eventlet.event.Event()
+ 
+diff --git a/cinder/tests/unit/db/test_migrations.py b/cinder/tests/unit/db/test_migrations.py
+index b22ea9a..f5832f9 100644
+--- a/cinder/tests/unit/db/test_migrations.py
++++ b/cinder/tests/unit/db/test_migrations.py
+@@ -380,6 +380,16 @@ class MigrationsWalk(
+         self.assertIn(['executor_service_user_id', 'nova_operation_id'],
+                       [item['column_names'] for item in constraints])
+ 
++    def _check_95b6d7f082e1(self, connection):
++        inspector = sqlalchemy.inspect(connection)
++        table = db_utils.get_table(connection, 'checkpoint_attachment_intents')
++        self.assertTrue(table.c.operation_id.foreign_keys)
++        constraints = inspector.get_unique_constraints(table.name)
++        self.assertIn(['operation_id', 'generation', 'volume_id', 'action'],
++                      [item['column_names'] for item in constraints])
++        self.assertNotIn('connection_info', table.c)
++        self.assertNotIn('auth_token', table.c)
++
+     def _pre_upgrade_c92a3e68beed(self, connection):
+         """Test shared_targets is nullable."""
+         table = db_utils.get_table(connection, 'volumes')
+diff --git a/cinder/tests/unit/objects/test_objects.py b/cinder/tests/unit/objects/test_objects.py
+index 3a113a4..22eda76 100644
+--- a/cinder/tests/unit/objects/test_objects.py
++++ b/cinder/tests/unit/objects/test_objects.py
+@@ -25,6 +25,8 @@ from cinder.tests.unit import test
+ object_data = {
+     'CheckpointContinuationGrant': '1.0-4d1d0c72dade73179c6bd7c96c772cd2',
+     'CheckpointContinuationGrantList': '1.0-15ecf022a68ddbb8c2a6739cfc9f8f5e',
++    'CheckpointAttachmentIntent': '1.0-5dcf2e3dc5b8d901fd5aedc3948f8d26',
++    'CheckpointAttachmentIntentList': '1.0-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'CheckpointInstance': '1.0-e6e05d9743a2bef7d33ad8ad3dc2befb',
+     'CheckpointInstanceList': '1.0-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'CheckpointOperation': '1.1-4f78d148a120d6f32384815f3ae0ab63',

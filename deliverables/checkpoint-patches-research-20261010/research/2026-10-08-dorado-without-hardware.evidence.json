@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "purpose": "static_research_only_not_runtime_configuration",
+  "checked_date": "2026-10-08",
+  "source_repository": "https://github.com/Huawei/OpenStack_Driver",
+  "source_tag": "v26.2.0",
+  "source_commit": "bda6d13cd0147648e04da5479d678dc2e0541395",
+  "source_tree": "1e4377e5c0e897b31e27cd82ffd85e0ac305cd33",
+  "source_subdirectory": "Cinder/Epoxy",
+  "target_profile": {
+    "array_model": null,
+    "firmware_version": null,
+    "native_api_revision": null,
+    "pool_type": null,
+    "transport": null,
+    "qualification_status": "unverified",
+    "supported": false
+  },
+  "production_qualified": false,
+  "hardware_qualified": false,
+  "runtime_tests_run": false,
+  "vendor_code_imported": false,
+  "vendor_files": [
+    {
+      "path": "RELEASE.md",
+      "sha256": "b9195be3e7738ee5f672baafa8f2fd6d6e6f758ff8676b3386f21e38968600bc",
+      "bytes": 24539,
+      "source_url": "https://github.com/Huawei/OpenStack_Driver/blob/bda6d13cd0147648e04da5479d678dc2e0541395/RELEASE.md",
+      "locations": []
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "bytes": 11357,
+      "source_url": "https://github.com/Huawei/OpenStack_Driver/blob/bda6d13cd0147648e04da5479d678dc2e0541395/LICENSE",
+      "locations": []
+    },
+    {
+      "path": "Cinder/Epoxy/huawei_base_driver.py",
+      "sha256": "bb89794a5b83def48e897634bc2d69bd5fae05ad0d605294ede27c11bd0bfd28",
+      "bytes": 37338,
+      "source_url": "https://github.com/Huawei/OpenStack_Driver/blob/bda6d13cd0147648e04da5479d678dc2e0541395/Cinder/Epoxy/huawei_base_driver.py",
+      "locations": [
+        {
+          "symbol": "create_snapshot",
+          "start_line": 463,
+          "end_line": 471
+        },
+        {
+          "symbol": "delete_snapshot",
+          "start_line": 473,
+          "end_line": 480
+        },
+        {
+          "symbol": "revert_to_snapshot",
+          "start_line": 880,
+          "end_line": 882
+        }
+      ]
+    },
+    {
+      "path": "Cinder/Epoxy/huawei_flow.py",
+      "sha256": "9562dab48c1490f1eabd0002b078859922c8d516da46ce2f5c5e4a50bcfeb92a",
+      "bytes": 120193,
+      "source_url": "https://github.com/Huawei/OpenStack_Driver/blob/bda6d13cd0147648e04da5479d678dc2e0541395/Cinder/Epoxy/huawei_flow.py",
+      "locations": [
+        {
+          "symbol": "CheckSnapshotExistTask",
+          "start_line": 623,
+          "end_line": 637
+        },
+        {
+          "symbol": "DeleteSnapshotTask",
+          "start_line": 897,
+          "end_line": 905
+        },
+        {
+          "symbol": "RevertToSnapshotTask",
+          "start_line": 918,
+          "end_line": 949
+        },
+        {
+          "symbol": "WaitSnapshotRollbackDoneTask",
+          "start_line": 952,
+          "end_line": 976
+        },
+        {
+          "symbol": "create_snapshot",
+          "start_line": 2612,
+          "end_line": 2627
+        },
+        {
+          "symbol": "delete_snapshot",
+          "start_line": 2630,
+          "end_line": 2639
+        },
+        {
+          "symbol": "revert_to_snapshot",
+          "start_line": 3202,
+          "end_line": 3212
+        }
+      ]
+    },
+    {
+      "path": "Cinder/Epoxy/rest_client.py",
+      "sha256": "b616424ad28d14daf4a331473440248451de2673cd29e0c925ac4a3ace9dcfd5",
+      "bytes": 84019,
+      "source_url": "https://github.com/Huawei/OpenStack_Driver/blob/bda6d13cd0147648e04da5479d678dc2e0541395/Cinder/Epoxy/rest_client.py",
+      "locations": [
+        {
+          "symbol": "rest_operation_wrapper",
+          "start_line": 1726,
+          "end_line": 1780
+        },
+        {
+          "symbol": "activate_snapshot",
+          "start_line": 282,
+          "end_line": 288
+        },
+        {
+          "symbol": "create_snapshot",
+          "start_line": 290,
+          "end_line": 316
+        },
+        {
+          "symbol": "stop_snapshot",
+          "start_line": 318,
+          "end_line": 321
+        },
+        {
+          "symbol": "delete_snapshot",
+          "start_line": 323,
+          "end_line": 328
+        },
+        {
+          "symbol": "get_snapshot_info_by_name",
+          "start_line": 330,
+          "end_line": 335
+        },
+        {
+          "symbol": "get_snapshot_info_by_id",
+          "start_line": 337,
+          "end_line": 341
+        },
+        {
+          "symbol": "rollback_snapshot",
+          "start_line": 366,
+          "end_line": 372
+        },
+        {
+          "symbol": "cancel_rollback_snapshot",
+          "start_line": 374,
+          "end_line": 377
+        }
+      ]
+    },
+    {
+      "path": "Cinder/Epoxy/huawei_utils.py",
+      "sha256": "aacfeb6aabf3fe75317c7712e9efe2ddd8f4cbe0353030422856dda226416b79",
+      "bytes": 27201,
+      "source_url": "https://github.com/Huawei/OpenStack_Driver/blob/bda6d13cd0147648e04da5479d678dc2e0541395/Cinder/Epoxy/huawei_utils.py",
+      "locations": [
+        {
+          "symbol": "get_snapshot_info",
+          "start_line": 540,
+          "end_line": 549
+        }
+      ]
+    },
+    {
+      "path": "Cinder/Epoxy/constants.py",
+      "sha256": "9adae3d1cfb8b000c6862609a07fb157585b0810cd54778b40770a4bc8dcc74d",
+      "bytes": 7553,
+      "source_url": "https://github.com/Huawei/OpenStack_Driver/blob/bda6d13cd0147648e04da5479d678dc2e0541395/Cinder/Epoxy/constants.py",
+      "locations": []
+    }
+  ],
+  "checkpoint_hook_inventory": {
+    "method": "AST function-definition inventory",
+    "scanned_files": [
+      "Cinder/Epoxy/__init__.py",
+      "Cinder/Epoxy/cipher.py",
+      "Cinder/Epoxy/constants.py",
+      "Cinder/Epoxy/huawei_base_driver.py",
+      "Cinder/Epoxy/huawei_conf.py",
+      "Cinder/Epoxy/huawei_driver.py",
+      "Cinder/Epoxy/huawei_flow.py",
+      "Cinder/Epoxy/huawei_roce_driver.py",
+      "Cinder/Epoxy/huawei_tcp_driver.py",
+      "Cinder/Epoxy/huawei_utils.py",
+      "Cinder/Epoxy/hypermetro.py",
+      "Cinder/Epoxy/replication.py",
+      "Cinder/Epoxy/rest_client.py",
+      "Cinder/Epoxy/smartx.py"
+    ],
+    "matches": []
+  },
+  "predicate_observation": {
+    "expression": "{}.get('ROLLBACKENDTIME') != '-1'",
+    "result": true,
+    "scope": "Python expression only; no assertion that a device returns this input"
+  },
+  "product_sources": [
+    {
+      "checkout": "work/cinder-checkpoint-continuation",
+      "commit": "d065a55cbe5cb8cd59489752846a41145d72bd27",
+      "tree": "53888d9cea7fa1b12d35a0b9afd894eeee270843",
+      "clean": true,
+      "files": [
+        {
+          "path": "cinder/checkpoints/contracts.py",
+          "sha256": "2e3d23fc4af9622e873eddac4e9db1ec9f9d467566afed982197398b5cbe2ea7"
+        },
+        {
+          "path": "cinder/checkpoints/continuation_manager.py",
+          "sha256": "bf7de8db7afe7e90275943b1ed1337e69723343184e90c789bbe748681d289db"
+        },
+        {
+          "path": "cinder/db/sqlalchemy/checkpoints.py",
+          "sha256": "d70f1ae60b2f535098ee22bc977571e997658a6a8a012504619dcfa17d0e9306"
+        },
+        {
+          "path": "cinder/volume/drivers/huawei/common.py",
+          "sha256": "14c14b72d6ed1dd58ecf02f57afeee5c53e8776a26bac6ddd49b1cb8ad67024c"
+        },
+        {
+          "path": "cinder/volume/drivers/huawei/rest_client.py",
+          "sha256": "66b8c4bf8899ad2e91cc4bbb33ba14a37272130efb5a228508fde8e7c06b5b7b"
+        },
+        {
+          "path": "cinder/volume/driver.py",
+          "sha256": "7d23b7320acf22d4949f8b5ebc79ce3c07f1e78a957248c61357d9faba4cd52b"
+        }
+      ]
+    },
+    {
+      "checkout": "work/nova-checkpoint-recovery-fix",
+      "commit": "6d55009fae5eb55adb156e13835dd66240488f84",
+      "tree": "20b52f9c94759820dda79fde046385bb979bdf5b",
+      "clean": true,
+      "files": []
+    }
+  ],
+  "static_parser": {
+    "python_version": "3.14.0",
+    "warnings": "SyntaxWarning for existing invalid string escape sequences in vendor constants.py, huawei_flow.py and huawei_base_driver.py; AST parsing completed; no runtime compatibility claim"
+  }
+}

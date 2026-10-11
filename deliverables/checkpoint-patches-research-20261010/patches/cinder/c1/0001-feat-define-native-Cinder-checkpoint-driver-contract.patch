@@ -1,0 +1,661 @@
+From 97e0f2097427db5a52baba5e03cd8f151678c5af Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Tue, 6 Oct 2026 22:12:49 +0300
+Subject: [PATCH 01/10] feat: define native Cinder checkpoint driver contract
+
+---
+ cinder/checkpoints/__init__.py                |   1 +
+ cinder/checkpoints/config.py                  |  31 +++
+ cinder/checkpoints/contracts.py               | 124 ++++++++++
+ cinder/exception.py                           |  22 ++
+ cinder/opts.py                                |  11 +-
+ cinder/tests/unit/checkpoints/__init__.py     |   0
+ cinder/tests/unit/checkpoints/fake_driver.py  | 103 +++++++++
+ .../tests/unit/checkpoints/test_contracts.py  | 215 ++++++++++++++++++
+ cinder/volume/driver.py                       |  30 +++
+ 9 files changed, 534 insertions(+), 3 deletions(-)
+ create mode 100644 cinder/checkpoints/__init__.py
+ create mode 100644 cinder/checkpoints/config.py
+ create mode 100644 cinder/checkpoints/contracts.py
+ create mode 100644 cinder/tests/unit/checkpoints/__init__.py
+ create mode 100644 cinder/tests/unit/checkpoints/fake_driver.py
+ create mode 100644 cinder/tests/unit/checkpoints/test_contracts.py
+
+diff --git a/cinder/checkpoints/__init__.py b/cinder/checkpoints/__init__.py
+new file mode 100644
+index 0000000..23d893d
+--- /dev/null
++++ b/cinder/checkpoints/__init__.py
+@@ -0,0 +1 @@
++"""Service-owned native volume checkpoint operations."""
+diff --git a/cinder/checkpoints/config.py b/cinder/checkpoints/config.py
+new file mode 100644
+index 0000000..3650900
+--- /dev/null
++++ b/cinder/checkpoints/config.py
+@@ -0,0 +1,31 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from oslo_config import cfg
++
++
++checkpoint_opts = [
++    cfg.BoolOpt('enabled', default=False,
++                help='Allow creation of new native instance checkpoints. '
++                     'Existing protection and recovery remain active when '
++                     'disabled.'),
++    cfg.ListOpt('nova_service_user_ids', default=[],
++                help='Keystone service user IDs allowed to operate instance '
++                     'checkpoints. An empty list denies service access.'),
++    cfg.IntOpt('reconcile_interval', default=60, min=1,
++               help='Seconds between read-only checkpoint reconciliation.'),
++    cfg.IntOpt('max_volumes_per_operation', default=64, min=1, max=64,
++               help='Maximum number of volumes in one checkpoint operation.'),
++]
++
++CONF = cfg.CONF
++CONF.register_opts(checkpoint_opts, group='checkpoint')
+diff --git a/cinder/checkpoints/contracts.py b/cinder/checkpoints/contracts.py
+new file mode 100644
+index 0000000..fa233e7
+--- /dev/null
++++ b/cinder/checkpoints/contracts.py
+@@ -0,0 +1,124 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Validate the version-one native checkpoint contract.
++
++Driver capability declarations are necessary, but verification of the actual
++volume and its model/firmware/transport profile remains the driver's duty.
++Unknown capabilities deny admission; unknown outcomes retain ownership.
++"""
++
++import copy
++import hashlib
++import json
++import re
++import uuid
++
++from cinder import exception
++
++
++REQUIRED_CAPABILITIES = (
++    'native_snapshot', 'arbitrary_inplace_revert',
++    'preserves_other_checkpoints', 'independent_snapshot_delete',
++    'operation_reconciliation',
++)
++RESULT_STATES = ('succeeded', 'pending', 'failed_no_effect', 'unknown')
++_CODE = re.compile(r'[a-z][a-z0-9_]{0,63}\Z')
++
++
++def unsupported_capabilities(reason: str) -> dict:
++    """Return an explicit denial without guessing legacy driver semantics."""
++    if not isinstance(reason, str) or not _CODE.fullmatch(reason):
++        reason = 'unsupported_driver'
++    return dict(
++        dict.fromkeys(REQUIRED_CAPABILITIES, False),
++        contract_version=1, supported=False, snapshot_semantics='unknown',
++        consistent_group_snapshot=False, driver_identity={},
++        unsupported_reasons=[reason])
++
++
++def validate_capabilities(value: dict) -> dict:
++    """Return an independent, validated capability document or deny access."""
++    def deny():
++        raise exception.CheckpointNotSupported(
++            reason='unverified_capabilities')
++
++    if not isinstance(value, dict):
++        deny()
++    if type(value.get('contract_version')) is not int:
++        deny()
++    if value['contract_version'] != 1 or value.get('supported') is not True:
++        deny()
++    if any(value.get(key) is not True for key in REQUIRED_CAPABILITIES):
++        deny()
++    if value.get('snapshot_semantics') not in ('cow', 'row'):
++        deny()
++    if type(value.get('consistent_group_snapshot')) is not bool:
++        deny()
++    if value.get('unsupported_reasons') != []:
++        deny()
++    identity = value.get('driver_identity')
++    if not isinstance(identity, dict):
++        deny()
++    for key in ('driver_class', 'driver_version', 'profile'):
++        if (not isinstance(identity.get(key), str) or
++                not identity[key].strip() or len(identity[key]) > 255):
++            deny()
++    allowed = set(REQUIRED_CAPABILITIES) | {
++        'contract_version', 'supported', 'snapshot_semantics',
++        'consistent_group_snapshot', 'driver_identity', 'unsupported_reasons',
++    }
++    if set(value) != allowed or set(identity) != {
++            'driver_class', 'driver_version', 'profile'}:
++        deny()
++    return copy.deepcopy(value)
++
++
++def canonical_payload_hash(payload: dict) -> str:
++    """Bind a request to its identity, operation and canonical volume set."""
++    try:
++        if not isinstance(payload, dict):
++            raise ValueError()
++        value = copy.deepcopy(payload)
++        for key in ('request_id', 'checkpoint_id', 'instance_uuid'):
++            value[key] = str(uuid.UUID(value[key]))
++        volumes = value['volume_ids']
++        if not isinstance(volumes, list) or not 1 <= len(volumes) <= 64:
++            raise ValueError()
++        volumes = [str(uuid.UUID(volume_id)) for volume_id in volumes]
++        if len(set(volumes)) != len(volumes):
++            raise ValueError()
++        value['volume_ids'] = sorted(volumes)
++        encoded = json.dumps(value, sort_keys=True, separators=(',', ':'),
++                             ensure_ascii=True, allow_nan=False)
++    except (KeyError, TypeError, ValueError, AttributeError):
++        raise exception.InvalidInput(reason='invalid_checkpoint_payload')
++    return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
++
++
++def validate_driver_result(value: dict) -> dict:
++    """Never interpret malformed backend responses as no effect or success."""
++    unknown = {'status': 'unknown', 'error_code': 'invalid_driver_result'}
++    if not isinstance(value, dict) or value.get('status') not in RESULT_STATES:
++        return unknown
++    if set(value) - {'status', 'backend_reference', 'error_code'}:
++        return unknown
++    if 'backend_reference' in value:
++        ref = value['backend_reference']
++        if not isinstance(ref, str) or not ref or len(ref) > 1024:
++            return unknown
++    if 'error_code' in value:
++        code = value['error_code']
++        if (not isinstance(code, str) or not _CODE.fullmatch(code) or
++                value['status'] == 'succeeded'):
++            return unknown
++    return copy.deepcopy(value)
+diff --git a/cinder/exception.py b/cinder/exception.py
+index 65cf506..62fcf52 100644
+--- a/cinder/exception.py
++++ b/cinder/exception.py
+@@ -132,6 +132,28 @@ class VolumeBackendAPIException(CinderException):
+                 "backend API: %(data)s")
+ 
+ 
++class CheckpointConflict(CinderException):
++    message = _("Checkpoint operation conflict: %(reason)s")
++    code = 409
++    safe = True
++
++
++class CheckpointNotSupported(CheckpointConflict):
++    message = _("Native checkpoint contract is not supported: %(reason)s")
++
++
++class CheckpointOperationNotFound(CinderException):
++    message = _("Checkpoint operation was not found.")
++    code = 404
++    safe = True
++
++
++class CheckpointServiceForbidden(CinderException):
++    message = _("A trusted checkpoint service identity is required.")
++    code = 403
++    safe = True
++
++
+ class VolumeDriverException(CinderException):
+     message = _("Volume driver reported an error: %(message)s")
+ 
+diff --git a/cinder/opts.py b/cinder/opts.py
+index eaf9cde..442ac6a 100644
+--- a/cinder/opts.py
++++ b/cinder/opts.py
+@@ -42,6 +42,7 @@ from cinder.backup.drivers import posix as cinder_backup_drivers_posix
+ from cinder.backup.drivers import s3 as cinder_backup_drivers_s3
+ from cinder.backup.drivers import swift as cinder_backup_drivers_swift
+ from cinder.backup import manager as cinder_backup_manager
++from cinder.checkpoints import config as cinder_checkpoints_config
+ from cinder.cmd import backup as cinder_cmd_backup
+ from cinder.cmd import volume as cinder_cmd_volume
+ from cinder.common import config as cinder_common_config
+@@ -118,8 +119,8 @@ from cinder.volume.drivers.hpe import nimble as \
+     cinder_volume_drivers_hpe_nimble
+ from cinder.volume.drivers.hpe.xp import hpe_xp_rest as \
+     cinder_volume_drivers_hpe_xp_hpexprest
+-from cinder.volume.drivers.huawei import huawei_base_driver as \
+-    cinder_volume_drivers_huawei_huaweibasedriver
++from cinder.volume.drivers.huawei import common as \
++    cinder_volume_drivers_huawei_common
+ from cinder.volume.drivers.ibm import flashsystem_common as \
+     cinder_volume_drivers_ibm_flashsystemcommon
+ from cinder.volume.drivers.ibm import flashsystem_iscsi as \
+@@ -228,6 +229,10 @@ def list_opts():
+                 cinder_zonemanager_drivers_brocade_brcdfabricopts.
+                 brcd_zone_opts,
+             )),
++        ('checkpoint',
++            itertools.chain(
++                cinder_checkpoints_config.checkpoint_opts,
++            )),
+         ('cisco_fabric_example',
+             itertools.chain(
+                 cinder_zonemanager_drivers_cisco_ciscofabricopts.
+@@ -308,7 +313,6 @@ def list_opts():
+                 REST_MIRROR_API_OPTS,
+                 cinder_volume_drivers_hitachi_hbsdreplication.
+                 REST_MIRROR_SSL_OPTS,
+-                cinder_volume_drivers_huawei_huaweibasedriver.huawei_opts,
+                 cinder_volume_drivers_infortrend_raidcmd_cli_commoncli.
+                 infortrend_opts,
+                 cinder_volume_drivers_inspur_as13000_as13000driver.
+@@ -384,6 +388,7 @@ def list_opts():
+                 cinder_volume_drivers_hpe_xp_hpexprest.COMMON_VOLUME_OPTS,
+                 cinder_volume_drivers_hpe_xp_hpexprest.REST_VOLUME_OPTS,
+                 cinder_volume_drivers_hpe_xp_hpexprest.FC_VOLUME_OPTS,
++                cinder_volume_drivers_huawei_common.huawei_opts,
+                 cinder_volume_drivers_ibm_flashsystemcommon.flashsystem_opts,
+                 cinder_volume_drivers_ibm_flashsystemiscsi.
+                 flashsystem_iscsi_opts,
+diff --git a/cinder/tests/unit/checkpoints/__init__.py b/cinder/tests/unit/checkpoints/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/cinder/tests/unit/checkpoints/fake_driver.py b/cinder/tests/unit/checkpoints/fake_driver.py
+new file mode 100644
+index 0000000..85b0f6d
+--- /dev/null
++++ b/cinder/tests/unit/checkpoints/fake_driver.py
+@@ -0,0 +1,103 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""In-memory native storage with observable effects and response faults."""
++
++import collections
++import copy
++
++from cinder.volume import configuration
++from cinder.volume import driver
++
++
++class FakeCheckpointDriver(driver.VolumeDriver):
++    VERSION = '1.0'
++
++    def __init__(self, *args, **kwargs):
++        kwargs.setdefault('configuration',
++                          configuration.Configuration(driver.volume_opts))
++        super().__init__(*args, **kwargs)
++        self.data = {}
++        self.snapshots = {}
++        self.native_calls = []
++        self.query_calls = []
++        self.results = {}
++        self.query_results = {}
++        self.outcomes = collections.defaultdict(collections.deque)
++
++    @property
++    def native_call_count(self):
++        return len(self.native_calls)
++
++    def get_checkpoint_capabilities(self, context, volume):
++        return {
++            'contract_version': 1, 'supported': True,
++            'native_snapshot': True, 'snapshot_semantics': 'row',
++            'arbitrary_inplace_revert': True,
++            'preserves_other_checkpoints': True,
++            'independent_snapshot_delete': True,
++            'operation_reconciliation': True,
++            'consistent_group_snapshot': False,
++            'driver_identity': {
++                'driver_class': 'test.FakeCheckpointDriver',
++                'driver_version': '1.0', 'profile': 'test-row-v1',
++            },
++            'unsupported_reasons': [],
++        }
++
++    def _effect(self, action, volume, snapshot, operation_id):
++        self.native_calls.append((action, volume.id, snapshot.id,
++                                  operation_id))
++        if operation_id in self.results:
++            raise AssertionError('Native effect was dispatched twice')
++        outcome = (self.outcomes[action].popleft() if self.outcomes[action]
++                   else {'status': 'succeeded'})
++        if isinstance(outcome, dict) and outcome.get('status') == (
++                'failed_no_effect'):
++            self.results[operation_id] = copy.deepcopy(outcome)
++            return outcome
++        if action == 'snapshot':
++            self.snapshots[snapshot.id] = (
++                volume.id, copy.deepcopy(self.data.get(volume.id, b'')))
++        elif action == 'revert':
++            source, data = self.snapshots[snapshot.id]
++            if source != volume.id:
++                raise AssertionError('Snapshot belongs to a different volume')
++            self.data[volume.id] = copy.deepcopy(data)
++        elif action == 'delete_snapshot':
++            self.snapshots.pop(snapshot.id, None)
++        else:
++            raise AssertionError('Unexpected native action')
++        self.results[operation_id] = {'status': 'succeeded'}
++        if isinstance(outcome, Exception):
++            # The effect completed but its reply was lost.
++            raise outcome
++        return copy.deepcopy(outcome)
++
++    def checkpoint_create_snapshot(self, context, volume, snapshot,
++                                   operation_id):
++        return self._effect('snapshot', volume, snapshot, operation_id)
++
++    def checkpoint_revert_to_snapshot(self, context, volume, snapshot,
++                                      operation_id):
++        return self._effect('revert', volume, snapshot, operation_id)
++
++    def checkpoint_delete_snapshot(self, context, volume, snapshot,
++                                   operation_id):
++        return self._effect('delete_snapshot', volume, snapshot, operation_id)
++
++    def checkpoint_query_operation(self, context, volume, snapshot,
++                                   operation_id, action):
++        self.query_calls.append((action, volume.id, snapshot.id, operation_id))
++        return copy.deepcopy(self.query_results.get(
++            operation_id,
++            self.results.get(operation_id, {'status': 'unknown'})))
+diff --git a/cinder/tests/unit/checkpoints/test_contracts.py b/cinder/tests/unit/checkpoints/test_contracts.py
+new file mode 100644
+index 0000000..5624df3
+--- /dev/null
++++ b/cinder/tests/unit/checkpoints/test_contracts.py
+@@ -0,0 +1,215 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import copy
++import unittest
++from unittest import mock
++
++from oslo_config import cfg
++
++from cinder.checkpoints import config
++from cinder.checkpoints import contracts
++from cinder import exception
++from cinder.tests.unit import test
++from cinder.volume import configuration
++from cinder.volume import driver
++
++
++def supported_capabilities():
++    return {
++        'contract_version': 1,
++        'supported': True,
++        'native_snapshot': True,
++        'snapshot_semantics': 'row',
++        'arbitrary_inplace_revert': True,
++        'preserves_other_checkpoints': True,
++        'independent_snapshot_delete': True,
++        'operation_reconciliation': True,
++        'consistent_group_snapshot': False,
++        'driver_identity': {
++            'driver_class': 'test.FakeCheckpointDriver',
++            'driver_version': '1.0',
++            'profile': 'test-row-v1',
++        },
++        'unsupported_reasons': [],
++    }
++
++
++def reserve_payload():
++    return {
++        'request_id': '11111111-1111-4111-8111-111111111111',
++        'checkpoint_id': '22222222-2222-4222-8222-222222222222',
++        'instance_uuid': '33333333-3333-4333-8333-333333333333',
++        'kind': 'create',
++        'project_id': 'project-one',
++        'service_user_id': 'nova-service',
++        'volume_ids': ['44444444-4444-4444-8444-444444444444',
++                       'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
++    }
++
++
++class ContractTestCase(unittest.TestCase):
++    def test_default_capabilities_are_not_admitted(self):
++        caps = contracts.unsupported_capabilities('unsupported_driver')
++        self.assertFalse(caps['supported'])
++        self.assertFalse(caps['native_snapshot'])
++        self.assertRaises(exception.CheckpointNotSupported,
++                          contracts.validate_capabilities, caps)
++
++    def test_unknown_semantics_rejected(self):
++        caps = supported_capabilities()
++        caps['snapshot_semantics'] = 'unknown'
++        self.assertRaises(exception.CheckpointNotSupported,
++                          contracts.validate_capabilities, caps)
++
++    def test_row_remains_row_and_group_support_is_optional(self):
++        result = contracts.validate_capabilities(supported_capabilities())
++        self.assertEqual('row', result['snapshot_semantics'])
++        self.assertTrue(result['supported'])
++        self.assertFalse(result['consistent_group_snapshot'])
++
++    def test_missing_false_or_non_boolean_capability_is_rejected(self):
++        for field in ('native_snapshot', 'arbitrary_inplace_revert',
++                      'preserves_other_checkpoints',
++                      'independent_snapshot_delete',
++                      'operation_reconciliation'):
++            for value in (None, False, 'true', 1):
++                with self.subTest(field=field, value=value):
++                    caps = supported_capabilities()
++                    if value is None:
++                        del caps[field]
++                    else:
++                        caps[field] = value
++                    self.assertRaises(exception.CheckpointNotSupported,
++                                      contracts.validate_capabilities, caps)
++
++    def test_missing_profile_or_bad_version_is_rejected(self):
++        for patch in ({'contract_version': True}, {'contract_version': 2},
++                      {'driver_identity': {}}, {'supported': False},
++                      {'unsupported_reasons': ['unverified_profile']},
++                      {'consistent_group_snapshot': 'false'}):
++            with self.subTest(patch=patch):
++                caps = supported_capabilities()
++                caps.update(patch)
++                self.assertRaises(exception.CheckpointNotSupported,
++                                  contracts.validate_capabilities, caps)
++
++    def test_validated_capabilities_do_not_alias_input(self):
++        caps = supported_capabilities()
++        result = contracts.validate_capabilities(caps)
++        result['driver_identity']['profile'] = 'changed'
++        self.assertEqual('test-row-v1', caps['driver_identity']['profile'])
++
++    def test_hash_is_stable_across_key_order_and_volume_order(self):
++        original = reserve_payload()
++        permuted = dict(reversed(list(original.items())))
++        permuted['volume_ids'] = list(reversed(original['volume_ids']))
++        self.assertEqual(contracts.canonical_payload_hash(original),
++                         contracts.canonical_payload_hash(permuted))
++        self.assertEqual(reserve_payload(), original)
++
++    def test_hash_normalizes_volume_uuid_spelling(self):
++        original = reserve_payload()
++        equivalent = copy.deepcopy(original)
++        equivalent['volume_ids'][1] = 'AAAAAAAAAAAA4AAA8AAAAAAAAAAAAAAA'
++        self.assertEqual(contracts.canonical_payload_hash(original),
++                         contracts.canonical_payload_hash(equivalent))
++
++    def test_hash_binds_request_identity_action_and_volume_set(self):
++        original = reserve_payload()
++        for field, value in (
++                ('request_id', '55555555-5555-4555-8555-555555555555'),
++                ('instance_uuid', '66666666-6666-4666-8666-666666666666'),
++                ('checkpoint_id', '77777777-7777-4777-8777-777777777777'),
++                ('kind', 'revert'), ('project_id', 'other-project'),
++                ('service_user_id', 'other-service'),
++                ('volume_ids', ['88888888-8888-4888-8888-888888888888'])):
++            with self.subTest(field=field):
++                changed = copy.deepcopy(original)
++                changed[field] = value
++                self.assertNotEqual(contracts.canonical_payload_hash(original),
++                                    contracts.canonical_payload_hash(changed))
++
++    def test_invalid_or_duplicate_uuid_is_not_hashed(self):
++        for ids in ([], ['not-a-uuid'],
++                    ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
++                     'AAAAAAAAAAAA4AAA8AAAAAAAAAAAAAAA']):
++            payload = reserve_payload()
++            payload['volume_ids'] = ids
++            self.assertRaises(exception.InvalidInput,
++                              contracts.canonical_payload_hash, payload)
++
++    def test_driver_result_preserves_pending_reference(self):
++        result = contracts.validate_driver_result({
++            'status': 'pending', 'backend_reference': 'job-17'})
++        self.assertEqual('pending', result['status'])
++        self.assertEqual('job-17', result['backend_reference'])
++
++    def test_invalid_driver_result_is_unknown_not_success(self):
++        for value in (None, True, {}, {'status': 'available'},
++                      {'status': 'succeeded', 'password': 'secret'},
++                      {'status': 'succeeded', 'error_code': 'backend_failed'},
++                      {'status': 'unknown', 'error_code': '/secret/password'}):
++            with self.subTest(value=value):
++                self.assertEqual(
++                    {'status': 'unknown',
++                     'error_code': 'invalid_driver_result'},
++                    contracts.validate_driver_result(value))
++
++    def test_confirmed_driver_results_preserved(self):
++        for value in ({'status': 'succeeded'},
++                      {'status': 'unknown'},
++                      {'status': 'failed_no_effect',
++                       'error_code': 'backend_rejected'}):
++            self.assertEqual(value, contracts.validate_driver_result(value))
++
++    def test_config_defaults_disable_new_operations_and_service_access(self):
++        conf = cfg.ConfigOpts()
++        conf.register_opts(config.checkpoint_opts, group='checkpoint')
++        self.assertFalse(conf.checkpoint.enabled)
++        self.assertEqual([], conf.checkpoint.nova_service_user_ids)
++        self.assertRaises(ValueError, conf.set_override,
++                          'max_volumes_per_operation', 0,
++                          group='checkpoint')
++
++
++class DefaultDriverContractTestCase(test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.driver = driver.VolumeDriver(configuration=
++                                          configuration.Configuration(
++                                              driver.volume_opts))
++
++    def test_default_driver_is_unsupported(self):
++        caps = self.driver.get_checkpoint_capabilities(None, None)
++        self.assertFalse(caps['native_snapshot'])
++        self.assertRaises(exception.CheckpointNotSupported,
++                          contracts.validate_capabilities, caps)
++
++    def test_default_methods_never_fall_back_to_legacy_operations(self):
++        for action in ('create', 'revert', 'delete'):
++            with self.subTest(action=action), mock.patch.multiple(
++                    self.driver, create_snapshot=mock.DEFAULT,
++                    revert_to_snapshot=mock.DEFAULT,
++                    delete_snapshot=mock.DEFAULT) as legacy:
++                method = getattr(self.driver, {
++                    'create': 'checkpoint_create_snapshot',
++                    'revert': 'checkpoint_revert_to_snapshot',
++                    'delete': 'checkpoint_delete_snapshot',
++                }[action])
++                self.assertRaises(exception.CheckpointNotSupported,
++                                  method, None, None, None, 'step-id')
++                for old_method in legacy.values():
++                    old_method.assert_not_called()
++        self.assertRaises(exception.CheckpointNotSupported,
++                          self.driver.checkpoint_query_operation,
++                          None, None, None, 'step-id', 'snapshot')
+diff --git a/cinder/volume/driver.py b/cinder/volume/driver.py
+index bfd7408..e3c9bb5 100644
+--- a/cinder/volume/driver.py
++++ b/cinder/volume/driver.py
+@@ -25,6 +25,7 @@ from oslo_config import types
+ from oslo_log import log as logging
+ from oslo_utils import excutils
+ 
++from cinder.checkpoints import contracts as checkpoint_contracts
+ from cinder.common import constants
+ from cinder import db
+ from cinder import exception
+@@ -2263,6 +2264,35 @@ class ManageableSnapshotsVD(object, metaclass=abc.ABCMeta):
+ 
+ class VolumeDriver(ManageableVD, CloneableImageVD, ManageableSnapshotsVD,
+                    MigrateVD, BaseVD):
++    def get_checkpoint_capabilities(self, context, volume):
++        """Report verified native checkpoint support for this volume.
++
++        Legacy snapshot or revert support does not establish this contract.
++        A driver must explicitly implement and verify the complete profile.
++        """
++        return checkpoint_contracts.unsupported_capabilities(
++            'unsupported_driver')
++
++    def checkpoint_create_snapshot(self, context, volume, snapshot,
++                                   operation_id):
++        """Create a native snapshot, identified by a durable step UUID."""
++        raise exception.CheckpointNotSupported(reason='unsupported_driver')
++
++    def checkpoint_revert_to_snapshot(self, context, volume, snapshot,
++                                      operation_id):
++        """Restore the selected snapshot in place, preserving other points."""
++        raise exception.CheckpointNotSupported(reason='unsupported_driver')
++
++    def checkpoint_delete_snapshot(self, context, volume, snapshot,
++                                   operation_id):
++        """Delete only this checkpoint snapshot without cascading effects."""
++        raise exception.CheckpointNotSupported(reason='unsupported_driver')
++
++    def checkpoint_query_operation(self, context, volume, snapshot,
++                                   operation_id, action):
++        """Read the outcome of a step without reissuing its native effect."""
++        raise exception.CheckpointNotSupported(reason='unsupported_driver')
++
+     def check_for_setup_error(self):
+         raise NotImplementedError()
+ 

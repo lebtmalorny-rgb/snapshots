@@ -1,0 +1,867 @@
+From 9a5d9ef37db21da6a6dd79e0a85e239a02ac0086 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 12:34:27 +0300
+Subject: [PATCH 09/10] docs: document Nova checkpoint model and recovery
+ boundaries
+
+---
+ api-ref/source/index.rst                      |   1 +
+ api-ref/source/parameters.yaml                | 220 ++++++++++++++++
+ .../server-checkpoints/action-resp.json       |  12 +
+ .../server-checkpoints/capabilities.json      |   7 +
+ .../server-checkpoints/create-req.json        |   6 +
+ .../server-checkpoints/create-resp.json       |  20 ++
+ .../deleted-operation-resp.json               |  12 +
+ .../samples/server-checkpoints/list-resp.json |  12 +
+ .../server-checkpoints/operation-resp.json    |  12 +
+ .../server-checkpoints/revert-req.json        |   5 +
+ .../samples/server-checkpoints/show-resp.json |  10 +
+ api-ref/source/server-checkpoints.inc         | 238 ++++++++++++++++++
+ doc/source/admin/index.rst                    |   1 +
+ doc/source/admin/instance-checkpoints.rst     | 126 +++++++++-
+ .../instance-checkpoints-n1-4a8c2d7e9101.yaml |  24 ++
+ 15 files changed, 704 insertions(+), 2 deletions(-)
+ create mode 100644 api-ref/source/samples/server-checkpoints/action-resp.json
+ create mode 100644 api-ref/source/samples/server-checkpoints/capabilities.json
+ create mode 100644 api-ref/source/samples/server-checkpoints/create-req.json
+ create mode 100644 api-ref/source/samples/server-checkpoints/create-resp.json
+ create mode 100644 api-ref/source/samples/server-checkpoints/deleted-operation-resp.json
+ create mode 100644 api-ref/source/samples/server-checkpoints/list-resp.json
+ create mode 100644 api-ref/source/samples/server-checkpoints/operation-resp.json
+ create mode 100644 api-ref/source/samples/server-checkpoints/revert-req.json
+ create mode 100644 api-ref/source/samples/server-checkpoints/show-resp.json
+ create mode 100644 api-ref/source/server-checkpoints.inc
+ create mode 100644 releasenotes/notes/instance-checkpoints-n1-4a8c2d7e9101.yaml
+
+diff --git a/api-ref/source/index.rst b/api-ref/source/index.rst
+index 765c21a..30af3b6 100644
+--- a/api-ref/source/index.rst
++++ b/api-ref/source/index.rst
+@@ -14,6 +14,7 @@ the `API guide <https://docs.openstack.org/api-guide/compute/index.html>`_.
+ .. include:: urls.inc
+ .. include:: request-ids.inc
+ .. include:: servers.inc
++.. include:: server-checkpoints.inc
+ .. include:: servers-actions.inc
+ .. include:: servers-action-fixed-ip.inc
+ .. include:: servers-action-deferred-delete.inc
+diff --git a/api-ref/source/parameters.yaml b/api-ref/source/parameters.yaml
+index 25e0911..621cf8e 100644
+--- a/api-ref/source/parameters.yaml
++++ b/api-ref/source/parameters.yaml
+@@ -1,4 +1,12 @@
+ # variables in header
++checkpoint_request_header:
++  description: |
++    Client-generated UUID for idempotent DELETE. Required even when
++    replaying.
++  in: header
++  required: true
++  type: string
++  min_version: 2.106
+ image_location:
+   description: |
+     The image location URL of the image or backup created, HTTP header
+@@ -106,6 +114,20 @@ cell_id:
+   in: path
+   required: true
+   type: string
++checkpoint_id_path:
++  description: |
++    Checkpoint UUID belonging to the specified server.
++  in: path
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_operation_path:
++  description: |
++    Operation UUID belonging to the specified server.
++  in: path
++  required: true
++  type: string
++  min_version: 2.106
+ console_id:
+   description: |
+     The UUID of the console.
+@@ -582,6 +604,21 @@ changes_since_server:
+   in: query
+   required: false
+   type: string
++checkpoint_limit:
++  description: |
++    Maximum page size, from 1 to 1000; default 100.
++  in: query
++  required: false
++  type: integer
++  min_version: 2.106
++checkpoint_marker:
++  description: |
++    Checkpoint UUID to continue after. Must belong to this server; a
++    deleted point may be used.
++  in: query
++  required: false
++  type: string
++  min_version: 2.106
+ config_drive_query_server:
+   description: |
+     Filter the server list result by the config drive setting of the server.
+@@ -2067,6 +2104,189 @@ changePassword:
+   in: body
+   required: true
+   type: object
++checkpoint_active_operation:
++  description: |
++    UUID of the current operation, or null when there is no active
++    operation.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_body:
++  description: |
++    Public checkpoint projection. Internal resource locations and owner
++    tokens are omitted.
++  in: body
++  required: true
++  type: object
++  min_version: 2.106
++checkpoint_capabilities:
++  description: |
++    Live support projection for the server.
++  in: body
++  required: true
++  type: object
++  min_version: 2.106
++checkpoint_created_at:
++  description: |
++    Creation timestamp in ISO 8601 format.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_error_code:
++  description: |
++    Closed diagnostic reason code, or null. Raw backend exception text is
++    never returned.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_id_body:
++  description: |
++    Server-generated checkpoint UUID.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_include_memory:
++  description: |
++    Must be true if supplied. Defaults to true; disk-only requests are
++    rejected.
++  in: body
++  required: false
++  type: boolean
++  min_version: 2.106
++checkpoint_name_body:
++  description: |
++    Checkpoint display name, possibly empty.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_name_request:
++  description: |
++    Display name, at most 255 characters. Defaults to an empty string.
++  in: body
++  required: false
++  type: string
++  min_version: 2.106
++checkpoint_operation_body:
++  description: |
++    Public operation projection. Poll its UUID for the latest state after
++    acceptance.
++  in: body
++  required: true
++  type: object
++  min_version: 2.106
++checkpoint_operation_id:
++  description: |
++    Server-generated durable operation UUID.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_operation_kind:
++  description: |
++    Operation kind: create, revert or delete.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_operation_phase:
++  description: |
++    Most recently claimed workflow phase, or null before the first claim.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_operation_state:
++  description: |
++    State: reserved, running, recovery_required, succeeded, released or
++    failed. Failed create cleanup can still hold resources and quota;
++    failure alone is not a release proof.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_profile:
++  description: |
++    Executor profile kvm-bios-same-host-v1 when supported; otherwise null.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_reasons:
++  description: |
++    Closed reason codes; empty when supported. May report disabled,
++    executor_unsupported, invalid_executor_result, executor_unavailable,
++    executor_rejected, incompatible_service, unsupported_profile,
++    quota_exceeded, guard_busy, identity_changed, invalid_state,
++    operation_conflict, recovery_required, cell_unavailable,
++    admission_cancelled or resources_remaining.
++  in: body
++  required: true
++  type: array
++  min_version: 2.106
++checkpoint_request_body:
++  description: |
++    Create request containing request_id and optional name/include_memory.
++  in: body
++  required: true
++  type: object
++  min_version: 2.106
++checkpoint_request_id:
++  description: |
++    Client-generated UUID for idempotency, scoped to project/server across
++    actions. Actor, action and payload must match on replay.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_revert_body:
++  description: |
++    Revert action containing only request_id.
++  in: body
++  required: true
++  type: object
++  min_version: 2.106
++checkpoint_server_id:
++  description: |
++    UUID of the original server. Revert does not create a new server.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_status:
++  description: |
++    Checkpoint status: creating, available or deleting. Deleted points are
++    omitted from reads.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoint_supported:
++  description: |
++    Whether the live executor accepts the profile. False by default in N1.
++  in: body
++  required: true
++  type: boolean
++  min_version: 2.106
++checkpoint_updated_at:
++  description: |
++    Last operation update timestamp in ISO 8601 format, or null before an
++    update.
++  in: body
++  required: true
++  type: string
++  min_version: 2.106
++checkpoints_body:
++  description: |
++    Retained checkpoint projections; excludes deleted tombstones.
++  in: body
++  required: true
++  type: array
++  min_version: 2.106
+ cidr:
+   description: |
+     The CIDR for address range.
+diff --git a/api-ref/source/samples/server-checkpoints/action-resp.json b/api-ref/source/samples/server-checkpoints/action-resp.json
+new file mode 100644
+index 0000000..60639bb
+--- /dev/null
++++ b/api-ref/source/samples/server-checkpoints/action-resp.json
+@@ -0,0 +1,12 @@
++{
++  "operation": {
++    "id": "c4a5e84e-25c2-4ad6-a3a7-b6cd27d746c0",
++    "checkpoint_id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++    "kind": "revert",
++    "state": "reserved",
++    "phase": null,
++    "error_code": null,
++    "created_at": "2026-10-07T09:10:56.071183+00:00",
++    "updated_at": "2026-10-07T09:10:56.074958+00:00"
++  }
++}
+diff --git a/api-ref/source/samples/server-checkpoints/capabilities.json b/api-ref/source/samples/server-checkpoints/capabilities.json
+new file mode 100644
+index 0000000..4fa0e72
+--- /dev/null
++++ b/api-ref/source/samples/server-checkpoints/capabilities.json
+@@ -0,0 +1,7 @@
++{
++  "capabilities": {
++    "supported": true,
++    "reasons": [],
++    "profile": "kvm-bios-same-host-v1"
++  }
++}
+diff --git a/api-ref/source/samples/server-checkpoints/create-req.json b/api-ref/source/samples/server-checkpoints/create-req.json
+new file mode 100644
+index 0000000..48e8db1
+--- /dev/null
++++ b/api-ref/source/samples/server-checkpoints/create-req.json
+@@ -0,0 +1,6 @@
++{
++  "checkpoint": {
++    "name": "A",
++    "request_id": "ea4a2bc5-e5c5-4460-aba0-d0036f125377"
++  }
++}
+diff --git a/api-ref/source/samples/server-checkpoints/create-resp.json b/api-ref/source/samples/server-checkpoints/create-resp.json
+new file mode 100644
+index 0000000..defcb07
+--- /dev/null
++++ b/api-ref/source/samples/server-checkpoints/create-resp.json
+@@ -0,0 +1,20 @@
++{
++  "checkpoint": {
++    "id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++    "server_id": "7b04ded1-420c-470f-b083-a954ae620493",
++    "name": "A",
++    "status": "available",
++    "created_at": "2026-10-07T09:10:55.811689+00:00",
++    "operation_id": null
++  },
++  "operation": {
++    "id": "c64496f7-dc78-4334-882e-dd45f76e4916",
++    "checkpoint_id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++    "kind": "create",
++    "state": "reserved",
++    "phase": null,
++    "error_code": null,
++    "created_at": "2026-10-07T09:10:55.812425+00:00",
++    "updated_at": "2026-10-07T09:10:55.821933+00:00"
++  }
++}
+diff --git a/api-ref/source/samples/server-checkpoints/deleted-operation-resp.json b/api-ref/source/samples/server-checkpoints/deleted-operation-resp.json
+new file mode 100644
+index 0000000..8e8687e
+--- /dev/null
++++ b/api-ref/source/samples/server-checkpoints/deleted-operation-resp.json
+@@ -0,0 +1,12 @@
++{
++  "operation": {
++    "id": "7e310c67-1361-473a-a18d-fd0b577d84fb",
++    "checkpoint_id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++    "kind": "delete",
++    "state": "released",
++    "phase": "cinder_release",
++    "error_code": null,
++    "created_at": "2026-10-07T09:10:56.326885+00:00",
++    "updated_at": "2026-10-07T09:10:56.473012+00:00"
++  }
++}
+diff --git a/api-ref/source/samples/server-checkpoints/list-resp.json b/api-ref/source/samples/server-checkpoints/list-resp.json
+new file mode 100644
+index 0000000..799aa4b
+--- /dev/null
++++ b/api-ref/source/samples/server-checkpoints/list-resp.json
+@@ -0,0 +1,12 @@
++{
++  "checkpoints": [
++    {
++      "id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++      "server_id": "7b04ded1-420c-470f-b083-a954ae620493",
++      "name": "A",
++      "status": "available",
++      "created_at": "2026-10-07T09:10:55.811689+00:00",
++      "operation_id": null
++    }
++  ]
++}
+diff --git a/api-ref/source/samples/server-checkpoints/operation-resp.json b/api-ref/source/samples/server-checkpoints/operation-resp.json
+new file mode 100644
+index 0000000..e0017bd
+--- /dev/null
++++ b/api-ref/source/samples/server-checkpoints/operation-resp.json
+@@ -0,0 +1,12 @@
++{
++  "operation": {
++    "id": "c4a5e84e-25c2-4ad6-a3a7-b6cd27d746c0",
++    "checkpoint_id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++    "kind": "revert",
++    "state": "succeeded",
++    "phase": "cinder_release",
++    "error_code": null,
++    "created_at": "2026-10-07T09:10:56.071183+00:00",
++    "updated_at": "2026-10-07T09:10:56.232125+00:00"
++  }
++}
+diff --git a/api-ref/source/samples/server-checkpoints/revert-req.json b/api-ref/source/samples/server-checkpoints/revert-req.json
+new file mode 100644
+index 0000000..4483e97
+--- /dev/null
++++ b/api-ref/source/samples/server-checkpoints/revert-req.json
+@@ -0,0 +1,5 @@
++{
++  "revert": {
++    "request_id": "671de9ae-97b5-4042-9e5a-d0274fbf072f"
++  }
++}
+diff --git a/api-ref/source/samples/server-checkpoints/show-resp.json b/api-ref/source/samples/server-checkpoints/show-resp.json
+new file mode 100644
+index 0000000..d79a877
+--- /dev/null
++++ b/api-ref/source/samples/server-checkpoints/show-resp.json
+@@ -0,0 +1,10 @@
++{
++  "checkpoint": {
++    "id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++    "server_id": "7b04ded1-420c-470f-b083-a954ae620493",
++    "name": "A",
++    "status": "available",
++    "created_at": "2026-10-07T09:10:55.811689+00:00",
++    "operation_id": null
++  }
++}
+diff --git a/api-ref/source/server-checkpoints.inc b/api-ref/source/server-checkpoints.inc
+new file mode 100644
+index 0000000..396e7ab
+--- /dev/null
++++ b/api-ref/source/server-checkpoints.inc
+@@ -0,0 +1,238 @@
++.. -*- rst -*-
++
++=========================================
++Server checkpoints (private N1 extension)
++=========================================
++
++All routes in this section require microversion ``2.106`` in this fork.
++N1 implements a durable model, not a working production RAM snapshot engine.
++The production executor reports unsupported until N2 and backend validation
++are delivered. The successful examples below were captured from real Nova
++WSGI/RPC tests using a test-only executor.
++
++Project readers may inspect their server's resources; project members may
++mutate them. Authorization is checked again for idempotent retries. System
++scope and a different project cannot access these resources. Requests reject
++unknown body/query fields. Host/path information, tokens and raw backend
++evidence are never returned.
++
++Mutation responses are ``202 Accepted``. Poll the operation UUID for the
++current result. Request UUIDs are unique within a project/server across all
++three actions. Exact retries by the same actor and with the same action and
++payload resolve to the original operation. Conflicting reuse returns ``409``.
++A retry does not authorize re-execution of a claimed destructive step.
++Timeouts do not imply cancellation or quota refund.
++
++Inspect checkpoint capabilities
++===============================
++
++.. rest_method:: GET /servers/{server_id}/checkpoint-capabilities
++
++Report live executor support for this server. A supported service/RPC version
++alone does not prove support. When creation is disabled, the response has
++``supported: false``, ``reasons: ["disabled"]`` and ``profile: null``.
++
++Normal response codes: 200
++
++Error response codes: badRequest(400), forbidden(403), itemNotFound(404),
++conflict(409), serviceUnavailable(503)
++
++.. rest_parameters:: parameters.yaml
++
++  - server_id: server_id_path
++  - capabilities: checkpoint_capabilities
++  - supported: checkpoint_supported
++  - reasons: checkpoint_reasons
++  - profile: checkpoint_profile
++
++.. literalinclude:: samples/server-checkpoints/capabilities.json
++   :language: json
++
++Create a checkpoint
++===================
++
++.. rest_method:: POST /servers/{server_id}/checkpoints
++
++Request one independent point including runtime memory and all supported
++writable disks. Disk subsets and memory-free checkpoints are not accepted.
++New create is denied when disabled, the executor is unsupported, identity has
++changed, ownership is busy or the count/byte budget is exhausted. The default
++byte budget is zero. Pending work and incomplete cleanup remain charged.
++
++Normal response codes: 202
++
++Error response codes: badRequest(400), forbidden(403), itemNotFound(404),
++conflict(409), overLimit(413), serviceUnavailable(503)
++
++Request
++-------
++
++.. rest_parameters:: parameters.yaml
++
++  - server_id: server_id_path
++  - checkpoint: checkpoint_request_body
++  - request_id: checkpoint_request_id
++  - name: checkpoint_name_request
++  - include_memory: checkpoint_include_memory
++
++.. literalinclude:: samples/server-checkpoints/create-req.json
++   :language: json
++
++Response
++--------
++
++.. rest_parameters:: parameters.yaml
++
++  - checkpoint: checkpoint_body
++  - operation: checkpoint_operation_body
++
++The checkpoint can already be available when the HTTP response arrives.
++The included operation is an acceptance projection; read its resource for
++the latest state. These two projections are not an atomic state snapshot.
++
++.. literalinclude:: samples/server-checkpoints/create-resp.json
++   :language: json
++
++List checkpoints
++================
++
++.. rest_method:: GET /servers/{server_id}/checkpoints
++
++List retained points ordered by creation time and UUID. Deleted tombstones
++are omitted. A marker must belong to the same server; a deleted point remains
++a valid marker. No cross-server or cross-cell list is exposed.
++
++Normal response codes: 200
++
++Error response codes: badRequest(400), forbidden(403), itemNotFound(404),
++serviceUnavailable(503)
++
++.. rest_parameters:: parameters.yaml
++
++  - server_id: server_id_path
++  - limit: checkpoint_limit
++  - marker: checkpoint_marker
++  - checkpoints: checkpoints_body
++
++.. literalinclude:: samples/server-checkpoints/list-resp.json
++   :language: json
++
++Show a checkpoint
++=================
++
++.. rest_method:: GET /servers/{server_id}/checkpoints/{checkpoint_id}
++
++Show one retained point. A deleted checkpoint returns ``404``; its operation
++history remains addressable while the server is addressable.
++
++Normal response codes: 200
++
++Error response codes: badRequest(400), forbidden(403), itemNotFound(404),
++serviceUnavailable(503)
++
++.. rest_parameters:: parameters.yaml
++
++  - server_id: server_id_path
++  - checkpoint_id: checkpoint_id_path
++  - checkpoint: checkpoint_body
++  - id: checkpoint_id_body
++  - server_id: checkpoint_server_id
++  - name: checkpoint_name_body
++  - status: checkpoint_status
++  - created_at: checkpoint_created_at
++  - operation_id: checkpoint_active_operation
++
++.. literalinclude:: samples/server-checkpoints/show-resp.json
++   :language: json
++
++Revert to a checkpoint
++======================
++
++.. rest_method:: POST /servers/{server_id}/checkpoints/{checkpoint_id}/action
++
++Restore the same server's runtime and disk contents without replacing its
++server/volume/port UUIDs. This does not restore IP leases, security groups or
++other external network state. A new revert still requires a supported live
++probe, even when new creation is disabled. Partial or unknown results retain
++ownership and prevent an unsafe guest restart; there is no force option.
++
++Normal response codes: 202
++
++Error response codes: badRequest(400), forbidden(403), itemNotFound(404),
++conflict(409), overLimit(413), serviceUnavailable(503)
++
++.. rest_parameters:: parameters.yaml
++
++  - server_id: server_id_path
++  - checkpoint_id: checkpoint_id_path
++  - revert: checkpoint_revert_body
++  - request_id: checkpoint_request_id
++  - operation: checkpoint_operation_body
++
++.. literalinclude:: samples/server-checkpoints/revert-req.json
++   :language: json
++
++.. literalinclude:: samples/server-checkpoints/action-resp.json
++   :language: json
++
++Delete a checkpoint
++===================
++
++.. rest_method:: DELETE /servers/{server_id}/checkpoints/{checkpoint_id}
++
++Supply ``OpenStack-Checkpoint-Request-ID`` with a client-generated UUID.
++Delete has no request body. Completion requires proof of resource deletion;
++quota remains charged while resources or an uncertain result remain. Deleting
++one point must preserve the others. New delete remains available when new
++creation is disabled, subject to live executor support and ownership checks.
++An exact replay after deletion resolves to the original operation.
++
++Normal response codes: 202
++
++Error response codes: badRequest(400), forbidden(403), itemNotFound(404),
++conflict(409), overLimit(413), serviceUnavailable(503)
++
++.. rest_parameters:: parameters.yaml
++
++  - server_id: server_id_path
++  - checkpoint_id: checkpoint_id_path
++  - OpenStack-Checkpoint-Request-ID: checkpoint_request_header
++  - operation: checkpoint_operation_body
++
++Read an operation
++=================
++
++.. rest_method:: GET /servers/{server_id}/checkpoint-operations/{operation_id}
++
++Read the durable operation's public projection. ``recovery_required`` is an
++unresolved outcome, not permission to repeat effects or clear ownership.
++Disabling the feature does not remove existing read or recovery paths.
++
++Normal response codes: 200
++
++Error response codes: badRequest(400), forbidden(403), itemNotFound(404),
++serviceUnavailable(503)
++
++.. rest_parameters:: parameters.yaml
++
++  - server_id: server_id_path
++  - operation_id: checkpoint_operation_path
++  - operation: checkpoint_operation_body
++  - id: checkpoint_operation_id
++  - checkpoint_id: checkpoint_id_body
++  - kind: checkpoint_operation_kind
++  - state: checkpoint_operation_state
++  - phase: checkpoint_operation_phase
++  - error_code: checkpoint_error_code
++  - created_at: checkpoint_created_at
++  - updated_at: checkpoint_updated_at
++
++Completed revert:
++
++.. literalinclude:: samples/server-checkpoints/operation-resp.json
++   :language: json
++
++Completed delete after resource proof and quota release:
++
++.. literalinclude:: samples/server-checkpoints/deleted-operation-resp.json
++   :language: json
+diff --git a/doc/source/admin/index.rst b/doc/source/admin/index.rst
+index 30532ea..56c7bd1 100644
+--- a/doc/source/admin/index.rst
++++ b/doc/source/admin/index.rst
+@@ -151,6 +151,7 @@ log management and live migration of instances.
+    live-migration-usage
+    secure-live-migration-with-qemu-native-tls
+    manage-volumes
++   instance-checkpoints
+    manage-shares
+    flavors
+    admin-password-injection
+diff --git a/doc/source/admin/instance-checkpoints.rst b/doc/source/admin/instance-checkpoints.rst
+index 836c3d1..4ac0922 100644
+--- a/doc/source/admin/instance-checkpoints.rst
++++ b/doc/source/admin/instance-checkpoints.rst
+@@ -97,5 +97,127 @@ to local claims; a copied Instance row is not a transferable checkpoint owner.
+ Runtime proof against real RPC, hypervisor, Neutron and SAN is separate from
+ unit SQL/serializer evidence.
+ 
+-The remaining API, recovery and deployment sections are completed with the
+-N1 integration and delivery tasks.
++Versions and activation boundary
++--------------------------------
++
++This fork reserves Compute API microversion ``2.106``, compute RPC ``6.5``,
++compute-task RPC ``1.26`` and service version ``69``. The general conductor
++RPC stays at ``3.0`` and the ordinary Instance object at ``2.8``. These private
++numbers do not imply compatibility with another fork using the same numbers.
++Mixed versions and a missing or unsupported live probe deny admission before
++any checkpoint effect. A positive version check alone is insufficient.
++
++The intended N2 profile is ``kvm-bios-same-host-v1``: KVM/libvirt, BIOS and the
++same compute, with every writable disk backed by Cinder. Ephemeral and swap
++disks, shares, multiattach, passthrough, vTPM and confidential VMs are outside
++this profile. Unknown properties must not be treated as supported. N2 must
++validate the actual domain, device topology, backend capabilities and runtime
++key material before destructive effects. N1 only validates its DB projection.
++It never registers the test executor as a production driver.
++
++Schema rollout precedes activation:
++
++#. Keep new checkpoint creation disabled. Upgrade the API DB through migration
++   ``71be90d2c402`` using the normal ``nova-manage api_db sync`` procedure.
++#. Upgrade every cell DB, including cell0, through ``4a8c2d7e9101`` using
++   ``nova-manage db sync`` with that cell's database configuration.
++#. Upgrade every API, conductor, compute and other DB writer. Old writers do
++   not participate in the guards. This is not a mixed-writer activation mode.
++#. Before any future activation, complete N2/backend validation, credential
++   design and runtime fault testing; configure all writers consistently.
++
++This sequence describes schema prerequisites, not a claim that N1 can be
++activated for production RAM checkpoints. Do not run these commands against
++an operating cloud merely to reproduce the local N1 test suite.
++
++The ``[checkpoint]`` defaults are::
++
++    enabled = false
++    max_checkpoints_per_instance = 8
++    max_checkpoints_per_project = 100
++    max_artifact_bytes_per_project = 0
++    reconcile_interval = 60
++
++Zero bytes denies new creates; it does not mean unlimited. Negative limits are
++invalid. Pending and retained checkpoints and resources awaiting cleanup all
++consume the count and byte reservations. The byte limit includes staging.
++This ledger is separate from ordinary Nova quotas and spans all project cells.
++
++Admission and recovery
++----------------------
++
++The API DB stores project usage and quota tickets. Each cell stores checkpoint,
++disk, artifact, operation, step, guard and admission-cancellation records.
++There is no transaction spanning the API and cell databases. Create reserves
++a global ticket, admits under the Instance lock, confirms that same ticket,
++marks the cell operation quota-ready, then dispatches. A step cannot be claimed
++before quota readiness. Request UUID reuse is scoped to project and server;
++the actor, action and canonical payload must also match. Authorization is
++checked again on every replay.
++
++Cancellation writes a durable cell tombstone before refunding the ticket.
++Late admission of that operation is then fenced. Delete and completed create
++cleanup release usage only after a durable cell proof that all owned resources
++are gone. A timeout, missing reply, down cell or one ``operation not found``
++response never refunds a ticket. Successful create holds its ticket until
++deletion. Byte growth reserves globally before writing; shrink records a
++versioned cell proof before reducing the global charge.
++
++Each backend intent receives a stable UUID before I/O. Once claimed, an
++uncertain step is queried by that UUID, never blindly executed again.
++Conductor startup and bounded periodic passes reconcile quota and local-cell
++journals independently, even when creation is disabled. Unclaimed subsequent
++steps can proceed only after the previous result is proven. Incomplete revert
++or unknown runtime effects retain ownership and block automatic guest start,
++power synchronization and conflicting callbacks. A restart does not grant
++takeover. Generation remains 1 in N1.
++
++Runtime-save evidence and published artifacts must identify the same objects,
++including kind, logical identifier, checksum and bytes. Two live points on
++the same VM cannot reuse a raw artifact or snapshot identifier. N2 additionally
++owns namespace isolation across VMs/cells and real backend retention semantics.
++Deleting A must not remove B's data.
++
++The requesting user's UUID is audit identity, not a credential. N1 does not
++persist bearer tokens or recover an expired user's token. Recovery creates a
++service context for internal journal work; it does not impersonate the Cinder
++C1 owner. N2 must define and validate background Cinder authorization. Current
++Neutron port identity is checked, but IP leases, security groups and external
++network state are not rolled back. SAN, libvirt and RabbitMQ behavior requires
++separate runtime evidence.
++
++Read-only diagnosis
++-------------------
++
++Use ``GET /servers/{server_id}/checkpoint-capabilities`` at microversion
++``2.106`` to inspect support and closed reason codes. Default N1 returns
++unsupported. Project readers can list/show checkpoints and inspect
++``GET /servers/{server_id}/checkpoint-operations/{operation_id}``; project
++members can request create/revert/delete. System scope and another project's
++server are not an authorization shortcut. Public responses omit host, paths,
++tokens, executor internals and per-disk backend evidence.
++
++After a ``202`` response, poll the operation resource. The acceptance projection
++and checkpoint projection can be observed at different instants: completion
++can precede the HTTP response. ``recovery_required`` means inspect the journal,
++not retry the backend manually. For example, with an existing authenticated
++token and server UUID::
++
++    curl -H "X-Auth-Token: $OS_TOKEN" \
++      -H "OpenStack-API-Version: compute 2.106" \
++      "$COMPUTE_ENDPOINT/servers/$SERVER_ID/checkpoint-capabilities"
++
++Operators can correlate the operation UUID, phase and closed error code with
++read-only cell journal records and the original API DB ticket. Check the
++Instance guard, step status/evidence, quota readiness and release proof before
++diagnosing a stranded operation. Treat internal tokens and resource locations
++as sensitive; do not copy raw journal rows into public API responses or logs.
++Ordinary queued/running claims with unknown outcomes are quarantined for
++investigation. N1 intentionally has no force-unlock, expiry, SQL repair command
++or automatic ordinary-worker takeover. Do not clear task state or delete
++ownership/quota rows to make an operation appear finished.
++
++The normal archive/purge path retains durable checkpoint history, including
++deleted/tombstone records. Tests use two SQL cells, actual WSGI/RPC serializers,
++MySQL/PostgreSQL lock races and test-only effects. They establish the N1
++protocol, not live Keystone, hypervisor, storage or network readiness.
+diff --git a/releasenotes/notes/instance-checkpoints-n1-4a8c2d7e9101.yaml b/releasenotes/notes/instance-checkpoints-n1-4a8c2d7e9101.yaml
+new file mode 100644
+index 0000000..263aea8
+--- /dev/null
++++ b/releasenotes/notes/instance-checkpoints-n1-4a8c2d7e9101.yaml
+@@ -0,0 +1,24 @@
++---
++features:
++  - |
++    This fork adds the private instance checkpoint model at Compute API
++    microversion 2.106: a cell-local durable operation journal, project-wide
++    count/byte reservations, ownership guards and reconciliation. Production
++    executors remain unsupported. RAM and Cinder effects require the separate
++    N2 implementation and backend/runtime validation.
++upgrade:
++  - |
++    Apply API DB migration 71be90d2c402 and cell DB migration 4a8c2d7e9101
++    before running the new writers. Future activation requires every writer
++    to be upgraded, compute RPC 6.5, compute-task RPC 1.26, service version 69
++    and a supported live executor probe. Mixed-writer activation is unsupported.
++    The default is disabled, with limits of 8 checkpoints per instance,
++    100 per project and zero artifact bytes; zero denies creation.
++security:
++  - |
++    Checkpoint request replay rechecks project authorization. Internal owner
++    tokens never enter public responses or notification contexts. Recovery
++    does not persist or impersonate the requesting user's token. Timeouts,
++    disabling creation and administrative state reset do not release durable
++    ownership or reserved quota. No force-unlock or ordinary-worker takeover
++    is provided by N1.

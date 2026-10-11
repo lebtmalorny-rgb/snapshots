@@ -1,0 +1,2499 @@
+From 152ec38b133b9ac8558fb36ac003b9fac3383ed1 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 09:15:09 +0300
+Subject: [PATCH 02/10] feat: persist cell checkpoint journal and admission
+ cancellation
+
+---
+ nova/checkpoints/contracts.py                 |   4 +
+ nova/compute/task_states.py                   |   6 +
+ nova/db/main/checkpoints.py                   | 946 ++++++++++++++++++
+ .../4a8c2d7e9101_add_instance_checkpoints.py  | 207 ++++
+ nova/db/main/models.py                        | 157 +++
+ nova/objects/__init__.py                      |   1 +
+ nova/objects/checkpoint.py                    | 341 +++++++
+ nova/tests/unit/checkpoints/test_cell_db.py   | 553 ++++++++++
+ nova/tests/unit/checkpoints/test_contracts.py |   2 +-
+ nova/tests/unit/db/main/test_api.py           |   5 +
+ nova/tests/unit/db/main/test_migrations.py    |  33 +
+ nova/tests/unit/objects/test_checkpoint.py    |  92 ++
+ nova/tests/unit/objects/test_objects.py       |  10 +
+ 13 files changed, 2356 insertions(+), 1 deletion(-)
+ create mode 100644 nova/db/main/checkpoints.py
+ create mode 100644 nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py
+ create mode 100644 nova/objects/checkpoint.py
+ create mode 100644 nova/tests/unit/checkpoints/test_cell_db.py
+ create mode 100644 nova/tests/unit/objects/test_checkpoint.py
+
+diff --git a/nova/checkpoints/contracts.py b/nova/checkpoints/contracts.py
+index ceb0958..f4293a5 100644
+--- a/nova/checkpoints/contracts.py
++++ b/nova/checkpoints/contracts.py
+@@ -219,9 +219,13 @@ class Admission(_Contract):
+     fingerprint: str
+     device_manifest: dict
+     artifact_upper_bound: int
++    executor_id: str
++    name: str = ''
+ 
+     def _validate(self):
+         _require(type(self.key) is RequestKey)
++        _string(self.executor_id)
++        _require(type(self.name) is str and len(self.name) <= 255)
+         for value in (self.operation_id, self.checkpoint_id, self.cell_uuid):
+             _uuid(value)
+         _integer(self.artifact_upper_bound, minimum=1)
+diff --git a/nova/compute/task_states.py b/nova/compute/task_states.py
+index d549eb7..a3520ed 100644
+--- a/nova/compute/task_states.py
++++ b/nova/compute/task_states.py
+@@ -130,3 +130,9 @@ resizing_states = (RESIZE_PREP, RESIZE_MIGRATING, RESIZE_MIGRATED,
+ 
+ # These states indicate a rebuild
+ rebuild_states = (REBUILDING, REBUILD_BLOCK_DEVICE_MAPPING, REBUILD_SPAWNING)
++
++# Durable checkpoint operations; ownership is also held in the cell journal.
++CHECKPOINT_CREATING = 'checkpoint_creating'
++CHECKPOINT_REVERTING = 'checkpoint_reverting'
++CHECKPOINT_DELETING = 'checkpoint_deleting'
++CHECKPOINT_RECOVERING = 'checkpoint_recovering'
+diff --git a/nova/db/main/checkpoints.py b/nova/db/main/checkpoints.py
+new file mode 100644
+index 0000000..1970f0b
+--- /dev/null
++++ b/nova/db/main/checkpoints.py
+@@ -0,0 +1,946 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Cell-local checkpoint journal. SQL transactions never contain external I/O.
++
++Every ownership transition serializes on the Instance row, then guard,
++checkpoint, operation and children. The SQLite write fence acquires the same
++serialization before a read; MySQL/PostgreSQL also use row locks. Identity
++mutation paths join this fence in guards integration.
++"""
++
++import hashlib
++import secrets
++
++from oslo_db import api as oslo_db_api
++from oslo_serialization import jsonutils
++from oslo_utils import uuidutils
++import sqlalchemy as sa
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import workflow
++from nova.compute import task_states
++from nova.compute import vm_states
++from nova import conf
++from nova.db.main import api as db
++from nova.db.main import models as m
++from nova.db.utils import require_context
++from nova import exception
++
++CONF = conf.CONF
++_JSON_COLUMNS = frozenset(
++    ('device_manifest', 'admission', 'payload', 'result')
++)
++
++
++def _conflict(reason='operation_conflict'):
++    raise exception.CheckpointConflict(reason=reason)
++
++
++def _row(row):
++    if row is None:
++        return None
++    value = {
++        column.name: getattr(row, column.name)
++        for column in row.__table__.columns
++    }
++    for key in _JSON_COLUMNS & value.keys():
++        if value[key] is not None:
++            value[key] = jsonutils.loads(value[key])
++    return value
++
++
++def _encode(value):
++    return jsonutils.dumps(value, sort_keys=True, separators=(',', ':'))
++
++
++def _authorize(context, project_id):
++    if not context.is_admin and context.project_id != project_id:
++        raise exception.NotFound()
++
++
++def _instance(context, instance_uuid, lock=False):
++    query = context.session.query(m.Instance).filter_by(
++        uuid=instance_uuid, deleted=0
++    )
++    if lock:
++        # Explicit updated_at assignment prevents the no-op fence from changing
++        # a user-visible timestamp. SQLite SELECT FOR UPDATE alone is no fence.
++        query.update(
++            {
++                m.Instance.uuid: m.Instance.uuid,
++                m.Instance.updated_at: m.Instance.updated_at,
++            },
++            synchronize_session=False,
++        )
++        query = query.with_for_update()
++    instance = query.first()
++    if instance is None:
++        raise exception.InstanceNotFound(instance_id=instance_uuid)
++    _authorize(context, instance.project_id)
++    return instance
++
++
++def _guard(context, instance_uuid):
++    guard = (
++        context.session.query(m.InstanceCheckpointGuard)
++        .filter_by(instance_uuid=instance_uuid)
++        .with_for_update()
++        .first()
++    )
++    if guard is None:
++        guard = m.InstanceCheckpointGuard(
++            instance_uuid=instance_uuid,
++            generation=1,
++            checkpoint_count=0,
++            version=1,
++        )
++        context.session.add(guard)
++        context.session.flush()
++    return guard
++
++
++def _checkpoint(context, checkpoint_id, lock=False):
++    query = context.session.query(m.InstanceCheckpoint).filter_by(
++        uuid=checkpoint_id
++    )
++    if lock:
++        query = query.with_for_update()
++    checkpoint = query.first()
++    if checkpoint is None:
++        raise exception.NotFound()
++    _authorize(context, checkpoint.project_id)
++    return checkpoint
++
++
++def _operation(context, operation_id):
++    operation = (
++        context.session.query(m.InstanceCheckpointOperation)
++        .filter_by(uuid=operation_id)
++        .first()
++    )
++    if operation is None:
++        raise exception.NotFound()
++    _authorize(context, operation.project_id)
++    return operation
++
++
++def _owned(context, operation_id, generation=1):
++    # The first read locates the immutable instance UUID; refresh after
++    # locking.
++    operation = _operation(context, operation_id)
++    instance = _instance(context, operation.instance_uuid, lock=True)
++    guard = _guard(context, instance.uuid)
++    checkpoint = _checkpoint(context, operation.checkpoint_id, lock=True)
++    context.session.refresh(operation, with_for_update=True)
++    if (
++        type(generation) is not int or
++        generation != 1 or
++        operation.generation != generation or
++        guard.operation_id != operation.uuid or
++        guard.generation != generation or
++        checkpoint.active_operation_id != operation.uuid
++    ):
++        _conflict('guard_busy')
++    return instance, guard, checkpoint, operation
++
++
++def _manifest(context, instance):
++    extra = (
++        context.session.query(m.InstanceExtra)
++        .filter_by(instance_uuid=instance.uuid, deleted=0)
++        .first()
++    )
++    try:
++        flavor_info = jsonutils.loads(extra.flavor)
++        flavor = flavor_info['cur']['nova_object.data']
++        if flavor_info.get('old') or flavor_info.get('new'):
++            _conflict('invalid_state')
++        flavor = {
++            key: flavor[key]
++            for key in (
++                'memory_mb',
++                'vcpus',
++                'root_gb',
++                'ephemeral_gb',
++                'swap',
++                'extra_specs',
++            )
++        }
++        keys = []
++        if instance.key_data:
++            keys.append(hashlib.sha256(instance.key_data.encode()).hexdigest())
++        if extra.keypairs:
++            keypairs = jsonutils.loads(extra.keypairs)['nova_object.data']
++            for key in keypairs['objects']:
++                public = key['nova_object.data']['public_key']
++                keys.append(hashlib.sha256(public.encode()).hexdigest())
++        properties = {
++            item.key[6:]: item.value
++            for item in context.session.query(
++                m.InstanceSystemMetadata
++            ).filter_by(instance_uuid=instance.uuid, deleted=0)
++            if item.key.startswith(('image_hw_', 'image_os_secure_'))
++        }
++        properties.update(
++            {
++                key: getattr(instance, key)
++                for key in (
++                    'image_ref',
++                    'architecture',
++                    'vm_mode',
++                    'os_type',
++                    'root_device_name',
++                )
++            }
++        )
++        disks = []
++        bdms = (
++            context.session.query(m.BlockDeviceMapping)
++            .filter_by(instance_uuid=instance.uuid, deleted=0)
++            .order_by(m.BlockDeviceMapping.uuid)
++            .all()
++        )
++        for bdm in bdms:
++            if (
++                bdm.destination_type != 'volume' or
++                not bdm.volume_id or
++                bdm.device_type not in ('disk', None)
++            ):
++                raise ValueError('unsupported disk')
++            connection = jsonutils.loads(bdm.connection_info or '{}')
++            disks.append(
++                dict(
++                    uuid=bdm.uuid,
++                    volume_id=bdm.volume_id,
++                    serial=connection.get('serial') or bdm.volume_id,
++                    device_name=bdm.device_name,
++                    boot_index=bdm.boot_index,
++                )
++            )
++        cache = (
++            context.session.query(m.InstanceInfoCache)
++            .filter_by(instance_uuid=instance.uuid, deleted=0)
++            .first()
++        )
++        networks = jsonutils.loads(cache.network_info or '[]') if cache else []
++        vifs = (
++            context.session.query(m.VirtualInterface)
++            .filter_by(instance_uuid=instance.uuid, deleted=0)
++            .all()
++        )
++        ports = [
++            dict(
++                uuid=port['id'],
++                mac=port['address'],
++                network_uuid=port['network']['id'],
++                vnic_type=port['vnic_type'],
++                model=port['model'],
++            )
++            for port in networks
++        ]
++        if {(vif.uuid, vif.address) for vif in vifs} != {
++            (port['uuid'], port['mac']) for port in ports
++        }:
++            raise ValueError('network identity unavailable')
++        shares = [
++            item.share_id
++            for item in context.session.query(m.ShareMapping).filter_by(
++                instance_uuid=instance.uuid
++            )
++        ]
++        manifest = dict(
++            instance_uuid=instance.uuid,
++            host=instance.host,
++            node=instance.node,
++            flavor=flavor,
++            image_properties=properties,
++            config_drive=instance.config_drive or None,
++            disks=disks,
++            ports=ports,
++            shares=shares,
++            runtime_key_fingerprints=keys,
++        )
++        return c.device_projection(manifest)
++    except (ValueError, TypeError, KeyError, AttributeError):
++        raise exception.CheckpointNotSupported(reason='unsupported_profile')
++
++
++@require_context
++@db.pick_context_manager_reader
++def device_manifest(context, instance_uuid):
++    return _manifest(context, _instance(context, instance_uuid))
++
++
++def _request(context, key):
++    operation = (
++        context.session.query(m.InstanceCheckpointOperation)
++        .filter_by(
++            project_id=key.project_id,
++            instance_uuid=key.instance_uuid,
++            request_id=key.request_id,
++        )
++        .first()
++    )
++    if operation:
++        if operation.actor_user_id != key.actor_user_id:
++            raise exception.NotFound()
++        if (
++            operation.kind != key.kind or
++            operation.payload_hash != key.payload_hash
++        ):
++            _conflict()
++    return operation
++
++
++@require_context
++@db.pick_context_manager_reader
++def find_request(context, key):
++    _authorize(context, key.project_id)
++    return _row(_request(context, key))
++
++
++@require_context
++@oslo_db_api.wrap_db_retry(max_retries=5, retry_on_deadlock=True)
++@db.pick_context_manager_writer
++def admit(context, admission, ticket_id):
++    a = admission
++    c._uuid(ticket_id)
++    instance = _instance(context, a.key.instance_uuid, lock=True)
++    if instance.project_id != a.key.project_id or (
++        not context.is_admin and context.user_id != a.key.actor_user_id
++    ):
++        raise exception.NotFound()
++    if context.session.get(
++        m.InstanceCheckpointAdmissionTombstone, a.operation_id
++    ):
++        _conflict('admission_cancelled')
++    existing = _request(context, a.key)
++    if existing:
++        return _row(existing)
++    if context.session.get(m.InstanceCheckpointOperation, a.operation_id):
++        _conflict()
++    guard = _guard(context, instance.uuid)
++    if guard.operation_id or guard.ordinary_claim_uuid:
++        _conflict('guard_busy')
++    if instance.task_state is not None or (
++        a.key.kind in ('create', 'revert') and
++        instance.vm_state != vm_states.ACTIVE
++    ):
++        _conflict('invalid_state')
++    if c.device_fingerprint(_manifest(context, instance)) != a.fingerprint:
++        _conflict('identity_changed')
++    if a.key.kind == 'create':
++        if (
++            guard.checkpoint_count >=
++            CONF.checkpoint.max_checkpoints_per_instance
++        ):
++            raise exception.CheckpointQuotaExceeded()
++        if context.session.get(m.InstanceCheckpoint, a.checkpoint_id):
++            _conflict()
++        checkpoint = m.InstanceCheckpoint(
++            uuid=a.checkpoint_id,
++            instance_uuid=instance.uuid,
++            project_id=a.key.project_id,
++            creator_user_id=a.key.actor_user_id,
++            name=a.name,
++            status='creating',
++            host=a.host,
++            node=a.node,
++            cell_uuid=a.cell_uuid,
++            format_version=1,
++            fingerprint=a.fingerprint,
++            device_manifest=_encode(a.to_primitive()['device_manifest']),
++            quota_ticket_id=ticket_id,
++            create_operation_id=a.operation_id,
++            active_operation_id=a.operation_id,
++            artifact_upper_bound=a.artifact_upper_bound,
++        )
++        context.session.add(checkpoint)
++        for disk in a.device_manifest['disks']:
++            context.session.add(
++                m.InstanceCheckpointDisk(
++                    uuid=uuidutils.generate_uuid(),
++                    checkpoint_id=a.checkpoint_id,
++                    bdm_uuid=disk['uuid'],
++                    volume_id=disk['volume_id'],
++                    serial=disk['serial'],
++                    device_name=disk['device_name'],
++                    boot_index=disk['boot_index'],
++                    state='reserved',
++                )
++            )
++        guard.checkpoint_count += 1
++    else:
++        checkpoint = _checkpoint(context, a.checkpoint_id, lock=True)
++        if (
++            checkpoint.instance_uuid != instance.uuid or
++            checkpoint.project_id != a.key.project_id
++        ):
++            raise exception.NotFound()
++        if (
++            checkpoint.status != 'available' or
++            checkpoint.quota_ticket_id != ticket_id or
++            checkpoint.fingerprint != a.fingerprint or
++            checkpoint.cell_uuid != a.cell_uuid or
++            checkpoint.active_operation_id is not None
++        ):
++            _conflict('identity_changed')
++        checkpoint.active_operation_id = a.operation_id
++        if a.key.kind == 'delete':
++            checkpoint.status = 'deleting'
++    operation = m.InstanceCheckpointOperation(
++        uuid=a.operation_id,
++        instance_uuid=instance.uuid,
++        checkpoint_id=a.checkpoint_id,
++        project_id=a.key.project_id,
++        actor_user_id=a.key.actor_user_id,
++        request_id=a.key.request_id,
++        payload_hash=a.key.payload_hash,
++        kind=a.key.kind,
++        generation=1,
++        executor_id=a.executor_id,
++        host=a.host,
++        node=a.node,
++        cell_uuid=a.cell_uuid,
++        state='reserved',
++        previous_vm_state=instance.vm_state,
++        previous_power_state=instance.power_state,
++        previous_task_state=instance.task_state,
++        quota_ticket_id=ticket_id,
++        quota_ready=False,
++        quota_released=False,
++        version=1,
++        admission=_encode(a.to_primitive()),
++    )
++    context.session.add(operation)
++    guard.operation_id = a.operation_id
++    guard.token = secrets.token_hex(32)
++    guard.version += 1
++    instance.task_state = {
++        'create': task_states.CHECKPOINT_CREATING,
++        'revert': task_states.CHECKPOINT_REVERTING,
++        'delete': task_states.CHECKPOINT_DELETING,
++    }[a.key.kind]
++    context.session.flush()
++    return _row(operation)
++
++
++@require_context
++@oslo_db_api.wrap_db_retry(max_retries=5, retry_on_deadlock=True)
++@db.pick_context_manager_writer
++def cancel_admission(context, admission):
++    a = admission
++    instance = _instance(context, a.key.instance_uuid, lock=True)
++    if instance.project_id != a.key.project_id or a.key.kind != 'create':
++        raise exception.NotFound()
++    existing = context.session.get(
++        m.InstanceCheckpointOperation, a.operation_id
++    )
++    if existing:
++        if existing.admission != _encode(a.to_primitive()):
++            _conflict()
++        instance, guard, checkpoint, operation = _owned(
++            context, a.operation_id
++        )
++        if (
++            context.session.query(m.InstanceCheckpointStep)
++            .filter_by(operation_id=a.operation_id)
++            .first()
++        ):
++            _conflict('recovery_required')
++        # Keep accepted request history and ownership until quota is refunded.
++        # A pre-effect admitted cancellation has no resources to delete.
++        for disk in _disks(context, a.checkpoint_id):
++            disk.state = 'deleted'
++        checkpoint.terminal_operation_id = operation.uuid
++        operation.state = 'failed'
++        operation.error_code = 'admission_cancelled'
++        operation.version += 1
++        context.session.flush()
++        return c.CloseProof(
++            a.operation_id,
++            a.operation_id,
++            a.checkpoint_id,
++            a.cell_uuid,
++            'resources_deleted',
++        )
++    tombstone = context.session.get(
++        m.InstanceCheckpointAdmissionTombstone, a.operation_id
++    )
++    if tombstone:
++        if tombstone.admission != _encode(a.to_primitive()):
++            _conflict()
++    else:
++        context.session.add(
++            m.InstanceCheckpointAdmissionTombstone(
++                operation_id=a.operation_id,
++                cell_uuid=a.cell_uuid,
++                instance_uuid=instance.uuid,
++                project_id=a.key.project_id,
++                actor_user_id=a.key.actor_user_id,
++                request_id=a.key.request_id,
++                payload_hash=a.key.payload_hash,
++                checkpoint_id=a.checkpoint_id,
++                admission=_encode(a.to_primitive()),
++            )
++        )
++        context.session.flush()
++    return c.CloseProof(
++        a.operation_id,
++        a.operation_id,
++        a.checkpoint_id,
++        a.cell_uuid,
++        'admission_cancelled',
++    )
++
++
++@require_context
++@db.pick_context_manager_writer
++def mark_quota_ready(context, operation_id, ticket_id):
++    instance, guard, checkpoint, operation = _owned(context, operation_id)
++    if (
++        operation.quota_ticket_id != ticket_id or
++        operation.state not in ('reserved', 'running') or
++        checkpoint.terminal_operation_id
++    ):
++        _conflict()
++    if not operation.quota_ready:
++        operation.quota_ready = True
++        operation.version += 1
++
++
++def _disks(context, checkpoint_id):
++    return (
++        context.session.query(m.InstanceCheckpointDisk)
++        .filter_by(checkpoint_id=checkpoint_id)
++        .order_by(m.InstanceCheckpointDisk.uuid)
++        .all()
++    )
++
++
++def _artifacts(context, checkpoint_id):
++    return (
++        context.session.query(m.InstanceCheckpointArtifact)
++        .filter_by(checkpoint_id=checkpoint_id)
++        .order_by(m.InstanceCheckpointArtifact.uuid)
++        .all()
++    )
++
++
++def _steps(context, operation_id):
++    return (
++        context.session.query(m.InstanceCheckpointStep)
++        .filter_by(operation_id=operation_id)
++        .order_by(m.InstanceCheckpointStep.uuid)
++        .all()
++    )
++
++
++@require_context
++@db.pick_context_manager_writer
++def claim_step(context, operation_id, generation, phase, executor_id):
++    instance, guard, checkpoint, operation = _owned(
++        context, operation_id, generation
++    )
++    if (
++        not operation.quota_ready or
++        operation.executor_id != executor_id or
++        operation.state not in ('reserved', 'running', 'recovery_required') or
++        (instance.host, instance.node) != (operation.host, operation.node)
++    ):
++        _conflict()
++    phases = workflow.steps_for(operation.kind)
++    if phase not in phases:
++        _conflict()
++    steps = {step.phase: step for step in _steps(context, operation_id)}
++    if phase in steps:
++        return None
++    if any(
++        name not in steps or steps[name].status != 'succeeded'
++        for name in phases[: phases.index(phase)]
++    ):
++        _conflict()
++    if any(name in steps for name in phases[phases.index(phase) + 1:]):
++        _conflict()
++    payload = dict(
++        instance_uuid=instance.uuid,
++        checkpoint_id=checkpoint.uuid,
++        host=operation.host,
++        node=operation.node,
++        fingerprint=checkpoint.fingerprint,
++        device_manifest=jsonutils.loads(checkpoint.device_manifest),
++        disks=[
++            {
++                key: value
++                for key, value in _row(disk).items()
++                if key not in ('created_at', 'updated_at')
++            }
++            for disk in _disks(context, checkpoint.uuid)
++        ],
++        artifacts=[
++            {
++                key: value
++                for key, value in _row(item).items()
++                if key not in ('created_at', 'updated_at')
++            }
++            for item in _artifacts(context, checkpoint.uuid)
++        ],
++        previous_results={
++            name: jsonutils.loads(step.result) for name, step in steps.items()
++        },
++    )
++    intent = c.StepIntent(
++        uuidutils.generate_uuid(),
++        operation_id,
++        generation,
++        phase,
++        executor_id,
++        c.canonical_payload_hash(payload),
++        payload,
++    )
++    context.session.add(
++        m.InstanceCheckpointStep(
++            uuid=intent.id,
++            operation_id=operation_id,
++            generation=generation,
++            phase=phase,
++            executor_id=executor_id,
++            payload_hash=intent.payload_hash,
++            payload=_encode(intent.to_primitive()['payload']),
++            status='dispatching',
++            version=1,
++        )
++    )
++    operation.state = 'running'
++    operation.phase = phase
++    operation.version += 1
++    context.session.flush()
++    return intent
++
++
++def _bind_result(context, checkpoint, step, result):
++    """Match complete evidence to the identities in the journal."""
++    if result.status != 'succeeded':
++        return result
++    e = result.evidence
++    disks = _disks(context, checkpoint.uuid)
++    artifacts = _artifacts(context, checkpoint.uuid)
++    valid = True
++    if 'fingerprint' in e:
++        valid &= e['fingerprint'] == checkpoint.fingerprint
++    if 'host' in e:
++        valid &= (e['host'], e['node']) == (checkpoint.host, checkpoint.node)
++    if 'volume_ids' in e:
++        valid &= set(e['volume_ids']) == {disk.volume_id for disk in disks}
++    if 'port_ids' in e:
++        manifest = jsonutils.loads(checkpoint.device_manifest)
++        valid &= set(e['port_ids']) == {
++            port['uuid'] for port in manifest['ports']
++        }
++    if 'snapshots' in e and step.phase != 'disk_snapshot':
++        valid &= {
++            (item['volume_id'], item['snapshot_id']) for item in e['snapshots']
++        } == {(disk.volume_id, disk.snapshot_id) for disk in disks}
++    if 'artifact_ids' in e:
++        valid &= set(e['artifact_ids']) == {item.uuid for item in artifacts}
++    if step.phase == 'artifact_publish':
++        valid &= {
++            (a['id'], a['logical_id'], a['checksum'], a['bytes'])
++            for a in e['artifacts']
++        } == {
++            (a.uuid, a.logical_id, a.checksum, a.actual_bytes)
++            for a in artifacts
++        }
++    if step.phase == 'runtime_save':
++        valid &= sum(a['bytes'] for a in e['artifacts']) <= (
++            checkpoint.artifact_upper_bound
++        )
++        valid &= any(a['kind'] == 'ram' for a in e['artifacts'])
++    if step.phase == 'cinder_release':
++        reserve = (
++            context.session.query(m.InstanceCheckpointStep)
++            .filter_by(operation_id=step.operation_id, phase='cinder_reserve')
++            .one()
++        )
++        reserved = jsonutils.loads(reserve.result)['evidence']
++        valid &= e['operation_id'] == reserved['operation_id']
++        valid &= e['generation'] == reserved['generation']
++    return result if valid else c.StepResult('unknown', {}, 'identity_changed')
++
++
++def _record_resources(context, checkpoint, step, result):
++    evidence = result.to_primitive()['evidence']
++    if step.phase == 'runtime_save':
++        for item in evidence['artifacts']:
++            context.session.add(
++                m.InstanceCheckpointArtifact(
++                    uuid=item['id'],
++                    checkpoint_id=checkpoint.uuid,
++                    kind=item['kind'],
++                    logical_id=item['logical_id'],
++                    expected_upper_bound=checkpoint.artifact_upper_bound,
++                    actual_bytes=item['bytes'],
++                    checksum=item['checksum'],
++                    state='staging',
++                )
++            )
++    elif step.phase == 'artifact_publish':
++        for item in _artifacts(context, checkpoint.uuid):
++            item.state = 'available'
++    elif step.phase == 'disk_snapshot':
++        snapshots = {
++            item['volume_id']: item['snapshot_id']
++            for item in evidence['snapshots']
++        }
++        reserved = (
++            context.session.query(m.InstanceCheckpointStep)
++            .filter_by(operation_id=step.operation_id, phase='cinder_reserve')
++            .one()
++        )
++        cinder_id = jsonutils.loads(reserved.result)['evidence'][
++            'operation_id'
++        ]
++        for disk in _disks(context, checkpoint.uuid):
++            disk.snapshot_id = snapshots[disk.volume_id]
++            disk.cinder_operation_id = cinder_id
++            disk.state = 'available'
++    elif step.phase == 'disk_snapshot_delete':
++        for disk in _disks(context, checkpoint.uuid):
++            disk.state = 'deleted'
++    elif step.phase == 'artifact_delete':
++        for item in _artifacts(context, checkpoint.uuid):
++            item.state = 'deleted'
++
++
++@require_context
++@db.pick_context_manager_writer
++def finish_step(context, step_id, generation, result):
++    step = context.session.get(m.InstanceCheckpointStep, step_id)
++    if step is None:
++        raise exception.NotFound()
++    instance, guard, checkpoint, operation = _owned(
++        context, step.operation_id, generation
++    )
++    context.session.refresh(step, with_for_update=True)
++    result = c.validate_result(step.phase, result.to_primitive())
++    result = _bind_result(context, checkpoint, step, result)
++    encoded = _encode(result.to_primitive())
++    if step.status in ('succeeded', 'failed_no_effect'):
++        if step.result != encoded:
++            _conflict()
++        return
++    if result.status == 'succeeded':
++        _record_resources(context, checkpoint, step, result)
++    step.result = encoded
++    step.status = result.status
++    step.version += 1
++    operation.version += 1
++    operation.error_code = result.error_code
++    if result.status in ('unknown', 'failed_no_effect'):
++        operation.state = 'recovery_required'
++        instance.task_state = task_states.CHECKPOINT_RECOVERING
++
++
++@require_context
++@db.pick_context_manager_writer
++def finalize(context, operation_id, generation, outcome):
++    operation = _operation(context, operation_id)
++    if (
++        type(generation) is not int or
++        generation != 1 or
++        outcome != 'succeeded'
++    ):
++        _conflict()
++    if operation.state in ('succeeded', 'released'):
++        return _row(operation)
++    instance, guard, checkpoint, operation = _owned(
++        context, operation_id, generation
++    )
++    phases = workflow.steps_for(operation.kind)
++    steps = {step.phase: step for step in _steps(context, operation_id)}
++    # An executor's diagnostic code is not a cell cancellation proof.
++    cancelled = (operation.kind == 'create' and not steps and
++                 operation.state == 'failed' and
++                 checkpoint.terminal_operation_id == operation_id and
++                 operation.error_code == 'admission_cancelled')
++    if not cancelled and any(
++        phase not in steps or steps[phase].status != 'succeeded'
++        for phase in phases
++    ):
++        _conflict('resources_remaining')
++    closing = operation.kind == 'delete' or cancelled
++    if closing:
++        if any(
++            item.state != 'deleted'
++            for item in _disks(context, checkpoint.uuid) +
++            _artifacts(context, checkpoint.uuid)
++        ):
++            _conflict('resources_remaining')
++        checkpoint.terminal_operation_id = operation_id
++        operation.state = 'failed' if cancelled else 'running'
++        if not operation.quota_released:
++            context.session.flush()
++            return _row(operation)
++        checkpoint.status = 'deleted'
++        guard.checkpoint_count -= 1
++        operation.state = 'released'
++    else:
++        checkpoint.status = 'available'
++        operation.state = 'succeeded'
++    checkpoint.active_operation_id = None
++    guard.operation_id = None
++    guard.token = None
++    guard.version += 1
++    operation.version += 1
++    instance.task_state = operation.previous_task_state
++    context.session.flush()
++    return _row(operation)
++
++
++@require_context
++@db.pick_context_manager_reader
++def close_proof(context, create_operation_id):
++    tombstone = context.session.get(
++        m.InstanceCheckpointAdmissionTombstone, create_operation_id
++    )
++    if tombstone:
++        _authorize(context, tombstone.project_id)
++        return c.CloseProof(
++            create_operation_id,
++            create_operation_id,
++            tombstone.checkpoint_id,
++            tombstone.cell_uuid,
++            'admission_cancelled',
++        )
++    operation = context.session.get(
++        m.InstanceCheckpointOperation, create_operation_id
++    )
++    if not operation:
++        return None
++    _authorize(context, operation.project_id)
++    checkpoint = _checkpoint(context, operation.checkpoint_id)
++    if (
++        operation.kind != 'create' or
++        checkpoint.create_operation_id != operation.uuid
++    ):
++        _conflict()
++    if not checkpoint.terminal_operation_id:
++        return None
++    return c.CloseProof(
++        create_operation_id,
++        checkpoint.terminal_operation_id,
++        checkpoint.uuid,
++        checkpoint.cell_uuid,
++        'resources_deleted',
++    )
++
++
++@require_context
++@db.pick_context_manager_writer
++def mark_quota_released(context, closing_operation_id, ticket_id):
++    operation = _operation(context, closing_operation_id)
++    if operation.quota_released and operation.quota_ticket_id == ticket_id:
++        return
++    instance, guard, checkpoint, operation = _owned(
++        context, closing_operation_id
++    )
++    if (
++        checkpoint.terminal_operation_id != closing_operation_id or
++        checkpoint.quota_ticket_id != ticket_id
++    ):
++        _conflict()
++    operation.quota_released = True
++    operation.version += 1
++
++
++@require_context
++@db.pick_context_manager_reader
++def get_by_uuid(context, operation_id):
++    return _row(_operation(context, operation_id))
++
++
++@require_context
++@db.pick_context_manager_reader
++def checkpoint_get(context, checkpoint_id):
++    return _row(_checkpoint(context, checkpoint_id))
++
++
++@require_context
++@db.pick_context_manager_reader
++def checkpoints_get(context, instance_uuid, marker=None, limit=100):
++    instance = _instance(context, instance_uuid)
++    c._integer(limit, minimum=1, maximum=1000)
++    query = context.session.query(m.InstanceCheckpoint).filter_by(
++        instance_uuid=instance_uuid, project_id=instance.project_id
++    )
++    if marker:
++        start = _checkpoint(context, marker)
++        if start.instance_uuid != instance_uuid:
++            raise exception.NotFound()
++        query = query.filter(
++            sa.or_(
++                m.InstanceCheckpoint.created_at > start.created_at,
++                sa.and_(
++                    m.InstanceCheckpoint.created_at == start.created_at,
++                    m.InstanceCheckpoint.uuid > start.uuid,
++                ),
++            )
++        )
++    return [
++        _row(row)
++        for row in query.filter(m.InstanceCheckpoint.status != 'deleted')
++        .order_by(m.InstanceCheckpoint.created_at, m.InstanceCheckpoint.uuid)
++        .limit(limit)
++    ]
++
++
++@require_context
++@db.pick_context_manager_reader
++def guard_get(context, instance_uuid):
++    _instance(context, instance_uuid)
++    return _row(context.session.get(m.InstanceCheckpointGuard, instance_uuid))
++
++
++@require_context
++@db.pick_context_manager_reader
++def steps_get(context, operation_id):
++    operation = context.session.get(
++        m.InstanceCheckpointOperation, operation_id
++    )
++    if operation:
++        _authorize(context, operation.project_id)
++    return [_row(row) for row in _steps(context, operation_id)]
++
++
++@require_context
++@db.pick_context_manager_reader
++def step_get(context, step_id):
++    step = context.session.get(m.InstanceCheckpointStep, step_id)
++    if step is None:
++        raise exception.NotFound()
++    _operation(context, step.operation_id)
++    return _row(step)
++
++
++@require_context
++@db.pick_context_manager_reader
++def disks_get(context, checkpoint_id):
++    _checkpoint(context, checkpoint_id)
++    return [_row(row) for row in _disks(context, checkpoint_id)]
++
++
++@require_context
++@db.pick_context_manager_reader
++def artifacts_get(context, checkpoint_id):
++    _checkpoint(context, checkpoint_id)
++    return [_row(row) for row in _artifacts(context, checkpoint_id)]
+diff --git a/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py b/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py
+new file mode 100644
+index 0000000..46f2713
+--- /dev/null
++++ b/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py
+@@ -0,0 +1,207 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Add durable instance checkpoint journals.
++
++Revision ID: 4a8c2d7e9101
++Revises: 2903cd72dc14
++"""
++
++from alembic import op
++import sqlalchemy as sa
++
++revision = '4a8c2d7e9101'
++down_revision = '2903cd72dc14'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    op.create_table(
++        'instance_checkpoints',
++        sa.Column('uuid', sa.String(36), primary_key=True, nullable=False),
++        sa.Column('instance_uuid', sa.String(36), nullable=False),
++        sa.Column('project_id', sa.String(255), nullable=False),
++        sa.Column('creator_user_id', sa.String(255), nullable=False),
++        sa.Column('name', sa.String(255), nullable=False),
++        sa.Column('status', sa.String(32), nullable=False),
++        sa.Column('host', sa.String(255), nullable=False),
++        sa.Column('node', sa.String(255), nullable=False),
++        sa.Column('cell_uuid', sa.String(36), nullable=False),
++        sa.Column('format_version', sa.Integer, nullable=False),
++        sa.Column('fingerprint', sa.String(64), nullable=False),
++        sa.Column('device_manifest', sa.Text, nullable=False),
++        sa.Column('quota_ticket_id', sa.String(36), nullable=False),
++        sa.Column('create_operation_id', sa.String(36), nullable=False),
++        sa.Column('active_operation_id', sa.String(36), nullable=True),
++        sa.Column('terminal_operation_id', sa.String(36), nullable=True),
++        sa.Column('artifact_upper_bound', sa.BigInteger, nullable=False),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        mysql_engine='InnoDB',
++        mysql_charset='utf8',
++    )
++    op.create_index(
++        'checkpoint_instance_project_idx',
++        'instance_checkpoints',
++        ['instance_uuid', 'project_id', 'created_at', 'uuid'],
++    )
++    op.create_table(
++        'instance_checkpoint_disks',
++        sa.Column('uuid', sa.String(36), primary_key=True, nullable=False),
++        sa.Column('checkpoint_id', sa.String(36), nullable=False),
++        sa.Column('bdm_uuid', sa.String(36), nullable=False),
++        sa.Column('volume_id', sa.String(36), nullable=False),
++        sa.Column('device_name', sa.String(255), nullable=False),
++        sa.Column('serial', sa.String(255), nullable=False),
++        sa.Column('boot_index', sa.Integer, nullable=False),
++        sa.Column('snapshot_id', sa.String(36), nullable=True),
++        sa.Column('backend_profile', sa.String(255), nullable=True),
++        sa.Column('cinder_operation_id', sa.String(36), nullable=True),
++        sa.Column('state', sa.String(32), nullable=False),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        sa.UniqueConstraint(
++            'checkpoint_id', 'volume_id', name='uniq_checkpoint_disk_volume'
++        ),
++        mysql_engine='InnoDB',
++        mysql_charset='utf8',
++    )
++    op.create_table(
++        'instance_checkpoint_artifacts',
++        sa.Column('uuid', sa.String(36), primary_key=True, nullable=False),
++        sa.Column('checkpoint_id', sa.String(36), nullable=False),
++        sa.Column('kind', sa.String(32), nullable=False),
++        sa.Column('logical_id', sa.String(255), nullable=False),
++        sa.Column('expected_upper_bound', sa.BigInteger, nullable=False),
++        sa.Column('actual_bytes', sa.BigInteger, nullable=False),
++        sa.Column('checksum', sa.String(64), nullable=False),
++        sa.Column('state', sa.String(32), nullable=False),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        mysql_engine='InnoDB',
++        mysql_charset='utf8',
++    )
++    op.create_index(
++        'checkpoint_artifact_checkpoint_idx',
++        'instance_checkpoint_artifacts',
++        ['checkpoint_id'],
++    )
++    op.create_table(
++        'instance_checkpoint_operations',
++        sa.Column('uuid', sa.String(36), primary_key=True, nullable=False),
++        sa.Column('instance_uuid', sa.String(36), nullable=False),
++        sa.Column('checkpoint_id', sa.String(36), nullable=False),
++        sa.Column('project_id', sa.String(255), nullable=False),
++        sa.Column('actor_user_id', sa.String(255), nullable=False),
++        sa.Column('request_id', sa.String(36), nullable=False),
++        sa.Column('payload_hash', sa.String(64), nullable=False),
++        sa.Column('kind', sa.String(32), nullable=False),
++        sa.Column('generation', sa.Integer, nullable=False),
++        sa.Column('executor_id', sa.String(255), nullable=False),
++        sa.Column('host', sa.String(255), nullable=False),
++        sa.Column('node', sa.String(255), nullable=False),
++        sa.Column('cell_uuid', sa.String(36), nullable=False),
++        sa.Column('state', sa.String(32), nullable=False),
++        sa.Column('phase', sa.String(64), nullable=True),
++        sa.Column('previous_vm_state', sa.String(255), nullable=True),
++        sa.Column('previous_power_state', sa.Integer, nullable=True),
++        sa.Column('previous_task_state', sa.String(255), nullable=True),
++        sa.Column('error_code', sa.String(64), nullable=True),
++        sa.Column('quota_ticket_id', sa.String(36), nullable=False),
++        sa.Column(
++            'quota_ready',
++            sa.Boolean,
++            nullable=False,
++            server_default=sa.false(),
++        ),
++        sa.Column(
++            'quota_released',
++            sa.Boolean,
++            nullable=False,
++            server_default=sa.false(),
++        ),
++        sa.Column('version', sa.Integer, nullable=False),
++        sa.Column('admission', sa.Text, nullable=False),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        sa.UniqueConstraint(
++            'project_id',
++            'instance_uuid',
++            'request_id',
++            name='uniq_checkpoint_operation_request',
++        ),
++        mysql_engine='InnoDB',
++        mysql_charset='utf8',
++    )
++    op.create_index(
++        'checkpoint_operation_reconcile_idx',
++        'instance_checkpoint_operations',
++        ['state', 'updated_at', 'uuid'],
++    )
++    op.create_table(
++        'instance_checkpoint_steps',
++        sa.Column('uuid', sa.String(36), primary_key=True, nullable=False),
++        sa.Column('operation_id', sa.String(36), nullable=False),
++        sa.Column('generation', sa.Integer, nullable=False),
++        sa.Column('phase', sa.String(64), nullable=False),
++        sa.Column('executor_id', sa.String(255), nullable=False),
++        sa.Column('payload_hash', sa.String(64), nullable=False),
++        sa.Column('payload', sa.Text, nullable=False),
++        sa.Column('status', sa.String(32), nullable=False),
++        sa.Column('result', sa.Text, nullable=True),
++        sa.Column('version', sa.Integer, nullable=False),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        sa.UniqueConstraint(
++            'operation_id', 'phase', name='uniq_checkpoint_operation_phase'
++        ),
++        mysql_engine='InnoDB',
++        mysql_charset='utf8',
++    )
++    op.create_table(
++        'instance_checkpoint_guards',
++        sa.Column(
++            'instance_uuid', sa.String(36), primary_key=True, nullable=False
++        ),
++        sa.Column('operation_id', sa.String(36), nullable=True),
++        sa.Column('generation', sa.Integer, nullable=False),
++        sa.Column('token', sa.String(64), nullable=True),
++        sa.Column('checkpoint_count', sa.BigInteger, nullable=False),
++        sa.Column('ordinary_claim_uuid', sa.String(36), nullable=True),
++        sa.Column('ordinary_token', sa.String(64), nullable=True),
++        sa.Column('ordinary_action', sa.String(64), nullable=True),
++        sa.Column('ordinary_state', sa.String(32), nullable=True),
++        sa.Column('version', sa.Integer, nullable=False),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        mysql_engine='InnoDB',
++        mysql_charset='utf8',
++    )
++    op.create_table(
++        'instance_checkpoint_admission_tombstones',
++        sa.Column(
++            'operation_id', sa.String(36), primary_key=True, nullable=False
++        ),
++        sa.Column('cell_uuid', sa.String(36), nullable=False),
++        sa.Column('instance_uuid', sa.String(36), nullable=False),
++        sa.Column('project_id', sa.String(255), nullable=False),
++        sa.Column('actor_user_id', sa.String(255), nullable=False),
++        sa.Column('request_id', sa.String(36), nullable=False),
++        sa.Column('payload_hash', sa.String(64), nullable=False),
++        sa.Column('checkpoint_id', sa.String(36), nullable=False),
++        sa.Column('admission', sa.Text, nullable=False),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        mysql_engine='InnoDB',
++        mysql_charset='utf8',
++    )
+diff --git a/nova/db/main/models.py b/nova/db/main/models.py
+index ee82b2e..d9f9298 100644
+--- a/nova/db/main/models.py
++++ b/nova/db/main/models.py
+@@ -1231,3 +1231,160 @@ class ConsoleAuthToken(BASE, NovaBase):
+                     'Instance.deleted == 0)',
+         foreign_keys=instance_uuid
+     )
++
++
++# Checkpoint journals are durable: no soft deletion or archive shadows.
++
++
++class InstanceCheckpoint(BASE, NovaBase):
++    __tablename__ = 'instance_checkpoints'
++    __table_args__ = (
++        sa.Index(
++            'checkpoint_instance_project_idx',
++            'instance_uuid',
++            'project_id',
++            'created_at',
++            'uuid',
++        ),
++    )
++    uuid = sa.Column(sa.String(36), primary_key=True, nullable=False)
++    instance_uuid = sa.Column(sa.String(36), nullable=False)
++    project_id = sa.Column(sa.String(255), nullable=False)
++    creator_user_id = sa.Column(sa.String(255), nullable=False)
++    name = sa.Column(sa.String(255), nullable=False)
++    status = sa.Column(sa.String(32), nullable=False)
++    host = sa.Column(sa.String(255), nullable=False)
++    node = sa.Column(sa.String(255), nullable=False)
++    cell_uuid = sa.Column(sa.String(36), nullable=False)
++    format_version = sa.Column(sa.Integer, nullable=False)
++    fingerprint = sa.Column(sa.String(64), nullable=False)
++    device_manifest = sa.Column(sa.Text, nullable=False)
++    quota_ticket_id = sa.Column(sa.String(36), nullable=False)
++    create_operation_id = sa.Column(sa.String(36), nullable=False)
++    active_operation_id = sa.Column(sa.String(36), nullable=True)
++    terminal_operation_id = sa.Column(sa.String(36), nullable=True)
++    artifact_upper_bound = sa.Column(sa.BigInteger, nullable=False)
++
++
++class InstanceCheckpointDisk(BASE, NovaBase):
++    __tablename__ = 'instance_checkpoint_disks'
++    __table_args__ = (
++        sa.UniqueConstraint(
++            'checkpoint_id', 'volume_id', name='uniq_checkpoint_disk_volume'
++        ),
++    )
++    uuid = sa.Column(sa.String(36), primary_key=True, nullable=False)
++    checkpoint_id = sa.Column(sa.String(36), nullable=False)
++    bdm_uuid = sa.Column(sa.String(36), nullable=False)
++    volume_id = sa.Column(sa.String(36), nullable=False)
++    device_name = sa.Column(sa.String(255), nullable=False)
++    serial = sa.Column(sa.String(255), nullable=False)
++    boot_index = sa.Column(sa.Integer, nullable=False)
++    snapshot_id = sa.Column(sa.String(36), nullable=True)
++    backend_profile = sa.Column(sa.String(255), nullable=True)
++    cinder_operation_id = sa.Column(sa.String(36), nullable=True)
++    state = sa.Column(sa.String(32), nullable=False)
++
++
++class InstanceCheckpointArtifact(BASE, NovaBase):
++    __tablename__ = 'instance_checkpoint_artifacts'
++    __table_args__ = (
++        sa.Index('checkpoint_artifact_checkpoint_idx', 'checkpoint_id'),
++    )
++    uuid = sa.Column(sa.String(36), primary_key=True, nullable=False)
++    checkpoint_id = sa.Column(sa.String(36), nullable=False)
++    kind = sa.Column(sa.String(32), nullable=False)
++    logical_id = sa.Column(sa.String(255), nullable=False)
++    expected_upper_bound = sa.Column(sa.BigInteger, nullable=False)
++    actual_bytes = sa.Column(sa.BigInteger, nullable=False)
++    checksum = sa.Column(sa.String(64), nullable=False)
++    state = sa.Column(sa.String(32), nullable=False)
++
++
++class InstanceCheckpointOperation(BASE, NovaBase):
++    __tablename__ = 'instance_checkpoint_operations'
++    __table_args__ = (
++        sa.UniqueConstraint(
++            'project_id',
++            'instance_uuid',
++            'request_id',
++            name='uniq_checkpoint_operation_request',
++        ),
++        sa.Index(
++            'checkpoint_operation_reconcile_idx', 'state', 'updated_at', 'uuid'
++        ),
++    )
++    uuid = sa.Column(sa.String(36), primary_key=True, nullable=False)
++    instance_uuid = sa.Column(sa.String(36), nullable=False)
++    checkpoint_id = sa.Column(sa.String(36), nullable=False)
++    project_id = sa.Column(sa.String(255), nullable=False)
++    actor_user_id = sa.Column(sa.String(255), nullable=False)
++    request_id = sa.Column(sa.String(36), nullable=False)
++    payload_hash = sa.Column(sa.String(64), nullable=False)
++    kind = sa.Column(sa.String(32), nullable=False)
++    generation = sa.Column(sa.Integer, nullable=False)
++    executor_id = sa.Column(sa.String(255), nullable=False)
++    host = sa.Column(sa.String(255), nullable=False)
++    node = sa.Column(sa.String(255), nullable=False)
++    cell_uuid = sa.Column(sa.String(36), nullable=False)
++    state = sa.Column(sa.String(32), nullable=False)
++    phase = sa.Column(sa.String(64), nullable=True)
++    previous_vm_state = sa.Column(sa.String(255), nullable=True)
++    previous_power_state = sa.Column(sa.Integer, nullable=True)
++    previous_task_state = sa.Column(sa.String(255), nullable=True)
++    error_code = sa.Column(sa.String(64), nullable=True)
++    quota_ticket_id = sa.Column(sa.String(36), nullable=False)
++    quota_ready = sa.Column(
++        sa.Boolean, nullable=False, server_default=sa.false()
++    )
++    quota_released = sa.Column(
++        sa.Boolean, nullable=False, server_default=sa.false()
++    )
++    version = sa.Column(sa.Integer, nullable=False)
++    admission = sa.Column(sa.Text, nullable=False)
++
++
++class InstanceCheckpointStep(BASE, NovaBase):
++    __tablename__ = 'instance_checkpoint_steps'
++    __table_args__ = (
++        sa.UniqueConstraint(
++            'operation_id', 'phase', name='uniq_checkpoint_operation_phase'
++        ),
++    )
++    uuid = sa.Column(sa.String(36), primary_key=True, nullable=False)
++    operation_id = sa.Column(sa.String(36), nullable=False)
++    generation = sa.Column(sa.Integer, nullable=False)
++    phase = sa.Column(sa.String(64), nullable=False)
++    executor_id = sa.Column(sa.String(255), nullable=False)
++    payload_hash = sa.Column(sa.String(64), nullable=False)
++    payload = sa.Column(sa.Text, nullable=False)
++    status = sa.Column(sa.String(32), nullable=False)
++    result = sa.Column(sa.Text, nullable=True)
++    version = sa.Column(sa.Integer, nullable=False)
++
++
++class InstanceCheckpointGuard(BASE, NovaBase):
++    __tablename__ = 'instance_checkpoint_guards'
++    instance_uuid = sa.Column(sa.String(36), primary_key=True, nullable=False)
++    operation_id = sa.Column(sa.String(36), nullable=True)
++    generation = sa.Column(sa.Integer, nullable=False)
++    token = sa.Column(sa.String(64), nullable=True)
++    checkpoint_count = sa.Column(sa.BigInteger, nullable=False)
++    ordinary_claim_uuid = sa.Column(sa.String(36), nullable=True)
++    ordinary_token = sa.Column(sa.String(64), nullable=True)
++    ordinary_action = sa.Column(sa.String(64), nullable=True)
++    ordinary_state = sa.Column(sa.String(32), nullable=True)
++    version = sa.Column(sa.Integer, nullable=False)
++
++
++class InstanceCheckpointAdmissionTombstone(BASE, NovaBase):
++    __tablename__ = 'instance_checkpoint_admission_tombstones'
++    operation_id = sa.Column(sa.String(36), primary_key=True, nullable=False)
++    cell_uuid = sa.Column(sa.String(36), nullable=False)
++    instance_uuid = sa.Column(sa.String(36), nullable=False)
++    project_id = sa.Column(sa.String(255), nullable=False)
++    actor_user_id = sa.Column(sa.String(255), nullable=False)
++    request_id = sa.Column(sa.String(36), nullable=False)
++    payload_hash = sa.Column(sa.String(64), nullable=False)
++    checkpoint_id = sa.Column(sa.String(36), nullable=False)
++    admission = sa.Column(sa.Text, nullable=False)
+diff --git a/nova/objects/__init__.py b/nova/objects/__init__.py
+index 4b51ea3..beef127 100644
+--- a/nova/objects/__init__.py
++++ b/nova/objects/__init__.py
+@@ -28,6 +28,7 @@ def register_all():
+     __import__('nova.objects.block_device')
+     __import__('nova.objects.build_request')
+     __import__('nova.objects.cell_mapping')
++    __import__('nova.objects.checkpoint')
+     __import__('nova.objects.compute_node')
+     __import__('nova.objects.diagnostics')
+     __import__('nova.objects.console_auth_token')
+diff --git a/nova/objects/checkpoint.py b/nova/objects/checkpoint.py
+new file mode 100644
+index 0000000..2e7fe0b
+--- /dev/null
++++ b/nova/objects/checkpoint.py
+@@ -0,0 +1,341 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Checkpoint projections and explicit remotable transitions.
++
++Only JSON primitives cross these calls; no dataclass is sent through RPC.
++Compute delegates SQL to conductor through standard object indirection.
++"""
++
++from oslo_versionedobjects import exception as ovo_exc
++
++from nova.checkpoints import contracts
++from nova.db.main import checkpoints as db
++from nova import objects
++from nova.objects import base
++from nova.objects import fields
++
++
++class CheckpointJSON(fields.FieldType):
++    @staticmethod
++    def coerce(obj, attr, value):
++        if not isinstance(value, dict):
++            raise ValueError('Checkpoint JSON object required')
++        return contracts._json(value)
++
++    @staticmethod
++    def to_primitive(obj, attr, value):
++        return contracts._json(value)
++
++    from_primitive = to_primitive
++
++    def get_schema(self):
++        return {'type': ['object']}
++
++
++class CheckpointJSONField(fields.AutoTypedField):
++    AUTO_TYPE = CheckpointJSON()
++
++
++class _VersionOne:
++    def obj_make_compatible(self, primitive, target_version):
++        if target_version != '1.0':
++            raise ovo_exc.UnsupportedObjectError(objtype=self.obj_name())
++        super().obj_make_compatible(primitive, target_version)
++
++
++class _Projection(_VersionOne, base.NovaObject, base.NovaObjectDictCompat):
++    VERSION = '1.0'
++    fields = {
++        'created_at': fields.DateTimeField(nullable=True),
++        'updated_at': fields.DateTimeField(nullable=True),
++    }
++
++    @staticmethod
++    def _from_db_object(context, obj, row):
++        for key in obj.fields:
++            obj[key] = row[key]
++        obj._context = context
++        obj.obj_reset_changes()
++        return obj
++
++    @classmethod
++    def _from_row(cls, context, row):
++        if row is None:
++            return None
++        return cls._from_db_object(context, cls(), row)
++
++
++@base.NovaObjectRegistry.register
++class InstanceCheckpoint(_Projection):
++    VERSION = '1.0'
++
++    fields = {
++        'uuid': fields.UUIDField(),
++        'instance_uuid': fields.UUIDField(),
++        'project_id': fields.StringField(),
++        'creator_user_id': fields.StringField(),
++        'name': fields.StringField(),
++        'status': fields.StringField(),
++        'host': fields.StringField(),
++        'node': fields.StringField(),
++        'cell_uuid': fields.UUIDField(),
++        'format_version': fields.IntegerField(),
++        'fingerprint': fields.StringField(),
++        'device_manifest': CheckpointJSONField(),
++        'quota_ticket_id': fields.UUIDField(),
++        'create_operation_id': fields.UUIDField(),
++        'active_operation_id': fields.UUIDField(nullable=True),
++        'terminal_operation_id': fields.UUIDField(nullable=True),
++        'artifact_upper_bound': fields.IntegerField(),
++    }
++
++    @base.remotable_classmethod
++    def get_by_uuid(cls, context, checkpoint_id):
++        return cls._from_row(
++            context, db.checkpoint_get(context, checkpoint_id)
++        )
++
++
++@base.NovaObjectRegistry.register
++class InstanceCheckpointDisk(_Projection):
++    VERSION = '1.0'
++
++    fields = {
++        'uuid': fields.UUIDField(),
++        'checkpoint_id': fields.UUIDField(),
++        'bdm_uuid': fields.UUIDField(),
++        'volume_id': fields.UUIDField(),
++        'device_name': fields.StringField(),
++        'serial': fields.StringField(),
++        'boot_index': fields.IntegerField(),
++        'snapshot_id': fields.UUIDField(nullable=True),
++        'backend_profile': fields.StringField(nullable=True),
++        'cinder_operation_id': fields.UUIDField(nullable=True),
++        'state': fields.StringField(),
++    }
++
++
++@base.NovaObjectRegistry.register
++class InstanceCheckpointArtifact(_Projection):
++    VERSION = '1.0'
++
++    fields = {
++        'uuid': fields.UUIDField(),
++        'checkpoint_id': fields.UUIDField(),
++        'kind': fields.StringField(),
++        'logical_id': fields.StringField(),
++        'expected_upper_bound': fields.IntegerField(),
++        'actual_bytes': fields.IntegerField(),
++        'checksum': fields.StringField(),
++        'state': fields.StringField(),
++    }
++
++
++@base.NovaObjectRegistry.register
++class InstanceCheckpointOperation(_Projection):
++    VERSION = '1.0'
++
++    fields = {
++        'uuid': fields.UUIDField(),
++        'instance_uuid': fields.UUIDField(),
++        'checkpoint_id': fields.UUIDField(),
++        'project_id': fields.StringField(),
++        'actor_user_id': fields.StringField(),
++        'request_id': fields.UUIDField(),
++        'payload_hash': fields.StringField(),
++        'kind': fields.StringField(),
++        'generation': fields.IntegerField(),
++        'executor_id': fields.StringField(),
++        'host': fields.StringField(),
++        'node': fields.StringField(),
++        'cell_uuid': fields.UUIDField(),
++        'state': fields.StringField(),
++        'phase': fields.StringField(nullable=True),
++        'previous_vm_state': fields.StringField(nullable=True),
++        'previous_power_state': fields.IntegerField(nullable=True),
++        'previous_task_state': fields.StringField(nullable=True),
++        'error_code': fields.StringField(nullable=True),
++        'quota_ticket_id': fields.UUIDField(),
++        'quota_ready': fields.BooleanField(),
++        'quota_released': fields.BooleanField(),
++        'version': fields.IntegerField(),
++        'admission': CheckpointJSONField(),
++    }
++
++    @base.remotable_classmethod
++    def admit(cls, context, admission, ticket_id):
++        admission = contracts.Admission.from_primitive(admission)
++        return cls._from_row(context, db.admit(context, admission, ticket_id))
++
++    @base.remotable_classmethod
++    def cancel_admission(cls, context, admission):
++        admission = contracts.Admission.from_primitive(admission)
++        return db.cancel_admission(context, admission).to_primitive()
++
++    @base.remotable_classmethod
++    def mark_quota_ready(cls, context, operation_id, ticket_id):
++        db.mark_quota_ready(context, operation_id, ticket_id)
++
++    @base.remotable_classmethod
++    def get_by_uuid(cls, context, operation_id):
++        return cls._from_row(context, db.get_by_uuid(context, operation_id))
++
++    @base.remotable_classmethod
++    def find_request(cls, context, key):
++        key = contracts.RequestKey.from_primitive(key)
++        return cls._from_row(context, db.find_request(context, key))
++
++    @base.remotable_classmethod
++    def claim_step(cls, context, operation_id, generation, phase, executor_id):
++        intent = db.claim_step(
++            context, operation_id, generation, phase, executor_id
++        )
++        return intent.to_primitive() if intent else None
++
++    @base.remotable_classmethod
++    def finish_step(cls, context, step_id, generation, result):
++        result = contracts.StepResult.from_primitive(result)
++        db.finish_step(context, step_id, generation, result)
++
++    @base.remotable_classmethod
++    def finalize(cls, context, operation_id, generation, outcome):
++        return cls._from_row(
++            context, db.finalize(context, operation_id, generation, outcome)
++        )
++
++    @base.remotable_classmethod
++    def close_proof(cls, context, create_operation_id):
++        proof = db.close_proof(context, create_operation_id)
++        return proof.to_primitive() if proof else None
++
++    @base.remotable_classmethod
++    def mark_quota_released(cls, context, closing_operation_id, ticket_id):
++        db.mark_quota_released(context, closing_operation_id, ticket_id)
++
++    @base.remotable_classmethod
++    def device_manifest(cls, context, instance_uuid):
++        return db.device_manifest(context, instance_uuid)
++
++
++@base.NovaObjectRegistry.register
++class InstanceCheckpointStep(_Projection):
++    VERSION = '1.0'
++
++    fields = {
++        'uuid': fields.UUIDField(),
++        'operation_id': fields.UUIDField(),
++        'generation': fields.IntegerField(),
++        'phase': fields.StringField(),
++        'executor_id': fields.StringField(),
++        'payload_hash': fields.StringField(),
++        'payload': CheckpointJSONField(),
++        'status': fields.StringField(),
++        'result': CheckpointJSONField(nullable=True),
++        'version': fields.IntegerField(),
++    }
++
++    @base.remotable_classmethod
++    def get_by_uuid(cls, context, step_id):
++        return cls._from_row(context, db.step_get(context, step_id))
++
++
++@base.NovaObjectRegistry.register
++class InstanceCheckpointGuard(_Projection):
++    VERSION = '1.0'
++
++    fields = {
++        'instance_uuid': fields.UUIDField(),
++        'operation_id': fields.UUIDField(nullable=True),
++        'generation': fields.IntegerField(),
++        'token': fields.StringField(nullable=True),
++        'checkpoint_count': fields.IntegerField(),
++        'ordinary_claim_uuid': fields.UUIDField(nullable=True),
++        'ordinary_token': fields.StringField(nullable=True),
++        'ordinary_action': fields.StringField(nullable=True),
++        'ordinary_state': fields.StringField(nullable=True),
++        'version': fields.IntegerField(),
++    }
++
++    @base.remotable_classmethod
++    def get_by_instance_uuid(cls, context, instance_uuid):
++        return cls._from_row(context, db.guard_get(context, instance_uuid))
++
++
++@base.NovaObjectRegistry.register
++class InstanceCheckpointList(
++    _VersionOne, base.ObjectListBase, base.NovaObject
++):
++    VERSION = '1.0'
++    fields = {'objects': fields.ListOfObjectsField('InstanceCheckpoint')}
++    obj_relationships = {'objects': [('1.0', '1.0')]}
++
++    @base.remotable_classmethod
++    def get_by_instance_uuid(
++        cls, context, instance_uuid, marker=None, limit=100
++    ):
++        rows = db.checkpoints_get(
++            context, instance_uuid, marker=marker, limit=limit
++        )
++        return base.obj_make_list(
++            context, cls(), objects.InstanceCheckpoint, rows
++        )
++
++
++@base.NovaObjectRegistry.register
++class InstanceCheckpointDiskList(
++    _VersionOne, base.ObjectListBase, base.NovaObject
++):
++    VERSION = '1.0'
++    fields = {'objects': fields.ListOfObjectsField('InstanceCheckpointDisk')}
++    obj_relationships = {'objects': [('1.0', '1.0')]}
++
++    @base.remotable_classmethod
++    def get_by_checkpoint(cls, context, checkpoint_id):
++        rows = db.disks_get(context, checkpoint_id)
++        return base.obj_make_list(
++            context, cls(), objects.InstanceCheckpointDisk, rows
++        )
++
++
++@base.NovaObjectRegistry.register
++class InstanceCheckpointArtifactList(
++    _VersionOne, base.ObjectListBase, base.NovaObject
++):
++    VERSION = '1.0'
++    fields = {
++        'objects': fields.ListOfObjectsField('InstanceCheckpointArtifact')
++    }
++    obj_relationships = {'objects': [('1.0', '1.0')]}
++
++    @base.remotable_classmethod
++    def get_by_checkpoint(cls, context, checkpoint_id):
++        rows = db.artifacts_get(context, checkpoint_id)
++        return base.obj_make_list(
++            context, cls(), objects.InstanceCheckpointArtifact, rows
++        )
++
++
++@base.NovaObjectRegistry.register
++class InstanceCheckpointStepList(
++    _VersionOne, base.ObjectListBase, base.NovaObject
++):
++    VERSION = '1.0'
++    fields = {'objects': fields.ListOfObjectsField('InstanceCheckpointStep')}
++    obj_relationships = {'objects': [('1.0', '1.0')]}
++
++    @base.remotable_classmethod
++    def get_by_operation(cls, context, operation_id):
++        rows = db.steps_get(context, operation_id)
++        return base.obj_make_list(
++            context, cls(), objects.InstanceCheckpointStep, rows
++        )
+diff --git a/nova/tests/unit/checkpoints/test_cell_db.py b/nova/tests/unit/checkpoints/test_cell_db.py
+new file mode 100644
+index 0000000..d66a901
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/test_cell_db.py
+@@ -0,0 +1,553 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from dataclasses import replace
++import threading
++from unittest import mock
++
++from oslo_db.sqlalchemy import enginefacade
++from oslo_db.sqlalchemy import test_fixtures
++from oslo_serialization import jsonutils
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import workflow
++from nova.compute import task_states
++from nova.compute import vm_states
++from nova import context
++from nova.db.main import api as db
++from nova.db.main import checkpoints
++from nova.db import migration
++from nova import exception
++from nova import test
++
++
++def make_instance(ctx, instance_uuid=uuids.instance):
++    flavor = {
++        'nova_object.data': dict(
++            memory_mb=1024,
++            vcpus=1,
++            root_gb=0,
++            ephemeral_gb=0,
++            swap=0,
++            extra_specs={},
++        )
++    }
++    db.instance_create(
++        ctx,
++        dict(
++            uuid=instance_uuid,
++            project_id='project',
++            user_id='actor',
++            vm_state=vm_states.ACTIVE,
++            power_state=1,
++            host='compute',
++            node='node',
++            config_drive='',
++            extra={
++                'flavor': jsonutils.dumps(dict(cur=flavor, old=None, new=None))
++            },
++        ),
++    )
++    db.block_device_mapping_create(
++        ctx,
++        dict(
++            uuid=uuids.bdm,
++            instance_uuid=instance_uuid,
++            volume_id=uuids.volume,
++            source_type='volume',
++            destination_type='volume',
++            device_type='disk',
++            device_name='/dev/vda',
++            boot_index=0,
++            connection_info=jsonutils.dumps({'serial': uuids.volume}),
++        ),
++        legacy=False,
++    )
++
++
++def admission(
++    ctx,
++    request_id=uuids.request,
++    kind='create',
++    checkpoint_id=uuids.checkpoint,
++    operation_id=uuids.operation,
++):
++    manifest = checkpoints.device_manifest(ctx, uuids.instance)
++    return c.Admission(
++        c.RequestKey(
++            'project',
++            uuids.instance,
++            request_id,
++            'actor',
++            kind,
++            c.canonical_payload_hash({'kind': kind}),
++        ),
++        operation_id,
++        checkpoint_id,
++        uuids.cell,
++        'compute',
++        'node',
++        c.device_fingerprint(manifest),
++        manifest,
++        4096,
++        executor_id='test-executor',
++        name='A',
++    )
++
++
++def phase_result(phase, fingerprint):
++    artifact = dict(
++        id=uuids.artifact,
++        kind='ram',
++        logical_id='ram-object',
++        checksum='a' * 64,
++        bytes=1024,
++    )
++    proofs = {
++        'preflight': dict(
++            fingerprint=fingerprint, host='compute', node='node'
++        ),
++        'cinder_reserve': dict(
++            operation_id=uuids.cinder,
++            generation=1,
++            volume_ids=[uuids.volume],
++            state='reserved',
++        ),
++        'runtime_save': dict(writes_stopped=True, artifacts=[artifact]),
++        'disk_snapshot': dict(
++            volume_ids=[uuids.volume],
++            snapshots=[
++                dict(
++                    volume_id=uuids.volume,
++                    snapshot_id=uuids.snapshot,
++                    status='available',
++                )
++            ],
++        ),
++        'artifact_publish': dict(artifacts=[artifact], staging_deleted=True),
++        'runtime_restore_current': dict(
++            fingerprint=fingerprint, power_state='RUNNING'
++        ),
++        'cinder_release': dict(
++            operation_id=uuids.cinder,
++            generation=1,
++            state='released',
++            outcome='succeeded',
++        ),
++        'disk_snapshot_delete': dict(
++            volume_ids=[uuids.volume],
++            snapshots=[
++                dict(
++                    volume_id=uuids.volume,
++                    snapshot_id=uuids.snapshot,
++                    status='deleted',
++                )
++            ],
++        ),
++        'artifact_delete': dict(
++            artifact_ids=[uuids.artifact],
++            deleted_artifact_ids=[uuids.artifact],
++        ),
++    }
++    return c.StepResult('succeeded', proofs[phase], None)
++
++
++class CellDBTest(test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.ctx = context.RequestContext('actor', 'project')
++        make_instance(self.ctx)
++        self.admission = admission(self.ctx)
++
++    def admit(self, value=None):
++        return checkpoints.admit(
++            self.ctx, value or self.admission, uuids.ticket
++        )
++
++    def ready(self, value=None):
++        op = self.admit(value)
++        checkpoints.mark_quota_ready(self.ctx, op['uuid'], uuids.ticket)
++        return op
++
++    def complete_steps(self, value):
++        self.ready(value)
++        for phase in workflow.steps_for(value.key.kind):
++            step = checkpoints.claim_step(
++                self.ctx, value.operation_id, 1, phase, 'test-executor'
++            )
++            checkpoints.finish_step(
++                self.ctx, step.id, 1, phase_result(phase, value.fingerprint)
++            )
++
++    def test_admit_atomic_with_instance_task(self):
++        op = self.admit()
++        self.assertEqual(uuids.operation, op['uuid'])
++        self.assertEqual('reserved', op['state'])
++        self.assertFalse(op['quota_ready'])
++        guard = checkpoints.guard_get(self.ctx, uuids.instance)
++        self.assertEqual(uuids.operation, guard['operation_id'])
++        self.assertEqual(1, guard['checkpoint_count'])
++        self.assertEqual(
++            task_states.CHECKPOINT_CREATING,
++            db.instance_get_by_uuid(self.ctx, uuids.instance)['task_state'],
++        )
++        self.assertEqual(
++            'creating',
++            checkpoints.checkpoint_get(self.ctx, uuids.checkpoint)['status'],
++        )
++        self.assertEqual(
++            1, len(checkpoints.disks_get(self.ctx, uuids.checkpoint))
++        )
++
++    def test_conflicting_admission_does_not_leave_partial_records(self):
++        self.admit()
++        other = replace(
++            self.admission,
++            operation_id=uuids.other_op,
++            checkpoint_id=uuids.other_checkpoint,
++            key=replace(self.admission.key, request_id=uuids.other),
++        )
++        self.assertRaises(exception.CheckpointConflict, self.admit, other)
++        self.assertIsNone(checkpoints.find_request(self.ctx, other.key))
++        self.assertEqual(
++            1, len(checkpoints.checkpoints_get(self.ctx, uuids.instance))
++        )
++
++    def test_admit_rolls_back_guard_children_and_task_on_write_error(self):
++        with mock.patch.object(
++            checkpoints.secrets,
++            'token_hex',
++            side_effect=RuntimeError('injected failure'),
++        ):
++            self.assertRaises(RuntimeError, self.admit)
++        self.assertIsNone(
++            checkpoints.find_request(self.ctx, self.admission.key)
++        )
++        self.assertEqual(
++            [], checkpoints.checkpoints_get(self.ctx, uuids.instance)
++        )
++        self.assertIsNone(checkpoints.guard_get(self.ctx, uuids.instance))
++        self.assertIsNone(
++            db.instance_get_by_uuid(self.ctx, uuids.instance)['task_state']
++        )
++
++    def test_cancel_then_late_admit(self):
++        proof = checkpoints.cancel_admission(self.ctx, self.admission)
++        self.assertEqual('admission_cancelled', proof.kind)
++        self.assertEqual(
++            proof, checkpoints.close_proof(self.ctx, uuids.operation)
++        )
++        self.assertEqual(
++            proof, checkpoints.cancel_admission(self.ctx, self.admission)
++        )
++        self.assertRaises(exception.CheckpointConflict, self.admit)
++        self.assertEqual([], checkpoints.steps_get(self.ctx, uuids.operation))
++
++    def test_cancel_create_when_other_kind_owns_request(self):
++        self.complete_steps(self.admission)
++        checkpoints.finalize(self.ctx, uuids.operation, 1, 'succeeded')
++        deleting = admission(
++            self.ctx,
++            request_id=uuids.other_request,
++            kind='delete',
++            operation_id=uuids.delete_op,
++        )
++        self.admit(deleting)
++        candidate = replace(
++            self.admission,
++            operation_id=uuids.late_op,
++            checkpoint_id=uuids.late_checkpoint,
++            key=replace(self.admission.key, request_id=uuids.other_request),
++        )
++        proof = checkpoints.cancel_admission(self.ctx, candidate)
++        self.assertEqual('admission_cancelled', proof.kind)
++        self.assertEqual(
++            uuids.delete_op,
++            checkpoints.find_request(self.ctx, deleting.key)['uuid'],
++        )
++        self.assertRaises(exception.CheckpointConflict, self.admit, candidate)
++
++    def test_scope_identity_immutable(self):
++        self.admit()
++        self.assertEqual(uuids.operation, self.admit()['uuid'])
++        changed = replace(
++            self.admission,
++            key=replace(self.admission.key, actor_user_id='different'),
++        )
++        other_ctx = context.RequestContext('different', 'project')
++        self.assertRaises(
++            exception.NotFound,
++            checkpoints.admit,
++            other_ctx,
++            changed,
++            uuids.ticket,
++        )
++        changed = replace(
++            self.admission,
++            key=replace(self.admission.key, payload_hash='a' * 64),
++        )
++        self.assertRaises(exception.CheckpointConflict, self.admit, changed)
++
++    def test_wrong_generation_cannot_finalize(self):
++        self.ready()
++        self.assertRaises(
++            exception.CheckpointConflict,
++            checkpoints.finalize,
++            self.ctx,
++            uuids.operation,
++            2,
++            'succeeded',
++        )
++        self.assertEqual(
++            uuids.operation,
++            checkpoints.guard_get(self.ctx, uuids.instance)['operation_id'],
++        )
++
++    def test_cannot_finalize_without_all_evidence(self):
++        self.ready()
++        self.assertRaises(
++            exception.CheckpointConflict,
++            checkpoints.finalize,
++            self.ctx,
++            uuids.operation,
++            1,
++            'succeeded',
++        )
++        self.assertIsNone(checkpoints.close_proof(self.ctx, uuids.operation))
++
++    def test_claim_is_once_and_requires_quota_and_phase_order(self):
++        self.admit()
++        self.assertRaises(
++            exception.CheckpointConflict,
++            checkpoints.claim_step,
++            self.ctx,
++            uuids.operation,
++            1,
++            'preflight',
++            'test-executor',
++        )
++        checkpoints.mark_quota_ready(self.ctx, uuids.operation, uuids.ticket)
++        self.assertRaises(
++            exception.CheckpointConflict,
++            checkpoints.claim_step,
++            self.ctx,
++            uuids.operation,
++            1,
++            'disk_snapshot',
++            'test-executor',
++        )
++        self.assertRaises(
++            exception.CheckpointConflict,
++            checkpoints.claim_step,
++            self.ctx,
++            uuids.operation,
++            1,
++            'preflight',
++            'foreign',
++        )
++        step = checkpoints.claim_step(
++            self.ctx, uuids.operation, 1, 'preflight', 'test-executor'
++        )
++        self.assertIsNotNone(step)
++        self.assertIsNone(
++            checkpoints.claim_step(
++                self.ctx, uuids.operation, 1, 'preflight', 'test-executor'
++            )
++        )
++        self.assertRaises(
++            exception.CheckpointConflict,
++            checkpoints.cancel_admission,
++            self.ctx,
++            self.admission,
++        )
++
++    def test_invalid_result_remains_unknown_and_retains_guard(self):
++        self.ready()
++        step = checkpoints.claim_step(
++            self.ctx, uuids.operation, 1, 'preflight', 'test-executor'
++        )
++        checkpoints.finish_step(
++            self.ctx, step.id, 1, c.StepResult('succeeded', {}, None)
++        )
++        self.assertEqual(
++            'unknown', checkpoints.step_get(self.ctx, step.id)['status']
++        )
++        self.assertEqual(
++            'recovery_required',
++            checkpoints.get_by_uuid(self.ctx, uuids.operation)['state'],
++        )
++        self.assertIsNone(checkpoints.close_proof(self.ctx, uuids.operation))
++
++    def test_terminal_step_cannot_be_changed(self):
++        self.ready()
++        step = checkpoints.claim_step(
++            self.ctx, uuids.operation, 1, 'preflight', 'test-executor'
++        )
++        result = phase_result('preflight', self.admission.fingerprint)
++        checkpoints.finish_step(self.ctx, step.id, 1, result)
++        checkpoints.finish_step(self.ctx, step.id, 1, result)
++        self.assertRaises(
++            exception.CheckpointConflict,
++            checkpoints.finish_step,
++            self.ctx,
++            step.id,
++            1,
++            c.StepResult('unknown', {}, 'executor_unavailable'),
++        )
++
++    def test_deleted_tombstone_replay_same_uuid(self):
++        self.complete_steps(self.admission)
++        checkpoints.finalize(self.ctx, uuids.operation, 1, 'succeeded')
++        self.assertEqual(
++            1,
++            checkpoints.guard_get(self.ctx, uuids.instance)[
++                'checkpoint_count'
++            ],
++        )
++        deleting = admission(
++            self.ctx,
++            request_id=uuids.delete_request,
++            kind='delete',
++            operation_id=uuids.delete_op,
++        )
++        self.complete_steps(deleting)
++        checkpoints.finalize(self.ctx, uuids.delete_op, 1, 'succeeded')
++        proof = checkpoints.close_proof(self.ctx, uuids.operation)
++        self.assertEqual('resources_deleted', proof.kind)
++        self.assertEqual(uuids.delete_op, proof.closing_operation_id)
++        self.assertEqual(
++            uuids.delete_op,
++            checkpoints.guard_get(self.ctx, uuids.instance)['operation_id'],
++        )
++        checkpoints.mark_quota_released(
++            self.ctx, uuids.delete_op, uuids.ticket
++        )
++        checkpoints.finalize(self.ctx, uuids.delete_op, 1, 'succeeded')
++        self.assertEqual(
++            0,
++            checkpoints.guard_get(self.ctx, uuids.instance)[
++                'checkpoint_count'
++            ],
++        )
++        self.assertEqual(
++            'deleted',
++            checkpoints.checkpoint_get(self.ctx, uuids.checkpoint)['status'],
++        )
++        self.assertEqual(uuids.delete_op, self.admit(deleting)['uuid'])
++
++    def test_db_identity_change_aborts_before_journal(self):
++        db.instance_update(self.ctx, uuids.instance, {'host': 'other'})
++        self.assertRaises(exception.CheckpointConflict, self.admit)
++        self.assertIsNone(
++            checkpoints.find_request(self.ctx, self.admission.key)
++        )
++        self.assertIsNone(
++            db.instance_get_by_uuid(self.ctx, uuids.instance)['task_state']
++        )
++
++    def test_executor_error_code_cannot_forge_admission_cancellation(self):
++        self.complete_steps(self.admission)
++        checkpoints.finalize(self.ctx, uuids.operation, 1, 'succeeded')
++        deleting = admission(
++            self.ctx,
++            request_id=uuids.delete_request,
++            kind='delete',
++            operation_id=uuids.delete_op,
++        )
++        self.ready(deleting)
++        for phase in workflow.steps_for('delete'):
++            step = checkpoints.claim_step(
++                self.ctx, uuids.delete_op, 1, phase, 'test-executor'
++            )
++            if phase == 'cinder_release':
++                result = c.StepResult(
++                    'failed_no_effect',
++                    dict(no_effect=True, late_effect_impossible=True),
++                    'admission_cancelled',
++                )
++            else:
++                result = phase_result(phase, deleting.fingerprint)
++            checkpoints.finish_step(self.ctx, step.id, 1, result)
++        self.assertRaises(
++            exception.CheckpointConflict,
++            checkpoints.finalize,
++            self.ctx,
++            uuids.delete_op,
++            1,
++            'succeeded',
++        )
++        self.assertIsNone(checkpoints.close_proof(self.ctx, uuids.operation))
++
++
++class CellDBRaceMixin:
++    USES_DB_SELF = True
++
++    def setUp(self):
++        super().setUp()
++        self.ctx = context.RequestContext('actor', 'project')
++        # Use the actual opportunistic engine with the Nova cell facade.
++        self.engine = enginefacade.writer.get_engine()
++        self.manager = db.create_context_manager(
++            self.engine.url.render_as_string(hide_password=False)
++        )
++        self.ctx.db_connection = self.manager
++        with mock.patch.object(
++            migration, '_get_engine', return_value=self.engine
++        ):
++            migration.db_sync(database='main')
++        self.addCleanup(self.manager.dispose_pool)
++        make_instance(self.ctx)
++
++    def test_same_instance_two_requests_one_winner(self):
++        candidates = [
++            admission(self.ctx),
++            admission(
++                self.ctx,
++                request_id=uuids.request2,
++                operation_id=uuids.op2,
++                checkpoint_id=uuids.checkpoint2,
++            ),
++        ]
++        barrier = threading.Barrier(2)
++        outcomes = []
++
++        def run(candidate):
++            ctx = context.RequestContext('actor', 'project')
++            ctx.db_connection = self.manager
++            barrier.wait(timeout=10)
++            try:
++                checkpoints.admit(ctx, candidate, uuids.ticket)
++                outcomes.append(True)
++            except exception.CheckpointConflict:
++                outcomes.append(False)
++
++        threads = [threading.Thread(target=run, args=(a,)) for a in candidates]
++        for worker in threads:
++            worker.start()
++        for worker in threads:
++            worker.join(timeout=20)
++            self.assertFalse(worker.is_alive())
++        self.assertEqual(2, len(outcomes))
++        self.assertEqual(1, sum(outcomes))
++
++
++class CellDBMySQLRace(
++    CellDBRaceMixin, test_fixtures.OpportunisticDBTestMixin, test.NoDBTestCase
++):
++    FIXTURE = test_fixtures.MySQLOpportunisticFixture
++
++
++class CellDBPostgreSQLRace(
++    CellDBRaceMixin, test_fixtures.OpportunisticDBTestMixin, test.NoDBTestCase
++):
++    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
+diff --git a/nova/tests/unit/checkpoints/test_contracts.py b/nova/tests/unit/checkpoints/test_contracts.py
+index 6cfc96a..313e258 100644
+--- a/nova/tests/unit/checkpoints/test_contracts.py
++++ b/nova/tests/unit/checkpoints/test_contracts.py
+@@ -247,7 +247,7 @@ class ContractsTest(unittest.TestCase):
+                            DIGEST)
+         admission = c.Admission(key, OPERATION, CHECKPOINT, CELL, 'compute',
+                                 'node', c.device_fingerprint(devices), devices,
+-                                1024)
++                                1024, executor_id='test-executor')
+         primitive = admission.to_primitive()
+         self.assertEqual(admission, c.Admission.from_primitive(
+             jsonutils.loads(jsonutils.dumps(primitive))))
+diff --git a/nova/tests/unit/db/main/test_api.py b/nova/tests/unit/db/main/test_api.py
+index f02a320..d75ec0b 100644
+--- a/nova/tests/unit/db/main/test_api.py
++++ b/nova/tests/unit/db/main/test_api.py
+@@ -6011,6 +6011,11 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
+                 'tags', 'resource_providers', 'allocations',
+                 'inventories', 'resource_provider_aggregates',
+                 'console_auth_tokens', 'share_mapping',
++                'instance_checkpoints', 'instance_checkpoint_disks',
++                'instance_checkpoint_artifacts',
++                'instance_checkpoint_operations', 'instance_checkpoint_steps',
++                'instance_checkpoint_guards',
++                'instance_checkpoint_admission_tombstones',
+             ]:
+                 continue
+ 
+diff --git a/nova/tests/unit/db/main/test_migrations.py b/nova/tests/unit/db/main/test_migrations.py
+index b7ea88a..a1b326b 100644
+--- a/nova/tests/unit/db/main/test_migrations.py
++++ b/nova/tests/unit/db/main/test_migrations.py
+@@ -379,6 +379,39 @@ class NovaMigrationsWalk(
+                                 'console_auth_tokens',
+                                 'tls_port')
+ 
++    def _pre_upgrade_4a8c2d7e9101(self, connection):
++        self._checkpoint_original_rows = {}
++        instance_uuid = '00000000-0000-4000-8000-000000000991'
++        table = Table('instances', sa.MetaData(), autoload_with=connection)
++        connection.execute(table.insert().values(uuid=instance_uuid,
++                                                  project_id='old-project'))
++        table = Table('block_device_mapping', sa.MetaData(),
++                      autoload_with=connection)
++        connection.execute(table.insert().values(
++            uuid='00000000-0000-4000-8000-000000000992',
++            instance_uuid=instance_uuid, device_name='/dev/vda', boot_index=0))
++        for name in ('instances', 'block_device_mapping'):
++            table = Table(name, sa.MetaData(), autoload_with=connection)
++            self._checkpoint_original_rows[name] = list(
++                connection.execute(table.select()).mappings())
++
++    def _check_4a8c2d7e9101(self, connection):
++        names = ('instance_checkpoints', 'instance_checkpoint_disks',
++                 'instance_checkpoint_artifacts',
++                 'instance_checkpoint_operations', 'instance_checkpoint_steps',
++                 'instance_checkpoint_guards',
++                 'instance_checkpoint_admission_tombstones')
++        inspector = sa.inspect(connection)
++        for name in names:
++            self.assertIn(name, inspector.get_table_names())
++            self.assertNotIn('shadow_' + name, inspector.get_table_names())
++            self.assertNotIn('deleted', [column['name'] for column in
++                                        inspector.get_columns(name)])
++        for name, rows in self._checkpoint_original_rows.items():
++            table = Table(name, sa.MetaData(), autoload_with=connection)
++            self.assertEqual(rows, list(
++                connection.execute(table.select()).mappings()))
++
+     def test_single_base_revision(self):
+         """Ensure we only have a single base revision.
+ 
+diff --git a/nova/tests/unit/objects/test_checkpoint.py b/nova/tests/unit/objects/test_checkpoint.py
+new file mode 100644
+index 0000000..cd6cfaf
+--- /dev/null
++++ b/nova/tests/unit/objects/test_checkpoint.py
+@@ -0,0 +1,92 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from nova import context
++from nova import objects
++from nova.objects import base
++from nova import test
++from nova.tests.unit.checkpoints import test_cell_db
++from nova.tests.unit.objects import test_objects
++
++
++class CheckpointObjectTest(test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.ctx = context.RequestContext('actor', 'project')
++        test_cell_db.make_instance(self.ctx)
++        self.admission = test_cell_db.admission(self.ctx)
++
++    def test_operation_roundtrip(self):
++        op = objects.InstanceCheckpointOperation.admit(
++            self.ctx, self.admission.to_primitive(), test_cell_db.uuids.ticket
++        )
++        serializer = base.NovaObjectSerializer()
++        wire = serializer.serialize_entity(self.ctx, op)
++        received = serializer.deserialize_entity(self.ctx, wire)
++        self.assertIsInstance(received, objects.InstanceCheckpointOperation)
++        self.assertEqual(op.uuid, received.uuid)
++        self.assertEqual('1.0', received.VERSION)
++        self.assertRaises(NotImplementedError, received.save, self.ctx)
++        self.assertFalse(hasattr(received, 'create'))
++        self.assertEqual('2.8', objects.Instance.VERSION)
++
++    def test_backport_before_object_existed_is_rejected(self):
++        from oslo_versionedobjects import exception as ovo_exc
++
++        op = objects.InstanceCheckpointOperation.admit(
++            self.ctx, self.admission.to_primitive(), test_cell_db.uuids.ticket
++        )
++        self.assertRaises(
++            ovo_exc.UnsupportedObjectError,
++            op.obj_to_primitive,
++            target_version='0.9',
++        )
++
++    def test_list_backport_before_object_existed_is_rejected(self):
++        from oslo_versionedobjects import exception as ovo_exc
++
++        items = objects.InstanceCheckpointList(objects=[])
++        self.assertRaises(
++            ovo_exc.UnsupportedObjectError,
++            items.obj_to_primitive,
++            target_version='0.9',
++        )
++
++
++class _RemoteCheckpoint:
++    def test_find_request_remotes_closed_primitive(self):
++        from unittest import mock
++
++        from nova.db.main import checkpoints
++
++        key = test_cell_db.c.RequestKey(
++            'project',
++            test_cell_db.uuids.instance,
++            test_cell_db.uuids.request,
++            'actor',
++            'create',
++            'a' * 64,
++        )
++        with mock.patch.object(checkpoints, 'find_request', return_value=None):
++            self.assertIsNone(
++                objects.InstanceCheckpointOperation.find_request(
++                    self.context, key.to_primitive()
++                )
++            )
++
++
++class CheckpointRemoteTest(test_objects._RemoteTest, _RemoteCheckpoint):
++    pass
++
++
++class CheckpointLocalTest(test_objects._LocalTest, _RemoteCheckpoint):
++    pass
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 27bcf43..3ac1d74 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1077,6 +1077,16 @@ class TestRegistry(test.NoDBTestCase):
+ # they come with a corresponding version bump in the affected
+ # objects
+ object_data = {
++    'InstanceCheckpoint': '1.0-34525cf00914f9211abf6738ff70b4da',
++    'InstanceCheckpointArtifact': '1.0-230a6b36d1ee8416232da223889e465e',
++    'InstanceCheckpointArtifactList': '1.0-980a2e851b91058a2b688bee649202ef',
++    'InstanceCheckpointDisk': '1.0-32b4b8527364c69b5b047d3534dc2f26',
++    'InstanceCheckpointDiskList': '1.0-980a2e851b91058a2b688bee649202ef',
++    'InstanceCheckpointGuard': '1.0-e82f95884bbb1b0d0d33d3da46211154',
++    'InstanceCheckpointList': '1.0-df8bec672e55a3a45b40eaded98ec218',
++    'InstanceCheckpointOperation': '1.0-3b55229ba7e9019fa9370d6a93c3dcf5',
++    'InstanceCheckpointStep': '1.0-c93b4ee2e9176e4e97356aab8ea3dd0a',
++    'InstanceCheckpointStepList': '1.0-380130b03f40b317487ed802199130bb',
+     'Aggregate': '1.3-f315cb68906307ca2d1cca84d4753585',
+     'AggregateList': '1.3-3ea55a050354e72ef3306adefa553957',
+     'BlockDeviceMapping': '1.21-220abb8aa1450e759b72fce8ec6ff955',

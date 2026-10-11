@@ -1,0 +1,945 @@
+From ded19857810fff80af39f4d328d93654a7486531 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 16:03:48 +0300
+Subject: [PATCH 2/7] feat: persist checkpoint continuation grants atomically
+
+---
+ cinder/checkpoints/api.py                     |  16 +
+ cinder/db/api.py                              |  10 +
+ ...3d4e2a671c0_add_checkpoint_continuation.py |  48 +++
+ cinder/db/sqlalchemy/api.py                   |  12 +
+ .../db/sqlalchemy/checkpoint_continuation.py  | 162 +++++++++
+ cinder/db/sqlalchemy/checkpoints.py           |  30 ++
+ cinder/db/sqlalchemy/models.py                |  23 ++
+ cinder/objects/__init__.py                    |   1 +
+ cinder/objects/base.py                        |   5 +
+ cinder/objects/checkpoint.py                  |  17 +-
+ cinder/objects/checkpoint_continuation.py     |  56 ++++
+ .../unit/checkpoints/test_continuation_db.py  | 315 ++++++++++++++++++
+ cinder/tests/unit/db/test_migrations.py       |  16 +
+ cinder/tests/unit/objects/test_objects.py     |   4 +-
+ 14 files changed, 713 insertions(+), 2 deletions(-)
+ create mode 100644 cinder/db/migrations/versions/83d4e2a671c0_add_checkpoint_continuation.py
+ create mode 100644 cinder/db/sqlalchemy/checkpoint_continuation.py
+ create mode 100644 cinder/objects/checkpoint_continuation.py
+ create mode 100644 cinder/tests/unit/checkpoints/test_continuation_db.py
+
+diff --git a/cinder/checkpoints/api.py b/cinder/checkpoints/api.py
+index 059461d..603c1d7 100644
+--- a/cinder/checkpoints/api.py
++++ b/cinder/checkpoints/api.py
+@@ -17,6 +17,7 @@ import uuid
+ from cinder.api.schemas import checkpoints as schema
+ from cinder.api.validation import validators
+ from cinder.checkpoints import config
++from cinder.checkpoints import continuation_contracts
+ from cinder.checkpoints import contracts
+ from cinder.checkpoints import guards
+ from cinder import db
+@@ -68,6 +69,18 @@ class API:
+     def reserve(self, context, payload):
+         self._authorize(context, operate=True)
+         validators._SchemaValidator(schema.payload).validate(payload)
++        return self._reserve(context, payload)
++
++    def reserve_with_continuation(self, context, payload):
++        self._authorize(context, operate=True)
++        try:
++            payload = continuation_contracts.validate_reserve_373(payload)
++        except ValueError:
++            raise exception.InvalidInput(
++                reason='invalid_checkpoint_payload') from None
++        return self._reserve(context, payload)
++
++    def _reserve(self, context, payload):
+         identity = {key: getattr(context, key) for key in
+                     ('project_id', 'user_id', 'service_user_id')}
+         payload_hash = contracts.canonical_payload_hash(dict(payload,
+@@ -75,6 +88,9 @@ class API:
+         values = {key: str(uuid.UUID(payload[key])) for key in
+                   ('request_id', 'checkpoint_id', 'instance_uuid')}
+         values['kind'] = payload['kind']
++        if 'nova_operation_id' in payload:
++            values['nova_operation_id'] = payload['nova_operation_id']
++            values['allow_service_continuation'] = True
+         volume_ids = sorted(str(uuid.UUID(v)) for v in payload['volume_ids'])
+         existing = db.checkpoint_get_all(
+             context, {'request_id': values['request_id']})
+diff --git a/cinder/db/api.py b/cinder/db/api.py
+index 76511e9..de066e9 100644
+--- a/cinder/db/api.py
++++ b/cinder/db/api.py
+@@ -1997,6 +1997,16 @@ def checkpoint_reserve(context, values, volume_ids):
+     return IMPL.checkpoint_reserve(context, values, volume_ids)
+ 
+ 
++def checkpoint_continuation_get(context, nova_operation_id):
++    return IMPL.checkpoint_continuation_get(context, nova_operation_id)
++
++
++def checkpoint_continuation_scope(context, nova_operation_id, generation,
++                                  action, volume_id=None):
++    return IMPL.checkpoint_continuation_scope(
++        context, nova_operation_id, generation, action, volume_id)
++
++
+ def checkpoint_get(context, operation_id):
+     return IMPL.checkpoint_get(context, operation_id)
+ 
+diff --git a/cinder/db/migrations/versions/83d4e2a671c0_add_checkpoint_continuation.py b/cinder/db/migrations/versions/83d4e2a671c0_add_checkpoint_continuation.py
+new file mode 100644
+index 0000000..76a0e07
+--- /dev/null
++++ b/cinder/db/migrations/versions/83d4e2a671c0_add_checkpoint_continuation.py
+@@ -0,0 +1,48 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Persist service continuation with the original reservation."""
++
++from alembic import op
++import sqlalchemy as sa
++
++revision = '83d4e2a671c0'
++down_revision = '7fa82e10c601'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    op.add_column('checkpoint_operations',
++                  sa.Column('continuation_id', sa.String(36), nullable=True))
++    op.create_table(
++        'checkpoint_continuation_grants',
++        sa.Column('id', sa.String(36), primary_key=True, nullable=False),
++        sa.Column('operation_id', sa.String(36), sa.ForeignKey(
++            'checkpoint_operations.id'), nullable=False),
++        sa.Column('nova_operation_id', sa.String(36), nullable=False),
++        sa.Column('owner_project_id', sa.String(255), nullable=False),
++        sa.Column('actor_user_id', sa.String(255), nullable=False),
++        sa.Column('executor_service_user_id', sa.String(255), nullable=False),
++        sa.Column('generation', sa.Integer, nullable=False),
++        sa.Column('revision', sa.Integer, nullable=False),
++        sa.Column('state', sa.String(16), nullable=False),
++        sa.Column('payload_hash', sa.String(64), nullable=False),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        sa.Column('deleted_at', sa.DateTime),
++        sa.Column('deleted', sa.Boolean, default=False),
++        sa.UniqueConstraint('operation_id',
++                            name='checkpoint_continuation_operation_uc'),
++        sa.UniqueConstraint('executor_service_user_id', 'nova_operation_id',
++                            name='checkpoint_continuation_executor_nova_uc'),
++        mysql_engine='InnoDB')
+diff --git a/cinder/db/sqlalchemy/api.py b/cinder/db/sqlalchemy/api.py
+index 39255ae..c092b5f 100644
+--- a/cinder/db/sqlalchemy/api.py
++++ b/cinder/db/sqlalchemy/api.py
+@@ -8747,6 +8747,18 @@ def checkpoint_reserve(context, values, volume_ids):
+     return checkpoints.reserve(context, values, volume_ids)
+ 
+ 
++def checkpoint_continuation_get(context, nova_operation_id):
++    from cinder.db.sqlalchemy import checkpoint_continuation
++    return checkpoint_continuation.get(context, nova_operation_id)
++
++
++def checkpoint_continuation_scope(context, nova_operation_id, generation,
++                                  action, volume_id=None):
++    from cinder.db.sqlalchemy import checkpoint_continuation
++    return checkpoint_continuation.scope(
++        context, nova_operation_id, generation, action, volume_id)
++
++
+ def checkpoint_get(context, operation_id):
+     from cinder.db.sqlalchemy import checkpoints
+     return checkpoints.get(context, operation_id)
+diff --git a/cinder/db/sqlalchemy/checkpoint_continuation.py b/cinder/db/sqlalchemy/checkpoint_continuation.py
+new file mode 100644
+index 0000000..8628d24
+--- /dev/null
++++ b/cinder/db/sqlalchemy/checkpoint_continuation.py
+@@ -0,0 +1,162 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Owner-scoped grant queries. Never replace the authenticated context."""
++
++import json
++
++from oslo_utils import uuidutils
++
++from cinder.checkpoints import continuation
++from cinder.checkpoints import continuation_contracts as contracts
++from cinder.db.sqlalchemy import api
++from cinder.db.sqlalchemy import checkpoints as journal
++from cinder.db.sqlalchemy import models
++from cinder import exception
++from cinder.policies import checkpoints as policies
++
++
++def _grant(context, nova_operation_id, executor, lock=False):
++    query = journal._query(
++        context, models.CheckpointContinuationGrant).filter_by(
++            nova_operation_id=nova_operation_id,
++            executor_service_user_id=executor)
++    return (journal._current(query) if lock else query).first()
++
++
++def _bound_operation(context, grant, lock=False):
++    if grant is None:
++        raise exception.CheckpointOperationNotFound()
++    query = journal._query(context, models.CheckpointOperation).filter_by(
++        id=grant.operation_id, continuation_id=grant.id,
++        project_id=grant.owner_project_id, user_id=grant.actor_user_id,
++        service_user_id=grant.executor_service_user_id,
++        generation=grant.generation, payload_hash=grant.payload_hash)
++    operation = (journal._current(query) if lock else query).first()
++    if operation is None:
++        raise exception.CheckpointOperationNotFound()
++    if grant.state == 'revoked':
++        raise exception.CheckpointServiceForbidden()
++    if grant.state not in ('active', 'released'):
++        raise exception.CheckpointServiceForbidden()
++    if (grant.state == 'released') != (operation.status == 'released'):
++        journal._conflict('continuation_state_mismatch')
++    return operation
++
++
++def check_reserve(context, payload, payload_hash):
++    """Called within the original reserve transaction, with dual identity."""
++    previous = _grant(context, payload['nova_operation_id'],
++                      context.service_user_id)
++    if previous is not None:
++        if (previous.owner_project_id != context.project_id or
++                previous.actor_user_id != context.user_id):
++            raise exception.CheckpointOperationNotFound()
++        if previous.payload_hash != payload_hash:
++            journal._conflict('request_payload_changed')
++        return journal._as_dict(context, _bound_operation(context, previous))
++
++
++def insert_grant(context, operation, nova_operation_id):
++    """Commit snapshots, quota, grant and locks in the same transaction."""
++    grant = models.CheckpointContinuationGrant(
++        id=uuidutils.generate_uuid(), operation_id=operation.id,
++        nova_operation_id=nova_operation_id,
++        owner_project_id=operation.project_id, actor_user_id=operation.user_id,
++        executor_service_user_id=operation.service_user_id,
++        generation=operation.generation, revision=1, state='active',
++        payload_hash=operation.payload_hash)
++    context.session.add(grant)
++    context.session.flush()
++    operation.continuation_id = grant.id
++
++
++def mark_released(context, operation):
++    if operation.continuation_id is not None:
++        grant = journal._current(journal._query(
++            context, models.CheckpointContinuationGrant).filter_by(
++                id=operation.continuation_id,
++                operation_id=operation.id)).one()
++        grant.state = 'released'
++        grant.revision += 1
++
++
++@api.require_context
++@api.main_context_manager.reader
++def get(context, nova_operation_id):
++    executor = continuation.require_executor(context)
++    context.authorize(policies.CONTINUATION_READ_POLICY)
++    grant = _grant(context, nova_operation_id, executor)
++    operation = _bound_operation(context, grant)
++    return dict(grant, operation=journal._as_dict(context, operation))
++
++
++def _scope(context, nova_operation_id, generation, action, volume_id=None):
++    executor = continuation.require_executor(context)
++    if action not in ('read', 'execute', 'reconcile', 'cleanup', 'release',
++                      'capabilities', 'attachment'):
++        raise exception.InvalidInput(reason='invalid_continuation_action')
++    grant = _grant(context, nova_operation_id, executor)
++    operation = _bound_operation(context, grant)
++    if type(generation) is not int or generation != operation.generation:
++        journal._conflict('stale_generation')
++    if operation.status != 'released':
++        # Match C1 lock order: instance, sorted volumes, operation, then grant.
++        instance = journal._current(journal._query(
++            context, models.CheckpointInstance).filter_by(
++                instance_uuid=operation.instance_uuid,
++                project_id=grant.owner_project_id)).one()
++        volume_ids = json.loads(instance.volume_ids_json)
++        for vid in sorted(volume_ids):
++            volume = journal._current(journal._query(
++                context, models.Volume).filter_by(
++                    id=vid, project_id=grant.owner_project_id)).first()
++            if volume is None:
++                raise exception.VolumeNotFound(volume_id=vid)
++        operation = _bound_operation(context, grant, lock=True)
++        grant = _grant(context, nova_operation_id, executor, lock=True)
++        operation = _bound_operation(context, grant)
++        if operation.status != 'released':
++            locks = journal._current(journal._query(
++                context, models.CheckpointVolumeLock).filter_by(
++                    operation_id=operation.id)).all()
++            if (instance.active_operation_id != operation.id or
++                    sorted(row.volume_id for row in locks) !=
++                    sorted(volume_ids) or
++                    any(row.generation != generation for row in locks)):
++                journal._conflict('operation_not_owner')
++    if grant.state == 'released' and action != 'read':
++        journal._conflict('continuation_released')
++    resources = journal._resources(context, operation.checkpoint_id)
++    if any(row.project_id != grant.owner_project_id or
++           row.instance_uuid != operation.instance_uuid for row in resources):
++        raise exception.CheckpointOperationNotFound()
++    volume_ids = tuple(sorted(row.volume_id for row in resources))
++    if volume_id is not None and volume_id not in volume_ids:
++        raise exception.CheckpointOperationNotFound()
++    return contracts.ContinuationScope(
++        grant_id=grant.id, operation_id=operation.id,
++        nova_operation_id=grant.nova_operation_id,
++        owner_project_id=grant.owner_project_id,
++        actor_user_id=grant.actor_user_id,
++        executor_service_user_id=grant.executor_service_user_id,
++        instance_uuid=operation.instance_uuid,
++        checkpoint_id=operation.checkpoint_id, kind=operation.kind,
++        generation=generation, volume_ids=volume_ids,
++        grant_revision=grant.revision)
++
++
++@api.require_context
++@api.main_context_manager.writer
++def scope(context, nova_operation_id, generation, action, volume_id=None):
++    return _scope(context, nova_operation_id, generation, action,
++                  volume_id).to_primitive()
+diff --git a/cinder/db/sqlalchemy/checkpoints.py b/cinder/db/sqlalchemy/checkpoints.py
+index 9c75a26..77d99c9 100644
+--- a/cinder/db/sqlalchemy/checkpoints.py
++++ b/cinder/db/sqlalchemy/checkpoints.py
+@@ -27,7 +27,9 @@ from oslo_db import api as oslo_db_api
+ from oslo_utils import timeutils
+ from oslo_utils import uuidutils
+ 
++from cinder.checkpoints import continuation_contracts
+ from cinder.checkpoints import contracts
++from cinder.checkpoints import guards
+ from cinder.db.sqlalchemy import api
+ from cinder.db.sqlalchemy import models
+ from cinder import exception
+@@ -184,10 +186,28 @@ def _replay(context, operation, payload_hash):
+     max_retries=5, retry_on_deadlock=True, exception_checker=api._is_duplicate)
+ @api.main_context_manager.writer
+ def reserve(context, values, volume_ids):
++    from cinder.db.sqlalchemy import checkpoint_continuation as continuation
+     identity = _identity(context)
+     payload = {key: values.get(key) for key in
+                ('request_id', 'checkpoint_id', 'instance_uuid', 'kind')}
+     payload.update(identity, volume_ids=volume_ids)
++    delegated = ('nova_operation_id' in values or
++                 'allow_service_continuation' in values)
++    if delegated:
++        guards.require_service(context)
++        request = {key: payload[key] for key in (
++            'request_id', 'checkpoint_id', 'instance_uuid', 'kind',
++            'volume_ids')}
++        for key in ('nova_operation_id', 'allow_service_continuation'):
++            if key in values:
++                request[key] = values[key]
++        try:
++            request = continuation_contracts.validate_reserve_373(request)
++        except ValueError:
++            raise exception.InvalidInput(
++                reason='invalid_checkpoint_payload') from None
++        payload.update(nova_operation_id=request['nova_operation_id'],
++                       allow_service_continuation=True)
+     payload_hash = contracts.canonical_payload_hash(payload)
+     for key in ('request_id', 'checkpoint_id', 'instance_uuid'):
+         payload[key] = str(uuid.UUID(payload[key]))
+@@ -201,6 +221,11 @@ def reserve(context, values, volume_ids):
+     if previous:
+         return _replay(context, previous, payload_hash)
+ 
++    if delegated:
++        previous = continuation.check_reserve(context, payload, payload_hash)
++        if previous:
++            return previous
++
+     instance = _current(_query(context, models.CheckpointInstance).filter_by(
+         instance_uuid=payload['instance_uuid'])).first()
+     if instance is None:
+@@ -284,6 +309,9 @@ def reserve(context, values, volume_ids):
+         payload_hash=payload_hash, generation=1, status='reserved')
+     context.session.add(operation)
+     context.session.flush()
++    if delegated:
++        continuation.insert_grant(context, operation,
++                                  payload['nova_operation_id'])
+     instance.active_operation_id = operation.id
+     for resource in resources:
+         context.session.add(models.CheckpointStep(
+@@ -505,6 +533,8 @@ def release(context, operation_id, generation, outcome):
+     instance.active_operation_id = None
+     operation.status = 'released'
+     operation.release_outcome = outcome
++    from cinder.db.sqlalchemy import checkpoint_continuation as continuation
++    continuation.mark_released(context, operation)
+     return _as_dict(context, operation)
+ 
+ 
+diff --git a/cinder/db/sqlalchemy/models.py b/cinder/db/sqlalchemy/models.py
+index d57b321..1c400a9 100644
+--- a/cinder/db/sqlalchemy/models.py
++++ b/cinder/db/sqlalchemy/models.py
+@@ -1310,6 +1310,7 @@ class CheckpointOperation(BASE, CinderBase):
+     request_id = sa.Column(sa.String(36), nullable=False)
+     checkpoint_id = sa.Column(sa.String(36), nullable=False)
+     create_checkpoint_id = sa.Column(sa.String(36))
++    continuation_id = sa.Column(sa.String(36))
+     instance_uuid = sa.Column(sa.String(36), sa.ForeignKey(
+         'checkpoint_instances.instance_uuid'), nullable=False)
+     kind = sa.Column(sa.String(16), nullable=False)
+@@ -1320,6 +1321,28 @@ class CheckpointOperation(BASE, CinderBase):
+     error_code = sa.Column(sa.String(64))
+ 
+ 
++class CheckpointContinuationGrant(BASE, CinderBase):
++    __tablename__ = 'checkpoint_continuation_grants'
++    __table_args__ = (
++        sa.UniqueConstraint('operation_id',
++                            name='checkpoint_continuation_operation_uc'),
++        sa.UniqueConstraint('executor_service_user_id', 'nova_operation_id',
++                            name='checkpoint_continuation_executor_nova_uc'),
++        CinderBase.__table_args__,
++    )
++    id = sa.Column(sa.String(36), primary_key=True)
++    operation_id = sa.Column(sa.String(36), sa.ForeignKey(
++        'checkpoint_operations.id'), nullable=False)
++    nova_operation_id = sa.Column(sa.String(36), nullable=False)
++    owner_project_id = sa.Column(sa.String(255), nullable=False)
++    actor_user_id = sa.Column(sa.String(255), nullable=False)
++    executor_service_user_id = sa.Column(sa.String(255), nullable=False)
++    generation = sa.Column(sa.Integer, nullable=False)
++    revision = sa.Column(sa.Integer, nullable=False)
++    state = sa.Column(sa.String(16), nullable=False)
++    payload_hash = sa.Column(sa.String(64), nullable=False)
++
++
+ class CheckpointResource(BASE, CinderBase):
+     __tablename__ = 'checkpoint_resources'
+     __table_args__ = (
+diff --git a/cinder/objects/__init__.py b/cinder/objects/__init__.py
+index 1da532b..c9c5d31 100644
+--- a/cinder/objects/__init__.py
++++ b/cinder/objects/__init__.py
+@@ -26,6 +26,7 @@ def register_all():
+     # need to receive it via RPC.
+     __import__('cinder.objects.backup')
+     __import__('cinder.objects.checkpoint')
++    __import__('cinder.objects.checkpoint_continuation')
+     # NOTE(geguileo): Don't include cleanable to prevent circular imports
+     __import__('cinder.objects.cleanup_request')
+     __import__('cinder.objects.cgsnapshot')
+diff --git a/cinder/objects/base.py b/cinder/objects/base.py
+index fe89806..124398d 100644
+--- a/cinder/objects/base.py
++++ b/cinder/objects/base.py
+@@ -150,6 +150,11 @@ OBJ_VERSIONS.add('1.40', {
+     'CheckpointVolumeLock': '1.0',
+     'CheckpointVolumeLockList': '1.0',
+ })
++OBJ_VERSIONS.add('1.41', {
++    'CheckpointOperation': '1.1',
++    'CheckpointContinuationGrant': '1.0',
++    'CheckpointContinuationGrantList': '1.0',
++})
+ 
+ 
+ class CinderObjectRegistry(base.VersionedObjectRegistry):
+diff --git a/cinder/objects/checkpoint.py b/cinder/objects/checkpoint.py
+index 094d6c2..3695661 100644
+--- a/cinder/objects/checkpoint.py
++++ b/cinder/objects/checkpoint.py
+@@ -76,7 +76,7 @@ class CheckpointInstanceList(base.ObjectListBase, base.CinderObject):
+ 
+ @base.CinderObjectRegistry.register
+ class CheckpointOperation(_CheckpointObject):
+-    VERSION = '1.0'
++    VERSION = '1.1'
+ 
+     fields = {
+         'id': fields.UUIDField(),
+@@ -86,6 +86,7 @@ class CheckpointOperation(_CheckpointObject):
+         'request_id': fields.UUIDField(),
+         'checkpoint_id': fields.UUIDField(),
+         'create_checkpoint_id': fields.UUIDField(nullable=True),
++        'continuation_id': fields.UUIDField(nullable=True),
+         'instance_uuid': fields.UUIDField(),
+         'kind': fields.StringField(),
+         'payload_hash': fields.StringField(),
+@@ -97,6 +98,20 @@ class CheckpointOperation(_CheckpointObject):
+         'steps': fields.ListOfObjectsField('CheckpointStep'),
+     }
+ 
++    def obj_make_compatible(self, primitive, target_version):
++        if target_version == '1.0':
++            if primitive.get('continuation_id') is not None:
++                raise exception.ObjectActionError(
++                    action='obj_make_compatible',
++                    reason='continuation requires checkpoint operation 1.1')
++            primitive.pop('continuation_id', None)
++        super().obj_make_compatible(primitive, target_version)
++
++    obj_relationships = {
++        'resources': [('1.0', '1.0')],
++        'steps': [('1.0', '1.0')],
++    }
++
+ 
+ @base.CinderObjectRegistry.register
+ class CheckpointOperationList(base.ObjectListBase, base.CinderObject):
+diff --git a/cinder/objects/checkpoint_continuation.py b/cinder/objects/checkpoint_continuation.py
+new file mode 100644
+index 0000000..a048c47
+--- /dev/null
++++ b/cinder/objects/checkpoint_continuation.py
+@@ -0,0 +1,56 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Read-only projections of grants, never standalone authorization."""
++
++from oslo_versionedobjects import fields
++
++from cinder import db
++from cinder import exception
++from cinder.objects import base
++from cinder.objects import checkpoint
++
++
++@base.CinderObjectRegistry.register
++class CheckpointContinuationGrant(checkpoint._CheckpointObject):
++    VERSION = '1.0'
++
++    fields = {
++        'id': fields.UUIDField(),
++        'operation_id': fields.UUIDField(),
++        'nova_operation_id': fields.UUIDField(),
++        'owner_project_id': fields.StringField(),
++        'actor_user_id': fields.StringField(),
++        'executor_service_user_id': fields.StringField(),
++        'generation': fields.IntegerField(),
++        'revision': fields.IntegerField(),
++        'state': fields.StringField(),
++        'payload_hash': fields.StringField(),
++    }
++
++    @classmethod
++    def get_by_nova_operation(cls, context, nova_operation_id):
++        return cls._from_db_object(context, cls(context),
++                                   db.checkpoint_continuation_get(
++                                       context, nova_operation_id))
++
++    def save(self):
++        raise exception.ObjectActionError(
++            action='save', reason='read-only checkpoint continuation grant')
++
++
++@base.CinderObjectRegistry.register
++class CheckpointContinuationGrantList(base.ObjectListBase, base.CinderObject):
++    VERSION = '1.0'
++
++    fields = {
++        'objects': fields.ListOfObjectsField('CheckpointContinuationGrant')}
+diff --git a/cinder/tests/unit/checkpoints/test_continuation_db.py b/cinder/tests/unit/checkpoints/test_continuation_db.py
+new file mode 100644
+index 0000000..34346d0
+--- /dev/null
++++ b/cinder/tests/unit/checkpoints/test_continuation_db.py
+@@ -0,0 +1,315 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import copy
++from unittest import mock
++
++import eventlet
++from oslo_config import fixture as config_fixture
++from oslo_db.sqlalchemy import enginefacade
++from oslo_db.sqlalchemy import test_fixtures
++from oslo_utils.fixture import uuidsentinel as uuids
++from oslotest import base as test_base
++import sqlalchemy as sa
++
++from cinder.checkpoints import api
++from cinder.checkpoints import continuation_contracts as contracts
++from cinder import context
++from cinder import db
++from cinder.db import migration
++from cinder.db.sqlalchemy import api as sqla_api
++from cinder.db.sqlalchemy import models
++from cinder import exception
++from cinder import objects
++from cinder import policy
++from cinder.tests.unit.checkpoints import test_api
++from cinder.tests.unit.checkpoints import test_contracts
++from cinder.tests.unit.checkpoints import test_db
++from cinder.tests.unit import test
++
++
++class ContinuationHelpers(test_api.APIHelpers):
++    def prepare_continuation(self):
++        self.prepare_api()
++        self.payload.update(nova_operation_id=uuids.nova_operation,
++                            allow_service_continuation=True)
++        self.service_ctx = context.RequestContext(
++            test_db.SERVICE_ID, uuids.service_project, roles=['service'],
++            is_admin=False)
++
++    def count(self, model):
++        with sqla_api.main_context_manager.reader.using(self.ctxt):
++            return self.ctxt.session.query(model).filter_by(
++                deleted=False).count()
++
++    def grant(self):
++        return db.checkpoint_continuation_get(self.service_ctx,
++                                              uuids.nova_operation)
++
++
++class ContinuationDBTest(ContinuationHelpers, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_continuation()
++
++    def test_reply_loss_keeps_one_owner_and_one_charge(self):
++        first = self.api.reserve_with_continuation(self.ctxt, self.payload)
++        second = self.api.reserve_with_continuation(self.ctxt, self.payload)
++        row = self.grant()
++        self.assertEqual(first.id, second.id)
++        self.assertEqual(first.id, row['operation_id'])
++        self.assertEqual(first.continuation_id, row['id'])
++        self.assertEqual(self.ctxt.user_id, row['actor_user_id'])
++        self.assertEqual(self.ctxt.project_id, row['owner_project_id'])
++        self.assertEqual(1, self.count(models.CheckpointOperation))
++        self.assertEqual(1, self.count(models.CheckpointContinuationGrant))
++        self.assertEqual(2, self.usage()['snapshots']['in_use'])
++        self.assertEqual(0, self.usage()['snapshots']['reserved'])
++
++    def test_grant_insert_failure_rolls_back_reserve(self):
++        def fail(mapper, connection, target):
++            raise RuntimeError('injected_grant_insert_failure')
++
++        sa.event.listen(models.CheckpointContinuationGrant, 'before_insert',
++                        fail)
++        self.addCleanup(sa.event.remove, models.CheckpointContinuationGrant,
++                        'before_insert', fail)
++        self.assertRaises(RuntimeError, self.api.reserve_with_continuation,
++                          self.ctxt, self.payload)
++        for model in (models.CheckpointOperation, models.CheckpointResource,
++                      models.CheckpointContinuationGrant, models.Snapshot):
++            self.assertEqual(0, self.count(model))
++        self.assertEqual([], self.locks())
++        self.assertEqual(0, self.usage()['snapshots']['in_use'])
++        self.assertEqual(0, self.usage()['snapshots']['reserved'])
++
++    def test_changed_actor_or_payload_conflicts(self):
++        self.api.reserve_with_continuation(self.ctxt, self.payload)
++        for fields in ({'nova_operation_id': uuids.other_operation},
++                       {'volume_ids': self.volumes[:1]},
++                       {'checkpoint_id': uuids.other_checkpoint}):
++            self.assertRaises(exception.CheckpointConflict,
++                              self.api.reserve_with_continuation, self.ctxt,
++                              dict(self.payload, **fields))
++        other = self.ctxt.deepcopy()
++        other.user_id = uuids.other_actor
++        self.assertRaises(exception.CheckpointOperationNotFound,
++                          self.api.reserve_with_continuation, other,
++                          self.payload)
++        self.assertEqual(1, self.count(models.CheckpointOperation))
++        self.assertEqual(2, self.usage()['snapshots']['in_use'])
++
++    def test_legacy_reserve_cannot_gain_grant_by_replay(self):
++        legacy = {key: value for key, value in self.payload.items()
++                  if key not in ('nova_operation_id',
++                                 'allow_service_continuation')}
++        first = self.api.reserve(self.ctxt, legacy)
++        self.assertIsNone(first.continuation_id)
++        self.assertRaises(exception.CheckpointConflict,
++                          self.api.reserve_with_continuation, self.ctxt,
++                          self.payload)
++        self.assertEqual(0, self.count(models.CheckpointContinuationGrant))
++
++    def test_released_grant_is_read_only(self):
++        operation = self.api.reserve_with_continuation(self.ctxt, self.payload)
++        db.checkpoint_release(self.ctxt, operation.id, 1, 'abort')
++        row = self.grant()
++        self.assertEqual('released', row['state'])
++        self.assertEqual('released', row['operation']['status'])
++        self.assertEqual(operation.id, self.api.reserve_with_continuation(
++            self.ctxt, self.payload).id)
++        for action in ('execute', 'cleanup', 'capabilities'):
++            self.assertRaises(exception.CheckpointConflict,
++                              db.checkpoint_continuation_scope,
++                              self.service_ctx, uuids.nova_operation, 1,
++                              action)
++        self.assertEqual(operation.id, db.checkpoint_continuation_scope(
++            self.service_ctx, uuids.nova_operation, 1, 'read')['operation_id'])
++        self.assertEqual([], self.locks())
++        changed = dict(self.payload, request_id=uuids.another_request,
++                       checkpoint_id=uuids.another_checkpoint)
++        self.assertRaises(exception.CheckpointConflict,
++                          self.api.reserve_with_continuation,
++                          self.ctxt, changed)
++        self.assertEqual(1, self.count(models.CheckpointOperation))
++        self.assertEqual(0, self.usage()['snapshots']['in_use'])
++        self.assertEqual(0, self.usage()['snapshots']['reserved'])
++
++    def test_scope_is_bound_without_changing_service_context(self):
++        operation = self.api.reserve_with_continuation(self.ctxt, self.payload)
++        before = self.service_ctx.to_dict()
++        primitive = db.checkpoint_continuation_scope(
++            self.service_ctx, uuids.nova_operation, 1, 'execute')
++        scope = contracts.ContinuationScope.from_primitive(primitive)
++        self.assertEqual(operation.id, scope.operation_id)
++        self.assertEqual(self.ctxt.user_id, scope.actor_user_id)
++        self.assertEqual(test_db.SERVICE_ID, scope.executor_service_user_id)
++        self.assertEqual(tuple(sorted(self.volumes)), scope.volume_ids)
++        self.assertEqual(before, self.service_ctx.to_dict())
++        self.assertRaises(exception.CheckpointOperationNotFound,
++                          db.checkpoint_get, self.service_ctx, operation.id)
++
++    def test_foreign_service_generation_and_resource_are_denied(self):
++        self.api.reserve_with_continuation(self.ctxt, self.payload)
++        other = self.service_ctx.deepcopy()
++        other.user_id = uuids.other_service
++        self.flags(nova_service_user_ids=[test_db.SERVICE_ID,
++                                          uuids.other_service],
++                   group='checkpoint')
++        self.assertRaises(exception.CheckpointOperationNotFound,
++                          db.checkpoint_continuation_get, other,
++                          uuids.nova_operation)
++        self.assertRaises(exception.CheckpointOperationNotFound,
++                          db.checkpoint_continuation_scope, self.service_ctx,
++                          uuids.nova_operation, 1, 'capabilities',
++                          uuids.other_volume)
++        for generation in (True, 0, 2):
++            self.assertRaises(exception.CheckpointConflict,
++                              db.checkpoint_continuation_scope,
++                              self.service_ctx, uuids.nova_operation,
++                              generation, 'execute')
++        self.assertEqual(2, len(self.locks()))
++
++    def test_revoked_grant_does_not_release_resources(self):
++        self.api.reserve_with_continuation(self.ctxt, self.payload)
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            grant = self.ctxt.session.query(
++                models.CheckpointContinuationGrant).one()
++            grant.state = 'revoked'
++            grant.revision += 1
++        self.assertRaises(exception.CheckpointServiceForbidden,
++                          db.checkpoint_continuation_scope, self.service_ctx,
++                          uuids.nova_operation, 1, 'execute')
++        self.assertEqual(2, len(self.locks()))
++        self.assertEqual(2, self.usage()['snapshots']['in_use'])
++
++    def test_db_reserve_requires_verified_dual_identity_for_grant(self):
++        values = self.values()
++        values.update(nova_operation_id=uuids.nova_operation,
++                      allow_service_continuation=True)
++        untrusted = self.ctxt.deepcopy()
++        untrusted.service_roles = []
++        self.assertRaises(exception.CheckpointServiceForbidden,
++                          db.checkpoint_reserve, untrusted, values,
++                          self.volumes)
++        self.assertEqual(0, self.count(models.CheckpointContinuationGrant))
++        self.assertEqual([], self.locks())
++
++    def test_db_reserve_requires_explicit_delegation(self):
++        values = self.values()
++        values.update(nova_operation_id=uuids.nova_operation,
++                      allow_service_continuation=False)
++        self.assertRaises(exception.InvalidInput, db.checkpoint_reserve,
++                          self.ctxt, values, self.volumes)
++        self.assertEqual([], self.locks())
++
++    def test_delegated_operation_cannot_downconvert(self):
++        operation = self.api.reserve_with_continuation(self.ctxt, self.payload)
++        self.assertRaises(exception.ObjectActionError,
++                          operation.obj_to_primitive, target_version='1.0')
++        operation.continuation_id = None
++        primitive = operation.obj_to_primitive(target_version='1.0')
++        self.assertNotIn('continuation_id', primitive['versioned_object.data'])
++        grant = objects.CheckpointContinuationGrant.get_by_nova_operation(
++            self.service_ctx, uuids.nova_operation)
++        self.assertEqual(self.ctxt.user_id, grant.actor_user_id)
++        self.assertRaises(exception.ObjectActionError, grant.save)
++
++
++class ContinuationRaceTests(test_db.CheckpointDBHelpers):
++    def setUp(self):
++        super().setUp()
++        cfg = self.useFixture(config_fixture.Config())
++        cfg.config(auth_url='http://keystone.test/v3',
++                   group='keystone_authtoken')
++        cfg.conf([], project='cinder', default_config_files=[])
++        policy.reset()
++        self.addCleanup(policy.reset)
++        cfg.config(connection='sqlite://', group='database')
++        cfg.config(enabled=True, nova_service_user_ids=[test_db.SERVICE_ID],
++                   group='checkpoint')
++        engine = enginefacade.writer.get_engine()
++        migration.db_sync(engine=engine)
++        self.addCleanup(sqla_api.main_context_manager.patch_engine(engine))
++        self.prepare_volumes()
++        self.ctxt.roles = ['member']
++        self.ctxt.service_roles = ['service']
++        self.payload = {key: value for key, value in self.values().items()
++                        if key != 'capabilities'}
++        self.payload.update(volume_ids=self.volumes,
++                            nova_operation_id=uuids.nova_operation,
++                            allow_service_continuation=True)
++        rpc = mock.Mock(spec=['assert_checkpoint_ready',
++                              'get_checkpoint_capabilities'])
++        rpc.get_checkpoint_capabilities.return_value = (
++            test_contracts.supported_capabilities())
++        self.api = api.API(rpc=rpc)
++
++    def test_two_connections_same_nova_uuid_one_winner(self):
++        gate = eventlet.event.Event()
++
++        def reserve(payload):
++            ctxt = self.ctxt.deepcopy()
++            gate.wait()
++            try:
++                return self.api.reserve_with_continuation(ctxt, payload).id
++            except exception.CheckpointConflict:
++                return None
++
++        changed = dict(self.payload, request_id=uuids.other_request,
++                       checkpoint_id=uuids.other_checkpoint)
++        tasks = [eventlet.spawn(reserve, payload)
++                 for payload in (self.payload, changed)]
++        gate.send()
++        results = [task.wait() for task in tasks]
++        self.assertEqual(1, sum(result is not None for result in results))
++        with sqla_api.main_context_manager.reader.using(self.ctxt):
++            self.assertEqual(1, self.ctxt.session.query(
++                models.CheckpointContinuationGrant).count())
++            self.assertEqual(1, self.ctxt.session.query(
++                models.CheckpointOperation).count())
++        usage = db.quota_usage_get_all_by_project(self.ctxt.elevated(),
++                                                  self.ctxt.project_id)
++        self.assertEqual(2, usage['snapshots']['in_use'])
++        self.assertEqual(0, usage['snapshots']['reserved'])
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++    def test_identical_concurrent_reserve_returns_same_grant(self):
++        gate = eventlet.event.Event()
++
++        def reserve():
++            ctxt = self.ctxt.deepcopy()
++            gate.wait()
++            return self.api.reserve_with_continuation(
++                ctxt, copy.deepcopy(self.payload)).id
++
++        tasks = [eventlet.spawn(reserve) for unused in range(2)]
++        gate.send()
++        self.assertEqual(tasks[0].wait(), tasks[1].wait())
++        usage = db.quota_usage_get_all_by_project(self.ctxt.elevated(),
++                                                  self.ctxt.project_id)
++        self.assertEqual(2, usage['snapshots']['in_use'])
++        self.assertEqual(0, usage['snapshots']['reserved'])
++
++
++class ContinuationMySQLTest(ContinuationRaceTests,
++                            test_fixtures.OpportunisticDBTestMixin,
++                            test_base.BaseTestCase):
++    FIXTURE = test_fixtures.MySQLOpportunisticFixture
++    SKIP_ON_UNAVAILABLE_DB = False
++
++
++class ContinuationPostgreSQLTest(ContinuationRaceTests,
++                                 test_fixtures.OpportunisticDBTestMixin,
++                                 test_base.BaseTestCase):
++    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
++    SKIP_ON_UNAVAILABLE_DB = False
+diff --git a/cinder/tests/unit/db/test_migrations.py b/cinder/tests/unit/db/test_migrations.py
+index a260f34..b22ea9a 100644
+--- a/cinder/tests/unit/db/test_migrations.py
++++ b/cinder/tests/unit/db/test_migrations.py
+@@ -364,6 +364,22 @@ class MigrationsWalk(
+         self.assertIn(['create_checkpoint_id'],
+                       [item['column_names'] for item in constraints])
+ 
++    def _check_83d4e2a671c0(self, connection):
++        inspector = sqlalchemy.inspect(connection)
++        grants = db_utils.get_table(connection,
++                                    'checkpoint_continuation_grants')
++        operations = db_utils.get_table(connection, 'checkpoint_operations')
++        self.assertTrue(operations.c.continuation_id.nullable)
++        self.assertFalse(operations.c.continuation_id.foreign_keys)
++        self.assertFalse(grants.c.operation_id.nullable)
++        self.assertTrue(grants.c.operation_id.foreign_keys)
++        constraints = inspector.get_unique_constraints(
++            'checkpoint_continuation_grants')
++        self.assertIn(['operation_id'],
++                      [item['column_names'] for item in constraints])
++        self.assertIn(['executor_service_user_id', 'nova_operation_id'],
++                      [item['column_names'] for item in constraints])
++
+     def _pre_upgrade_c92a3e68beed(self, connection):
+         """Test shared_targets is nullable."""
+         table = db_utils.get_table(connection, 'volumes')
+diff --git a/cinder/tests/unit/objects/test_objects.py b/cinder/tests/unit/objects/test_objects.py
+index 2d40840..3a113a4 100644
+--- a/cinder/tests/unit/objects/test_objects.py
++++ b/cinder/tests/unit/objects/test_objects.py
+@@ -23,9 +23,11 @@ from cinder.tests.unit import test
+ # NOTE: The hashes in this list should only be changed if they come with a
+ # corresponding version bump in the affected objects.
+ object_data = {
++    'CheckpointContinuationGrant': '1.0-4d1d0c72dade73179c6bd7c96c772cd2',
++    'CheckpointContinuationGrantList': '1.0-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'CheckpointInstance': '1.0-e6e05d9743a2bef7d33ad8ad3dc2befb',
+     'CheckpointInstanceList': '1.0-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+-    'CheckpointOperation': '1.0-dd1c623b450ade00956e90bf4d68e717',
++    'CheckpointOperation': '1.1-4f78d148a120d6f32384815f3ae0ab63',
+     'CheckpointOperationList': '1.0-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'CheckpointResource': '1.0-ee32f7a21b6a0184a182fbdcdc1c93b8',
+     'CheckpointResourceList': '1.0-15ecf022a68ddbb8c2a6739cfc9f8f5e',

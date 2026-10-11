@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "scope": "static_local_source_inspection",
+  "hardware_observed": false,
+  "vendor_tests_executed": false,
+  "checkouts": {
+    "work/cinder-checkpoint-continuation": {
+      "commit": "d065a55cbe5cb8cd59489752846a41145d72bd27",
+      "tree": "53888d9cea7fa1b12d35a0b9afd894eeee270843"
+    },
+    "work/nova-checkpoint-executor": {
+      "commit": "ce3c1c474b8fd04b6223cf8cf3af7079345d14b2",
+      "tree": "4d24555083fea5d547fe2e8ebf6ed39937c0733c"
+    }
+  },
+  "files": [
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/checkpoints/continuation_manager.py",
+      "sha256": "bf7de8db7afe7e90275943b1ed1337e69723343184e90c789bbe748681d289db"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/checkpoints/contracts.py",
+      "sha256": "2e3d23fc4af9622e873eddac4e9db1ec9f9d467566afed982197398b5cbe2ea7"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/checkpoints/manager.py",
+      "sha256": "bcccff924c74a624c68052afe949173faf48d02fc062601fe6c4060974e5caef"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/db/sqlalchemy/checkpoints.py",
+      "sha256": "d70f1ae60b2f535098ee22bc977571e997658a6a8a012504619dcfa17d0e9306"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/driver.py",
+      "sha256": "7d23b7320acf22d4949f8b5ebc79ce3c07f1e78a957248c61357d9faba4cd52b"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/huawei/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/huawei/common.py",
+      "sha256": "14c14b72d6ed1dd58ecf02f57afeee5c53e8776a26bac6ddd49b1cb8ad67024c"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/huawei/constants.py",
+      "sha256": "8fbdfb51f9e40a7a146be8dd79f1425735c3f870c19998865ded25823a059a4f"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/huawei/fc_zone_helper.py",
+      "sha256": "6bd7ca29149eb685ea202232f869725b9546c3c360ab06baf9bbdb57fb3fdd6a"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/huawei/huawei_conf.py",
+      "sha256": "a9283e5541d02fe5d5fe7b52a566777eff333e07fef2fa3389dffe27281eecc3"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/huawei/huawei_driver.py",
+      "sha256": "3f92995efd15a0b6190c5c14e596fe05461b79d868be78d015039ebcabf87b0c"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/huawei/huawei_utils.py",
+      "sha256": "ba922dbec26deddb31fe659ee10f13b8d5d1d9813decd723efe5e38a0700f0f4"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/huawei/hypermetro.py",
+      "sha256": "b5e5bd0f09be9d579bf46569e67dcbb114f081c9d4074e1ace862b4522580bac"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/huawei/replication.py",
+      "sha256": "7e3211fd3c046ba46f1704da83050d5459ccfd167f54cae743768c3f60ce38ba"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/huawei/rest_client.py",
+      "sha256": "66b8c4bf8899ad2e91cc4bbb33ba14a37272130efb5a228508fde8e7c06b5b7b"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/huawei/smartx.py",
+      "sha256": "aa6f4cb9223999e6b1bb86c3195aeb312457d180d78ec2fd27b5000e4a0af28a"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/yadro/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/yadro/tatlin_api.py",
+      "sha256": "4070ae8152d459f622a2f917dba568dad215f45d3ae080e4005008b5c1d20235"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/yadro/tatlin_client.py",
+      "sha256": "6f70be6db2b31f9b3df6d341d5bbfb0716687db6e4f78dcabb3f5537fc131ca7"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/yadro/tatlin_common.py",
+      "sha256": "a75786b991c3939de6b0e26d74d527e39bdd7e446ed6173850db6081289c84a9"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/yadro/tatlin_exception.py",
+      "sha256": "e2e2eb857ee5290535cbbb365592acac2c5ab5d9b5b2b9d0899d66b2dc5f0fbe"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/yadro/tatlin_fc.py",
+      "sha256": "e6d40f6f9f454ad69393ac7f8f7446203aefc7e764fca9cee78b4b6c03fb6753"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/yadro/tatlin_iscsi.py",
+      "sha256": "483c38902ec5945db5f271d38216e4cf5471f53ad9a81d0bb70c448fd310889e"
+    },
+    {
+      "path": "work/cinder-checkpoint-continuation/cinder/volume/drivers/yadro/tatlin_utils.py",
+      "sha256": "59921a0a3be4b50731255d3dc661ffab34ef3106c6917c1e2e5359af9157343b"
+    }
+  ],
+  "negative_ast_check": {
+    "searched_methods": [
+      "checkpoint_create_snapshot",
+      "checkpoint_delete_snapshot",
+      "checkpoint_query_operation",
+      "checkpoint_revert_to_snapshot",
+      "get_checkpoint_capabilities",
+      "revert_to_snapshot"
+    ],
+    "vendor_definitions_found": {
+      "huawei": [],
+      "yadro": []
+    }
+  },
+  "limits": [
+    "No deployed driver, array model, firmware, pool or transport observed.",
+    "No vendor API beyond the supplied local implementation was validated.",
+    "Empty vendor method matches establish only absence of definitions in the scanned Python files.",
+    "This evidence is not a capability allowlist or hardware qualification report."
+  ]
+}

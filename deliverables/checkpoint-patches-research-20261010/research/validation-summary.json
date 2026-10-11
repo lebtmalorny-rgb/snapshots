@@ -1,0 +1,64 @@
+{
+  "scope": "summary_of_preexisting_records_not_a_new_runtime_run",
+  "source_record": "deliverables/checkpoint-prototype-20261010-r2/CLOSEOUT.json",
+  "source_record_sha256": "d9b15bd9c179760f5449329159392f2adea1ec002d8b4c5ef8565106334d826e",
+  "product_pins": {
+    "nova": {
+      "commit": "c524d80e5fe26020905b3fc511b06100180f0836",
+      "tree": "5e968fbae851c47b321991e8cccd573b06e7e362"
+    },
+    "cinder": {
+      "commit": "d065a55cbe5cb8cd59489752846a41145d72bd27",
+      "tree": "53888d9cea7fa1b12d35a0b9afd894eeee270843"
+    }
+  },
+  "runtime_validation": {
+    "date": "2026-10-10",
+    "source_commit": "15f723d1bfcd4a0d2440ad32fa03e2e537b3e4fa",
+    "source_tree": "d8172256f21c058e55ef4036023222156bb60076",
+    "scope": "local_real_ram_simulated_storage",
+    "direct_libvirt_gate": "passed",
+    "native_runtime_gate": "passed",
+    "targeted_tests": {
+      "tests": 10,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "successful": true,
+      "modules": [
+        "tests.real_ram.test_bootstrap_cleanup",
+        "tests.real_ram.test_lifecycle",
+        "tests.real_ram.test_domain"
+      ]
+    },
+    "full_linux_suite_rerun": false,
+    "full_13_case_matrix_rerun": false,
+    "disk_ram_consistency_validated": false,
+    "hardware_qualified": false,
+    "production_qualified": false
+  },
+  "historical_checks": {
+    "linux_suite": {
+      "passed": 198,
+      "source_commit": "6723398",
+      "log": "lab/evidence/historical-checks/full-suite-02.log"
+    },
+    "l1r_cli_passed": 13,
+    "l1_cli_passed": 24
+  },
+  "d1p": {
+    "commit": "eda81bc929505d6e6dfdfa4797d9f751e16a77a5",
+    "hardware_qualified": false,
+    "production_qualified": false,
+    "scope": "synthetic_vendor_protocol",
+    "source_clean": true,
+    "source_origin": "git",
+    "source_sha256": "217988b9ee42baaf350e17274e2dc7b51ffd1470aba3edbff3c78d975f70127f",
+    "supported": false,
+    "tree": "93fd058c3d51e06752005e89b84308e42bfcf5bb",
+    "unpacked_verified": true
+  },
+  "d1p_source_record": "deliverables/dorado-checkpoint-protocol-d1p/package.json",
+  "d1p_source_record_sha256": "19da33c991b84ead8b92b2804d530327c41b4096d0bb95e5c6ce248f32c0d07e",
+  "new_runtime_run": false
+}

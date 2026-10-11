@@ -1,0 +1,141 @@
+From 6d55009fae5eb55adb156e13835dd66240488f84 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Thu, 8 Oct 2026 16:45:40 +0300
+Subject: [PATCH 2/3] fix: query claimed checkpoint children behind ready
+ parents
+
+---
+ nova/checkpoints/compute_v2.py                |  4 +-
+ nova/checkpoints/coordinator.py               | 13 ++--
+ .../functional/test_checkpoint_executor.py    | 61 +++++++++++++++++++
+ 3 files changed, 70 insertions(+), 8 deletions(-)
+
+diff --git a/nova/checkpoints/compute_v2.py b/nova/checkpoints/compute_v2.py
+index 0092a77..6204da5 100644
+--- a/nova/checkpoints/compute_v2.py
++++ b/nova/checkpoints/compute_v2.py
+@@ -230,7 +230,9 @@ class ComputeV2:
+                 objects.InstanceCheckpointOperation.finish_step(
+                     context, step.uuid, 1, result.to_primitive()
+                 )
+-            elif step.status == 'ready':
++            elif (step.status == 'ready' and
++                  objects.CheckpointEffect.continuation(
++                      context, step.uuid) is not None):
+                 return self.report(context, op.uuid, 'ready', step)
+             else:
+                 result = self._effect(
+diff --git a/nova/checkpoints/coordinator.py b/nova/checkpoints/coordinator.py
+index ce7b56f..46a0142 100644
+--- a/nova/checkpoints/coordinator.py
++++ b/nova/checkpoints/coordinator.py
+@@ -288,12 +288,11 @@ class Coordinator:
+                     )
+                     for name, s in steps.items()
+                 )
+-                if ready is not None and not needs_fence:
+-                    continuation = objects.CheckpointEffect.continuation(
+-                        ctx, ready.uuid
+-                    )
+-                    if continuation is None:
+-                        return
++                continuation = (
++                    objects.CheckpointEffect.continuation(ctx, ready.uuid)
++                    if ready is not None and not needs_fence else None
++                )
++                if continuation is not None:
+                     report = self.compute_rpc.checkpoint_continue(
+                         ctx,
+                         instance,
+@@ -304,7 +303,7 @@ class Coordinator:
+                     )
+                 else:
+                     unresolved = any(
+-                        s.status in ('dispatching', 'pending', 'unknown')
++                        s.status in ('dispatching', 'pending', 'unknown', 'ready')
+                         for s in steps.values()
+                     )
+                     method = (
+diff --git a/nova/tests/functional/test_checkpoint_executor.py b/nova/tests/functional/test_checkpoint_executor.py
+index 35bfeaa..3fe9b30 100644
+--- a/nova/tests/functional/test_checkpoint_executor.py
++++ b/nova/tests/functional/test_checkpoint_executor.py
+@@ -30,6 +30,7 @@ from nova.db.main import models
+ from nova import objects
+ from nova.tests.fixtures import checkpoints_v2
+ from nova.virt.libvirt.checkpoints import executor
++from nova.virt.libvirt.checkpoints import staging
+ from nova.virt.libvirt.checkpoints import topology
+ from nova.volume import checkpoints as cinder
+ 
+@@ -268,6 +269,66 @@ class ExecutorV2FunctionalTest(checkpoints_v2.CheckpointV2TestCase):
+         self.advance(created)
+         self.assertEqual(1, self.drivers[0].backend.calls['save'])
+ 
++    def interrupt_ready_save(self, after_receipt):
++        """Leave the exact durable parent/child shape of a killed worker."""
++        class Interrupted(BaseException):
++            pass
++
++        self.patch(coordinator.Coordinator, 'max_transitions', 1)
++        created = self.create()
++        self.drive_until(created, lambda: any(
++            s.phase == 'runtime_save' and s.status == 'ready'
++            for s in self.rows(created)))
++        parent = next(s for s in self.rows(created)
++                      if s.phase == 'runtime_save')
++        original = staging.RuntimeRecord.finish
++
++        def interrupted(record, result):
++            if after_receipt:
++                original(record, result)
++            raise Interrupted()
++
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            continuation = objects.CheckpointEffect.continuation(
++                ctx, parent.uuid)
++            instance = objects.Instance.get_by_uuid(ctx, self.servers[0])
++            engine = compute_v2.ComputeV2(self.drivers[0], instance.host)
++            with mock.patch.object(staging.RuntimeRecord, 'finish',
++                                   interrupted):
++                self.assertRaises(
++                    Interrupted, engine.continue_step, ctx, instance,
++                    created['operation']['id'], 1, parent.uuid,
++                    continuation['journal_revision'])
++            self.assertIsNone(objects.CheckpointEffect.continuation(
++                ctx, parent.uuid))
++            save = next(r for r in objects.CheckpointEffect.get_children(
++                ctx, parent.uuid) if r['action'] == 'save')
++            self.assertEqual('dispatching', save['status'])
++        self.assertEqual('ready', next(s for s in self.rows(created)
++                                     if s.phase == 'runtime_save').status)
++        return created
++
++    def test_ready_parent_queries_claimed_child_with_runtime_receipt(self):
++        created = self.interrupt_ready_save(after_receipt=True)
++        self.recover()
++        self.assertEqual('succeeded', next(s for s in self.rows(created)
++                                         if s.phase == 'runtime_save').status)
++        self.assertEqual(1, self.drivers[0].backend.calls['save'])
++        self.drive_until(created, lambda: self.operation(created)['state'] ==
++                         'succeeded')
++        self.assertEqual(1, self.drivers[0].backend.calls['save'])
++
++    def test_ready_parent_queries_claimed_child_without_runtime_receipt(self):
++        created = self.interrupt_ready_save(after_receipt=False)
++        before = dict(self.drivers[0].backend.calls)
++        self.recover()
++        self.recover()
++        self.assertEqual('unknown', next(s for s in self.rows(created)
++                                       if s.phase == 'runtime_save').status)
++        self.assertEqual('recovery_required', self.operation(created)['state'])
++        self.assertEqual(before, dict(self.drivers[0].backend.calls))
++        self.assertGreater(self.usage()['artifact_bytes'], 0)
++
+     def add_disk(self):
+ 
+         backend = self.drivers[0].backend
+-- 
+2.49.0
+
+

@@ -1,0 +1,110 @@
+From c524d80e5fe26020905b3fc511b06100180f0836 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Fri, 9 Oct 2026 16:42:01 +0300
+Subject: [PATCH 3/3] fix: let libvirt bind the checkpoint metadata namespace
+
+---
+ .../checkpoints/test_native_runtime.py        |  4 +-
+ nova/tests/unit/virt/libvirt/test_guest.py    | 37 +++++++++++++++++++
+ nova/virt/libvirt/guest.py                    | 14 ++++++-
+ 3 files changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/test_native_runtime.py b/nova/tests/unit/virt/libvirt/checkpoints/test_native_runtime.py
+index a9e6a43..b242aff 100644
+--- a/nova/tests/unit/virt/libvirt/checkpoints/test_native_runtime.py
++++ b/nova/tests/unit/virt/libvirt/checkpoints/test_native_runtime.py
+@@ -77,7 +77,9 @@ class NativeRuntimeTest(test.NoDBTestCase):
+         )
+ 
+     def test_marker_updates_both_configs_and_stop_has_no_detach(self):
+-        self.guest.checkpoint_set_marker('<checkpoint/>')
++        self.guest.checkpoint_set_marker(
++            '<checkpoint xmlns="urn:openstack:nova:checkpoint:2"/>'
++        )
+         self.domain.setMetadata.assert_called_once_with(
+             2,
+             '<checkpoint/>',
+diff --git a/nova/tests/unit/virt/libvirt/test_guest.py b/nova/tests/unit/virt/libvirt/test_guest.py
+index 6d9eb6e..04e2ad2 100644
+--- a/nova/tests/unit/virt/libvirt/test_guest.py
++++ b/nova/tests/unit/virt/libvirt/test_guest.py
+@@ -16,6 +16,7 @@
+ 
+ from unittest import mock
+ 
++from lxml import etree
+ from oslo_service import fixture as service_fixture
+ from oslo_utils import encodeutils
+ 
+@@ -237,6 +238,42 @@ class GuestTestCase(test.NoDBTestCase):
+         self.guest.save_memory_state()
+         self.domain.managedSave.assert_called_once_with(0)
+ 
++    def test_checkpoint_marker_namespace_is_bound_by_libvirt(self):
++        marker = ('<checkpoint:checkpoint '
++                  'xmlns:checkpoint="urn:openstack:nova:checkpoint:2" '
++                  'checkpoint_id="checkpoint-1" action="save" '
++                  'payload_hash="a&amp;b"/>')
++        self.guest.checkpoint_set_marker(marker)
++        self.domain.setMetadata.assert_called_once()
++        kind, payload, key, uri, flags = self.domain.setMetadata.call_args.args
++        node = etree.fromstring(payload.encode('utf-8'))
++        self.assertEqual('checkpoint', node.tag)
++        self.assertEqual({}, node.nsmap)
++        self.assertEqual({'checkpoint_id': 'checkpoint-1', 'action': 'save',
++                          'payload_hash': 'a&b'}, dict(node.attrib))
++        self.assertEqual(fakelibvirt.VIR_DOMAIN_METADATA_ELEMENT, kind)
++        self.assertEqual('checkpoint', key)
++        self.assertEqual('urn:openstack:nova:checkpoint:2', uri)
++        self.assertEqual(fakelibvirt.VIR_DOMAIN_AFFECT_LIVE |
++                         fakelibvirt.VIR_DOMAIN_AFFECT_CONFIG, flags)
++
++    def test_checkpoint_marker_rejects_wrong_namespace_or_children(self):
++        self.domain.ID.return_value = 1
++        for marker in ('<checkpoint/>', '<other xmlns="urn:other"/>',
++                       '<checkpoint xmlns="urn:openstack:nova:checkpoint:2">'
++                       '<child/></checkpoint>'):
++            with self.subTest(marker=marker):
++                self.assertRaises(ValueError,
++                                  self.guest.checkpoint_set_marker, marker)
++        self.domain.setMetadata.assert_not_called()
++
++    def test_checkpoint_marker_propagates_native_error_once(self):
++        marker = '<checkpoint xmlns="urn:openstack:nova:checkpoint:2"/>'
++        self.domain.setMetadata.side_effect = fakelibvirt.libvirtError('fail')
++        self.assertRaises(fakelibvirt.libvirtError,
++                          self.guest.checkpoint_set_marker, marker)
++        self.domain.setMetadata.assert_called_once()
++
+     def test_get_block_device(self):
+         disk = 'vda'
+         gblock = self.guest.get_block_device(disk)
+diff --git a/nova/virt/libvirt/guest.py b/nova/virt/libvirt/guest.py
+index 3690956..35db58b 100644
+--- a/nova/virt/libvirt/guest.py
++++ b/nova/virt/libvirt/guest.py
+@@ -499,9 +499,19 @@ class Guest(object):
+ 
+     def checkpoint_set_marker(self, marker):
+         """Set only the checkpoint namespace, without logging domain XML."""
++        namespace = 'urn:openstack:nova:checkpoint:2'
++        node = etree.fromstring(
++            marker.encode('utf-8'),
++            parser=etree.XMLParser(resolve_entities=False, no_network=True))
++        if node.tag != '{%s}checkpoint' % namespace or len(node):
++            raise ValueError('Invalid checkpoint marker')
++        # setMetadata injects key/uri itself. Reusing the same prefix in
++        # its input fragment makes libvirt xmlNewNs fail.
++        fragment = etree.Element('checkpoint', attrib=node.attrib)
++        payload = etree.tostring(fragment, encoding='unicode')
+         self._domain.setMetadata(
+-            libvirt.VIR_DOMAIN_METADATA_ELEMENT, marker, 'checkpoint',
+-            'urn:openstack:nova:checkpoint:2',
++            libvirt.VIR_DOMAIN_METADATA_ELEMENT, payload, 'checkpoint',
++            namespace,
+             libvirt.VIR_DOMAIN_AFFECT_LIVE | libvirt.VIR_DOMAIN_AFFECT_CONFIG)
+ 
+     def checkpoint_save(self, path, xml):
+-- 
+2.49.0
+

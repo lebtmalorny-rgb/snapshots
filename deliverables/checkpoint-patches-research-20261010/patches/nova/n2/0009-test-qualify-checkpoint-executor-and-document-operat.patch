@@ -1,0 +1,1456 @@
+From d1e8cd4ca0685485a4f2a85b560e20ec677a2f8e Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 23:37:48 +0300
+Subject: [PATCH 09/10] test: qualify checkpoint executor and document
+ operational limits
+
+---
+ api-ref/source/server-checkpoints.inc         |  12 +-
+ doc/source/admin/index.rst                    |   2 +
+ .../admin/instance-checkpoint-executor.rst    | 174 +++++++++
+ .../instance-checkpoint-qualification.rst     | 252 +++++++++++++
+ doc/source/admin/instance-checkpoints.rst     |  16 +-
+ nova/checkpoints/qualification.py             | 348 ++++++++++++++++++
+ .../db/test_checkpoint_temporary_quota.py     |   1 +
+ .../unit/checkpoints/test_qualification.py    | 250 +++++++++++++
+ nova/tests/unit/compute/test_virtapi.py       |  42 +++
+ nova/tests/unit/db/main/test_api.py           |  19 +-
+ nova/virt/libvirt/checkpoints/topology.py     |   7 +
+ tools/checkpoint/profile.schema.json          |  64 ++++
+ tools/checkpoint/profiles.example.json        |   4 +
+ tools/checkpoint/qualification.py             |  75 ++++
+ 14 files changed, 1250 insertions(+), 16 deletions(-)
+ create mode 100644 doc/source/admin/instance-checkpoint-executor.rst
+ create mode 100644 doc/source/admin/instance-checkpoint-qualification.rst
+ create mode 100644 nova/checkpoints/qualification.py
+ create mode 100644 nova/tests/unit/checkpoints/test_qualification.py
+ create mode 100644 tools/checkpoint/profile.schema.json
+ create mode 100644 tools/checkpoint/profiles.example.json
+ create mode 100755 tools/checkpoint/qualification.py
+
+diff --git a/api-ref/source/server-checkpoints.inc b/api-ref/source/server-checkpoints.inc
+index 396e7ab952a7f3ae40ed1ca20eda73f9438d7cdc..2d9e2c898c0e80f4a97a7fb3c072160af98a2b0a 100644
+--- a/api-ref/source/server-checkpoints.inc
++++ b/api-ref/source/server-checkpoints.inc
+@@ -1,14 +1,16 @@
+ .. -*- rst -*-
+ 
+ =========================================
+-Server checkpoints (private N1 extension)
++Server checkpoints (private extension)
+ =========================================
+ 
+ All routes in this section require microversion ``2.106`` in this fork.
+-N1 implements a durable model, not a working production RAM snapshot engine.
+-The production executor reports unsupported until N2 and backend validation
+-are delivered. The successful examples below were captured from real Nova
+-WSGI/RPC tests using a test-only executor.
++N1 provides the durable model; N2 adds a qualified libvirt/Cinder C1.1 executor.
++Production defaults remain disabled and unsupported without verified runtime,
++shared-store and staging profiles. The successful examples below come from
++Nova WSGI/RPC tests and do not establish live infrastructure readiness.
++N2 uses contract version 2 internally; the public 2.106 response format is
++unchanged. Existing points remain protected when new creation is disabled.
+ 
+ Project readers may inspect their server's resources; project members may
+ mutate them. Authorization is checked again for idempotent retries. System
+diff --git a/doc/source/admin/index.rst b/doc/source/admin/index.rst
+index 56c7bd1304d74cf9a6bba0d65264053dee000c75..46c7bad1509dc0d21dc38980eadeef34b381eed6 100644
+--- a/doc/source/admin/index.rst
++++ b/doc/source/admin/index.rst
+@@ -152,6 +152,8 @@ log management and live migration of instances.
+    secure-live-migration-with-qemu-native-tls
+    manage-volumes
+    instance-checkpoints
++   instance-checkpoint-executor
++   instance-checkpoint-qualification
+    manage-shares
+    flavors
+    admin-password-injection
+diff --git a/doc/source/admin/instance-checkpoint-executor.rst b/doc/source/admin/instance-checkpoint-executor.rst
+new file mode 100644
+index 0000000000000000000000000000000000000000..03c7a521efc9fe33f5f8826a1c51bf60a7b0817a
+--- /dev/null
++++ b/doc/source/admin/instance-checkpoint-executor.rst
+@@ -0,0 +1,174 @@
++Исполнитель checkpoint N2
++=========================
++
++Краткий вывод
++-------------
++
++N2 добавляет физические адаптеры libvirt, shared RAM-store, staging и scoped
++Cinder C1.1 client к модели N1. Локальные тесты не подтверждают готовность
++конкретной СХД, NAS, KVM или Keystone. Поставляемый allowlist пуст; новые
++checkpoint выключены. Положительный probe требует квалифицированных компонентов
++и совпадения их текущего состояния с профилем. Для приёмки всего стека нужен
++отдельный V1: :doc:`instance-checkpoint-qualification`.
++
++Первый профиль ``kvm-bios-same-host-v1`` ограничен KVM/x86_64, BIOS, исходным
++compute/node и Cinder для каждого записываемого диска. Допустимы raw disks с
++cache ``none``/``directsync`` и исходный readonly config-drive. Не поддерживаются
++UEFI/NVRAM, ephemeral/swap, shares, multiattach, passthrough/SR-IOV, vTPM,
++confidential VMs, backing chains, managed-save и активные block jobs.
++Host-side encryptor, требующий повторного получения/форматирования ключа, не
++поддерживается; native LUKS допускается только с проверенным текущим libvirt
++secret. Secret UUID без чтения и проверки хеша значения недостаточен.
++
++Зависимости и обновление
++------------------------
++
++Это частный протокол данного fork, не upstream-обещание совместимости:
++
++* Compute API: ``2.106``; compute RPC: ``6.6``; compute-task RPC: ``1.27``;
++  service version: ``70``. Общий conductor RPC: ``3.0``, Instance OVO: ``2.8``.
++* Требуется Cinder C1.1 commit
++  ``d065a55cbe5cb8cd59489752846a41145d72bd27``, tree
++  ``53888d9cea7fa1b12d35a0b9afd894eeee270843``: REST ``3.73``, volume RPC ``3.22``.
++  Обычный Cinder API Nova глобально не переключается на эту микроверсию.
++* Аддитивные cell migrations N2: ``5d9b2ea784c1``, затем ``6eaf49c32710``;
++  API DB: ``82e7b3c951d0``. Они идут после N1, включая cell0 по обычной
++  процедуре обновления Nova. Исторические N1 migrations не меняются.
++* Перед активацией обновляются все API/conductor/compute и другие writers.
++  Старые writers не участвуют в новом протоколе. Смешанная активация запрещена.
++  Schema sync и rollout выполняются оператором отдельным согласованным запуском.
++
++Production API создаёт операции schema 2. Сохранённые schema 1 записи читаются
++как schema 1; автоматического перехода к v1 physical executor нет. Новые child
++и temporary OVO имеют версию 1.0; checkpoint projections — 1.1, BDM — 1.22.
++Стабильный executor UUID выводится из deployment UUID и имени compute.
++Generation остаётся 1; переноса ownership на другой host нет.
++
++Хранилище, профили и квоты
++--------------------------
++
++Новые параметры ``[checkpoint]`` по умолчанию пусты::
++
++    deployment_id =
++    store_root =
++    staging_root =
++    profile_file =
++    max_concurrent_transfers = 1
++    enabled = false
++    max_checkpoints_per_instance = 8
++    max_checkpoints_per_project = 100
++    max_artifact_bytes_per_project = 0
++    reconcile_interval = 60
++
++Нулевой byte limit запрещает новые записи. Root-controlled profile file
++соответствует ``tools/checkpoint/profile.schema.json``; безопасный пример —
++``tools/checkpoint/profiles.example.json`` с пустым ``records``. Файл не должен
++быть доступен на запись группе/остальным. Запись включает UUID компонента,
++точный observed tuple, canonical SHA256 его JSON, SHA256 отчёта квалификации
++и положительные limits. Allowlist перечитывается при каждом входе исполнителя.
++Запись в конфигурации не заменяет совпадение с текущим mount/runtime.
++
++Shared store требует NFS/NFS4 с наблюдаемым ``xprtsec=tls``, ``xprtsec=mtls``
++или ``sec=krb5p`` и отдельно подтверждённым шифрованием NAS at rest. Staging
++требует XFS на зашифрованном device-mapper block device с включёнными и
++реально исполняемыми project quotas; external XFS log/realtime devices
++исключены. Helpers не создают mount, filesystem или ключи. Readiness должна
++существовать до включения. На каждом root имеется защищённый файл
++``.checkpoint-store`` с полями ``schema_version=1``, ``store_uuid``,
++``kind=store|staging``, ``encryption_at_rest=true``, ``server_policy_sha256``.
++Оператор заполняет их только после проверки инфраструктуры. Это утверждение
++оператора о NAS, а не обнаруженное клиентом доказательство шифрования.
++
++Runtime tuple включает версии kernel/libvirt/QEMU/os-brick/libvirt-python,
++CPU, architecture/machine, URI, UID/GID, mount/PID namespaces и режим доступа
++libvirt к pinned path. Пример положительного production tuple не поставляется.
++Limits runtime: ``max_memory_bytes``, ``save_bytes_limit``,
++``restore_bytes_limit``. Limits файловых профилей: ``max_bytes``,
++``metadata_bytes`` (не менее 262144), ``allocation_unit``; staging дополнительно
++задаёт ``max_workspaces``, ``project_id_min``, ``project_id_max``.
++Значения и поведение при переполнении требуют реального испытания.
++
++Namespace включает deployment/cell, SHA256 project ID, instance/checkpoint
++и уникальный artifact UUID. Пути, XML, connection_info и bearer отсутствуют
++в SQL/RPC envelopes. Закрытые файлы привязаны к owner/seal, inode/device,
++checksum и размеру. Symlink, hardlink, чужой owner и изменившийся mount
++отклоняются. Исчезновение NAS не разрешает писать в оставшийся local directory.
++
++Charge равен максимуму logical/allocated payload bytes плюс metadata allowance.
++До save зарезервированы staging и будущая shared copy; консервативный create
++bound — ``2 * artifact_kind_count * save_bytes_limit``. XFS ограничивает весь
++workspace, включая receipts и private connection_info. После cleanup staging
++settlement оставляет charge только immutable shared artifacts. Revert получает
++отдельный temporary ticket: минимум restore limit и сумма source bounds.
++Возврат temporary bytes требует cell proof закрытых writers и удаления staging.
++Timeout, down cell, отсутствие reply и изменение ``enabled`` не дают refund.
++
++Протокол исполнения
++-------------------
++
++Create: preflight → scoped Cinder reserve → staging/config copy/save →
++Cinder snapshot → immutable shared publish → restore paused → unpause →
++staging cleanup → Cinder commit release. Publication ещё не означает, что
++staging удалён. Config-drive копируется для фиксации данных, но restore
++использует проверенный исходный readonly config-drive.
++
++Revert: preflight/reserve → download → stop → disconnect → revert всех
++дисков → reconnect → ограниченное BDM update → restore paused → unpause →
++cleanup/release. До первого reconnect подтверждаются все disk revert results.
++CPU, guest addresses, serials, UUID, config и ключи неизменны; source/auth и
++host network fields подставляются из текущих защищённых BDM/VIF. IP leases,
++security groups и внешнее сетевое состояние назад не откатываются.
++
++Cell атомарно создаёт полный конечный child graph до I/O. Один вызов execute
++claims один child. Query только наблюдает существующее состояние и может
++сохранить observation. ``ready`` требует отдельного ``checkpoint_continue``
++с текущей revision; CAS запрещает устаревшему вызову взять следующий child.
++Ни одна SQL transaction не удерживается через RPC/driver I/O.
++
++Native save/restore/unpause имеют отдельные private intent/done receipts.
++Libvirt получает ``/proc/<nova-pid>/fd/<workspace-fd>/artifacts/<UUID>/data``
++при удерживаемом FD. Требуется квалификация reopen, PID namespace, UID и MAC.
++Сырой FD или повторно используемое имя файла не заменяют этот путь.
++Потеря native reply остаётся unknown даже при правильном marker/image/state.
++Потеря Nova RPC reply после durable done receipt восстанавливается чистым query.
++
++Cinder preflight/reserve использует текущий токен исходного пользователя вместе
++с собственным service token Nova. После reserve только scoped C1.1 continuation
++использует свежую аутентификацию ``[service_user]`` Nova. Нужны корректный
++service-role trust/policy Cinder и ``send_service_user_token``; наличие admin
++context не является credential. Нельзя менять actor на сервисного пользователя.
++Если reserve не дошёл до Cinder, background GET не заменяется POST. Exact API
++retry исходного actor с новым пользовательским токеном повторяет сохранённый
++request UUID/payload. После release остаётся только чтение tombstone.
++
++Операционная диагностика
++------------------------
++
++Сначала сохраните operation/checkpoint UUID, phase, safe error_code, host/node,
++project/cell и quota usage. Чтение API::
++
++    curl --fail --silent --show-error \
++      -H "X-Auth-Token: $OS_TOKEN" \
++      -H 'OpenStack-API-Version: compute 2.106' \
++      "$COMPUTE_URL/servers/$INSTANCE/checkpoint-operations/$OPERATION"
++
++Read-only host evidence: ``virsh domstate --reason "$INSTANCE"``,
++``virsh domjobinfo "$INSTANCE"``, текущие mount identities, статусы XFS quota,
++Cinder operation/resource/attachment requests и соответствующие server logs.
++XML, libvirt secrets, RAM и connection_info не прикладываются к общему тикету;
++хеши и закрытые служебные receipts собираются в защищённое хранилище.
++
++Повторная сверка не повторяет uncertain native calls. При unknown writer нельзя
++удалять файлы, освобождать quota, очищать guard, делать admin reset/start или
++объявлять успех по отсутствию процесса. Compute startup query предшествует
++обычному autostart/power-sync, который сохраняет guard. Автоматического force
++unlock и takeover нет. Operator investigation должна доказать исход каждого
++эффекта; непроверенный ручной ремонт journal здесь не предлагается.
++
++Известный terminal failure create компенсируется только после fence оставшихся
++prepared children: восстановление доказанно сохранённой current RAM, cleanup
++принадлежащих Cinder snapshots, shared/staging cleanup, abort release. Unknown
++save блокирует такую компенсацию. Revert можно отменить до stop; частичный
++revert после stop остаётся guarded/recovery_required. Delete не требует
++работающего domain, но требует полного подтверждения удаления собственных
++ресурсов и scoped release. Удаление A не удаляет B.
+diff --git a/doc/source/admin/instance-checkpoint-qualification.rst b/doc/source/admin/instance-checkpoint-qualification.rst
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8b04c967b3bee371375dc750aef8f09ab43e960
+--- /dev/null
++++ b/doc/source/admin/instance-checkpoint-qualification.rst
+@@ -0,0 +1,252 @@
++Квалификация checkpoint: компоненты и стек
++==========================================
++
++Краткий вывод
++-------------
++
++В локальном пакете N2 нет квалифицированного production profile. Физические
++проверки ниже ещё не выполнялись. Сначала квалифицируются отдельные компоненты
++на выделенном стенде, затем V1 проверяет Nova + Cinder C1.1 + D backend +
++Keystone + Neutron. Это два разных заключения. Синтетические unit fixtures,
++контролируемый token validator и local POSIX crash test не заменяют стенд.
++
++Read-only инструмент
++--------------------
++
++Из установленного Nova checkout и его Python environment::
++
++    python tools/checkpoint/qualification.py inspect \
++      --config /etc/nova/nova.conf --output /secure/evidence/inspection.json
++    python tools/checkpoint/qualification.py validate-report \
++      --report /secure/evidence/components.json \
++      --evidence-root /secure/evidence \
++      --output /secure/evidence/components-validated.json
++
++``inspect`` не создаёт VM, mount, snapshot, ключ, quota или allowlist. Он читает
++только выбранные configuration fields, versions, mount identities/markers;
++libvirt открывается через ``openReadOnly`` для локального ``qemu:///system``.
++Отсутствующие права или компоненты записываются как ``unobserved``. Exit 0
++означает сбор наблюдений; ``qualified`` и ``stack_qualified`` остаются false,
++checks — skipped. Нулевые timings/peak в этом выводе означают «не измерено».
++
++``validate-report`` проверяет полноту и SHA256 предоставленного оператором
++пакета, а не исполняет тесты и не доказывает подлинность его содержания.
++Exit 0 — все обязательные checks заданного scope прошли; 1 — есть unverified;
++2 — некорректный формат/недоступный вход. Output создаётся с mode 0600 без
++перезаписи существующего файла. Symlink, hardlink и выход за evidence root
++отклоняются. Входной ``qualified=true`` не принимается на веру.
++
++Формат отчёта
++-------------
++
++JSON schema_version=1 содержит ``scope=components|stack``, ``measured`` с
++тремя объектами ``runtime/store/staging`` (каждый с полем kind), ``metrics``
++с неотрицательными целыми ``pause_milliseconds``/``peak_bytes`` и ``checks``.
++Measured должен содержать точные observed tuples, использованные в испытаниях,
++включая tested VM shape, версии и инфраструктурные identities. Inspection —
++начальный inventory; он не заполняет отсутствующие измерения испытаний.
++
++Пример одной ссылки (SHA заменяется фактически вычисленным значением)::
++
++    "checks": {
++      "writer_hard_limit": {
++        "status": "pass",
++        "evidence": [{"path": "writer_hard_limit.json", "sha256": "..."}]
++      }
++    }
++
++Каждый evidence envelope содержит ровно ``check``, ``status=pass``,
++``measured_sha256`` и непустой ``artifacts`` — список относительных path/SHA256
++реальных captures. Контрольная сумма measured вычисляется
++``nova.checkpoints.contracts.canonical_payload_hash(measured)``; структура
++содержит строки, целые числа, bool, null, lists и objects, без float.
++Checks со статусом fail/skipped или отсутствующие обязательные checks не
++квалифицируют отчёт. Утрата любого envelope/capture, изменение SHA или tuple
++также снимает квалификацию. Envelope ограничен 1 MiB, отдельный capture —
++256 MiB: RAM image и secrets в evidence не копируются.
++
++Для stack обязателен ``target``: ``instance_uuid``, ``host``, ``volume_ids``.
++Каждый stack evidence содержит также ``target_sha256`` от этого объекта;
++``pause_and_peak_bytes`` — ещё ``metrics_sha256``. Хеши связывают evidence с
++объектом и измерениями. Оператор отдельно проверяет их происхождение и
++сопоставляет журналы Nova/Cinder/libvirt; корректный JSON не заменяет review.
++
++Компонентные испытания до активации Nova
++----------------------------------------
++
++Нужен отдельно разрешённый disposable KVM domain на выбранном host, известные
++тестовые диски, encrypted XFS workspace с жёсткой квотой и выделенный namespace
++NAS. UUID domain, host, диски и пределы записываются до запуска. Это отдельный
++стенд primitives, не ручной обход guards действующей cloud-managed ВМ.
++Никакие команды раздела не выполняются самим qualification CLI.
++
++Каждая строка требует envelope ``<check>.json`` и указанные сырые captures.
++Вызовы libvirt/os-brick выполняются только операторским harness, удерживающим
++workspace FD, под теми же PID namespace/UID/MAC, что будущий compute. Direct
++``virsh save /обычный/путь`` не доказывает работоспособность pinned path.
++
++.. list-table:: Обязательные component checks
++   :header-rows: 1
++   :widths: 23 49 28
++
++   * - Check
++     - Действие на явно выбранном тестовом объекте
++     - Ожидание / capture
++   * - libvirt_repeat_restore
++     - ``saveFlags(pinned_path, secure_xml, 0)``; затем
++       ``restoreFlags(pinned_path, restore_xml, VIR_DOMAIN_SAVE_PAUSED)``,
++       ``resume``; повторить restore из той же immutable RAM при остановленном
++       disposable domain. Сохранить SHA образа до/после.
++     - Оба восстановления успешны; SHA неизменен.
++       ``libvirt-repeat.log``.
++   * - paused_before_unpause
++     - Между restoreFlags и resume вызвать ``state(0)`` выбранного domain.
++     - Только PAUSED до отдельного resume; RUNNING после.
++       ``paused-state.log``.
++   * - writer_hard_limit
++     - Ограничить отдельный XFS project до указанного byte bound; запустить
++       реальный libvirt save, который этот bound превышает. Измерить usage
++       через ``xfs_quota -x -c 'report -p -b' "$STAGING"`` до/во время/после.
++     - Writer получает quota failure, usage не выходит за согласованный bound;
++       неизвестный writer не очищается. ``writer-quota.log``.
++   * - pinned_path_reopen
++     - Тот же libvirt writer использует
++       ``/proc/PID/fd/WORKSPACE_FD/artifacts/UNIQUE_UUID/data``. Проверить reopen
++       completion header, отдельный SELinux/AppArmor audit и рестарт worker.
++     - Доступ ровно к своему UUID; после FD reuse нет чужой записи.
++       ``pinned-path.log``, ``mac-audit.log``.
++   * - nas_durability
++     - Write/fsync → publish no-replace → directory fsync в выделенном
++       namespace. После подтверждения согласованно прервать тестовый NAS/client
++       и проверить чтение/хеш после восстановления.
++     - Подтверждённые данные сохранены; точные модель/firmware/export recorded.
++       ``nas-durability.log``.
++   * - partial_publish
++     - Прервать copy до/после link и до seal; query должен только наблюдать.
++       Cleanup лишь после fence writer.
++     - Partial остаётся charged, foreign file не меняется.
++       ``partial-publish.log``.
++   * - namespace_isolation
++     - Два test deployment/cell/instance namespace с одинаковым display name;
++       попытки symlink/hardlink и чужого artifact ID.
++     - Чужие read/write/delete отвергнуты. ``namespace.log``.
++   * - crypto_at_rest
++     - Проверить DMCrypt/XFS device chain и отдельный NAS storage policy,
++       модель/firmware, key ownership, backups/replicas; приложить подписанный
++       инфраструктурный акт и его SHA.
++     - RAM/config/private receipts везде зашифрованы.
++       ``storage-crypto-attestation.txt``.
++   * - crypto_transport
++     - ``findmnt -T "$STORE" -o TARGET,SOURCE,FSTYPE,OPTIONS`` плюс проверка
++       фактического TLS/krb5p на NAS; не подменять plaintext туннелем без evidence.
++     - Совпадение crypto policy и наблюдаемого соединения.
++       ``transport.log``.
++   * - no_cleartext_spill
++     - Сравнить filesystem/open-file/audit inventory до/во время save/upload/
++       restore; проверить swap, core dumps, logs, temp и libvirt paths.
++     - Нет cleartext spill вне квалифицированных encrypted paths.
++       ``spill-audit.log``.
++   * - xml_device_identity
++     - Сравнить нормализованные CPU/machine/addresses/serials/UUID/config/key
++       hashes до/после restore; менять только проверенные host sources/VIF.
++     - Guest identity неизменна, изменённый key отвергнут.
++       ``identity-hashes.json``.
++
++После human review components report оператор может подготовить root-controlled
++allowlist по ``profile.schema.json``. Для каждого record берётся точный tuple
++реального adapter observation и его canonical hash; qualification_sha256 —
++SHA256 проверенного отчёта. Нельзя копировать test-only records. Limits включают
++измеренный hard limit и metadata; изменение kernel, namespace, export, CPU,
++crypto или версии требует сверки/повторной квалификации. Сам CLI положительный
++allowlist не генерирует. Component qualification ещё не является V1.
++
++V1: испытания интегрированного стека
++------------------------------------
++
++Отдельно согласуйте disposable Nova ``INSTANCE``, исходный ``HOST``, все
++``VOLUME_IDS`` и API URLs. Профили компонентов уже установлены на стенде;
++Cinder C1.1 и квалифицированный D backend обязательны. Подставлять случайную
++действующую ВМ вместо этих параметров запрещено runbook. Команды ниже —
++операторская инструкция для будущего разрешённого V1, не отчёт об исполнении.
++
++Создание точки и чтение операции::
++
++    REQUEST=$(uuidgen | tr '[:upper:]' '[:lower:]')
++    curl --fail --silent --show-error -X POST \
++      -H "X-Auth-Token: $OS_TOKEN" \
++      -H 'OpenStack-API-Version: compute 2.106' \
++      -H 'Content-Type: application/json' \
++      --data "{\"checkpoint\":{\"name\":\"A\",\"request_id\":\"$REQUEST\"}}" \
++      "$COMPUTE_URL/servers/$INSTANCE/checkpoints"
++
++Сохраните возвращённые CP_A/OP_A. Poll GET operation до доказанного terminal
++result, а не только 202. Revert — POST
++``/servers/$INSTANCE/checkpoints/$CP_A/action`` с
++``{"revert":{"request_id":"<новый UUID>"}}``. Delete — DELETE того же
++checkpoint URL с ``OpenStack-Checkpoint-Request-ID: <новый UUID>``.
++Для каждой мутации используйте свежий request UUID, для exact replay — прежний.
++
++.. list-table:: Обязательные stack checks
++   :header-rows: 1
++   :widths: 23 49 28
++
++   * - Check
++     - Действие
++     - Ожидание / capture
++   * - cinder_c11_scope
++     - Проверить REST 3.73, pin C1.1, Nova/Cinder operation IDs и service UUID;
++       чужим service/project/instance выполнить scoped GET/action на test op.
++     - Собственная continuation работает, чужая запрещена, после release только
++       tombstone read. ``cinder-scope.log``.
++   * - backend_d_profile
++     - Выполнить утверждённый D1/D2 backend test на каждом выбранном volume;
++       сохранить capabilities, flush/snapshot/revert/delete evidence.
++     - Ровно заявленный backend/profile, без fake capabilities.
++       ``backend-d-report.json``.
++   * - ab_lifecycle
++     - Создать A, изменить состояние, создать B, revert A → B → A,
++       удалить B, затем A через private API.
++     - Независимые точки, нет повторного save при query и чужих удалений.
++       ``ab-api.log``.
++   * - ram_and_all_disk_markers
++     - В guest держать marker в процессе без записи на диск; отдельный marker
++       записать/fsync на каждый выбранный Cinder disk перед A и перед B.
++     - После каждого revert RAM и все disk markers относятся к одной точке.
++       ``guest-markers.log``.
++   * - uuid_preserved
++     - ``openstack server show "$INSTANCE"`` и ``virsh domuuid "$INSTANCE"``
++       до/после, вместе с BDM/VIF/serial identity capture.
++     - UUID/MAC/guest identity сохранены. ``uuid-identity.json``.
++   * - partial_revert
++     - На стенде через согласованный fault injector остановить один backend
++       revert после завершения другого; query/restart compute.
++     - Нет reconnect/unpause/refund; операция guarded.
++       ``partial-revert.log``.
++   * - expired_user_after_restart
++     - Реально дождаться истечения исходного Keystone user token после reserve,
++       перезапустить test compute; сверить scoped continuation со свежим service
++       auth. Отдельно потерять reserve до приёма и выполнить exact user replay.
++     - Нет user impersonation, backend POST reserve из background отсутствует.
++       ``keystone-expiry.log``.
++   * - current_neutron_bindings
++     - Сопоставить ``openstack port show`` для каждого port с host/network/MAC,
++       затем создать контролируемый binding mismatch перед unpause.
++     - Mismatch блокирует запуск; network state не откатывается.
++       ``neutron-bindings.json``.
++   * - pause_and_peak_bytes
++     - Монотонные timestamps save/restore/unpause; sampling API quota, XFS
++       allocated и NAS bytes на всех стадиях, включая partial cleanup.
++     - Измеренные pause_ms/peak_bytes и подтверждённый hard bound.
++       ``timings-and-quota.json``.
++   * - late_writer_fenced
++     - Задержать upload/download, потерять reply, запустить query и попытку
++       cleanup/refund; продолжить delayed writer после отмены prepared child.
++     - Unknown writer держит quota; cancelled child не пишет после refund.
++       ``late-writer.log``.
++
++Не выполненный или неразрешённый fault test остаётся skipped/unverified. Для
++приёмки нужны все stack checks, человеческое review сырых captures и полный
++``qualified=true, stack_qualified=true``. Это не переносимое обещание для другой
++NAS/СХД/версии. Не применять force-unlock при неполном результате; сбор
++диагностики и границы восстановления описаны в
++:doc:`instance-checkpoint-executor`.
+diff --git a/doc/source/admin/instance-checkpoints.rst b/doc/source/admin/instance-checkpoints.rst
+index 01ff2504838b858879c747729af6fce70329cdea..e160027315e423d58befd38336e9a447efee3f0c 100644
+--- a/doc/source/admin/instance-checkpoints.rst
++++ b/doc/source/admin/instance-checkpoints.rst
+@@ -2,9 +2,10 @@ Instance checkpoint model (N1)
+ ==============================
+ 
+ This private extension provides the journal, ownership and accounting model.
+-It does not implement RAM capture or storage snapshots. The production executor
+-is unsupported until the separately delivered N2 implementation is installed
+-and validated for the intended storage. Fake executors belong to tests only.
++N2 adds the qualified physical executor described in
++:doc:`instance-checkpoint-executor`; defaults remain disabled and unsupported
++without qualified profiles. The N1 model itself does not capture RAM or storage
++snapshots. Fake executors belong to tests only.
+ 
+ Ordinary operation barriers
+ ---------------------------
+@@ -113,8 +114,10 @@ unit SQL/serializer evidence.
+ Versions and activation boundary
+ --------------------------------
+ 
+-This fork reserves Compute API microversion ``2.106``, compute RPC ``6.5``,
+-compute-task RPC ``1.26`` and service version ``69``. The general conductor
++N1 reserved Compute API microversion ``2.106``, compute RPC ``6.5``,
++compute-task RPC ``1.26`` and service version ``69``. N2 retains API 2.106 and
++raises the internal versions to compute RPC 6.6, compute-task RPC 1.27 and
++service 70. The general conductor
+ RPC stays at ``3.0`` and the ordinary Instance object at ``2.8``. These private
+ numbers do not imply compatibility with another fork using the same numbers.
+ Mixed versions and a missing or unsupported live probe deny admission before
+@@ -195,7 +198,8 @@ Deleting A must not remove B's data.
+ The requesting user's UUID is audit identity, not a credential. N1 does not
+ persist bearer tokens or recover an expired user's token. Recovery creates a
+ service context for internal journal work; it does not impersonate the Cinder
+-C1 owner. N2 must define and validate background Cinder authorization. Current
++C1 owner. N2 uses the separate C1.1 scoped service-continuation protocol described in
++:doc:`instance-checkpoint-executor`. Current
+ Neutron port identity is checked, but IP leases, security groups and external
+ network state are not rolled back. SAN, libvirt and RabbitMQ behavior requires
+ separate runtime evidence.
+diff --git a/nova/checkpoints/qualification.py b/nova/checkpoints/qualification.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb4b30e2aa788f592ec9a535d723cf200454fe30
+--- /dev/null
++++ b/nova/checkpoints/qualification.py
+@@ -0,0 +1,348 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Read-only observations and evidence validation, without VM mutation."""
++
++import configparser
++import contextlib
++import hashlib
++from importlib import metadata
++import os
++from pathlib import PurePosixPath
++import platform
++import stat
++
++from oslo_serialization import jsonutils
++
++from nova.checkpoints import contracts as c
++
++COMPONENT_CHECKS = (
++    'libvirt_repeat_restore',
++    'paused_before_unpause',
++    'writer_hard_limit',
++    'nas_durability',
++    'partial_publish',
++    'namespace_isolation',
++    'crypto_at_rest',
++    'crypto_transport',
++    'no_cleartext_spill',
++    'xml_device_identity',
++    'pinned_path_reopen',
++)
++STACK_CHECKS = (
++    'cinder_c11_scope',
++    'backend_d_profile',
++    'ab_lifecycle',
++    'ram_and_all_disk_markers',
++    'uuid_preserved',
++    'partial_revert',
++    'expired_user_after_restart',
++    'current_neutron_bindings',
++    'pause_and_peak_bytes',
++    'late_writer_fenced',
++)
++STATUSES = ('pass', 'fail', 'skipped')
++MAX_JSON = 1024 * 1024
++MAX_CAPTURE = 256 * 1024 * 1024
++
++
++def summarize(checks, required):
++    c._require(type(checks) is dict and type(required) is tuple)
++    c._require(set(required) <= set(checks))
++    c._require(all(status in STATUSES for status in checks.values()))
++    unverified = sorted(
++        name for name in required if checks[name] != 'pass'
++    )
++    return dict(qualified=not unverified, unverified=unverified)
++
++
++@contextlib.contextmanager
++def _directory(path):
++    parts = PurePosixPath(path).parts
++    c._require(parts and parts[0] == '/' and '..' not in parts)
++    descriptor = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
++    try:
++        for part in parts[1:]:
++            next_fd = os.open(
++                part,
++                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
++                dir_fd=descriptor,
++            )
++            os.close(descriptor)
++            descriptor = next_fd
++        yield descriptor
++    finally:
++        os.close(descriptor)
++
++
++def _read(root, relative, maximum):
++    c._require(type(relative) is str and relative and '\\' not in relative)
++    parts = relative.split('/')
++    c._require(all(part not in ('', '.', '..') for part in parts))
++    with _directory(root) as directory:
++        descriptor = os.dup(directory)
++        try:
++            for part in parts[:-1]:
++                next_fd = os.open(
++                    part,
++                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
++                    dir_fd=descriptor,
++                )
++                os.close(descriptor)
++                descriptor = next_fd
++            source = os.open(
++                parts[-1],
++                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
++                dir_fd=descriptor,
++            )
++            with os.fdopen(source, 'rb') as stream:
++                info = os.fstat(stream.fileno())
++                c._require(
++                    stat.S_ISREG(info.st_mode) and
++                    info.st_nlink == 1 and
++                    info.st_size <= maximum
++                )
++                value = stream.read(maximum + 1)
++                c._require(len(value) <= maximum)
++                return value
++        finally:
++            os.close(descriptor)
++
++
++def _evidence(root, item, maximum):
++    c._keys(item, ('path', 'sha256'))
++    c._digest(item['sha256'])
++    value = _read(root, item['path'], maximum)
++    c._require(hashlib.sha256(value).hexdigest() == item['sha256'])
++    return value
++
++
++def validate_report(report, evidence_root):
++    c._require(type(report) is dict)
++    required_fields = {
++        'schema_version',
++        'scope',
++        'measured',
++        'checks',
++        'metrics',
++    }
++    optional_fields = {
++        'qualified',
++        'stack_qualified',
++        'unverified',
++        'target',
++    }
++    c._require(
++        required_fields <= set(report) <= required_fields | optional_fields
++    )
++    c._integer(report['schema_version'], minimum=1, maximum=1)
++    c._require(report['scope'] in ('components', 'stack'))
++    measured = report['measured']
++    c._keys(measured, ('runtime', 'store', 'staging'))
++    for kind, value in measured.items():
++        c._require(
++            type(value) is dict and
++            value.get('kind') == kind and
++            len(value) > 1
++        )
++    digest = c.canonical_payload_hash(measured)
++    c._keys(report['metrics'], ('pause_milliseconds', 'peak_bytes'))
++    c._integer(report['metrics']['peak_bytes'], minimum=0)
++    pause = report['metrics']['pause_milliseconds']
++    c._integer(pause, minimum=0)
++    required = COMPONENT_CHECKS + (
++        STACK_CHECKS if report['scope'] == 'stack' else ()
++    )
++    checks = report['checks']
++    c._require(
++        type(checks) is dict and
++        set(checks) <= set(COMPONENT_CHECKS + STACK_CHECKS)
++    )
++    statuses = {name: 'skipped' for name in required}
++    for name, check in checks.items():
++        c._keys(check, ('status', 'evidence'))
++        c._require(
++            check['status'] in STATUSES and type(check['evidence']) is list
++        )
++        statuses[name] = check['status']
++        if check['status'] != 'pass':
++            continue
++        try:
++            c._require(bool(check['evidence']))
++            for reference in check['evidence']:
++                value = jsonutils.loads(
++                    _evidence(evidence_root, reference, MAX_JSON)
++                )
++                fields = {
++                    'check',
++                    'status',
++                    'measured_sha256',
++                    'artifacts',
++                }
++                if name in STACK_CHECKS:
++                    fields.add('target_sha256')
++                if name == 'pause_and_peak_bytes':
++                    fields.add('metrics_sha256')
++                c._keys(value, fields)
++                if name in STACK_CHECKS:
++                    c._require(
++                        value['target_sha256'] ==
++                        c.canonical_payload_hash(report['target'])
++                    )
++                if name == 'pause_and_peak_bytes':
++                    c._require(
++                        value['metrics_sha256'] ==
++                        c.canonical_payload_hash(report['metrics'])
++                    )
++                c._require(
++                    value['check'] == name and
++                    value['status'] == 'pass' and
++                    value['measured_sha256'] == digest and
++                    type(value['artifacts']) is list and
++                    bool(value['artifacts'])
++                )
++                for capture in value['artifacts']:
++                    _evidence(evidence_root, capture, MAX_CAPTURE)
++        except (OSError, ValueError, KeyError, TypeError):
++            statuses[name] = 'fail'
++    result = summarize(statuses, required)
++    if report['scope'] == 'stack':
++        try:
++            target = report['target']
++            c._keys(target, ('instance_uuid', 'host', 'volume_ids'))
++            c._uuid(target['instance_uuid'])
++            c._string(target['host'])
++            c._ids(target['volume_ids'], nonempty=True)
++        except (ValueError, KeyError, TypeError):
++            result['qualified'] = False
++            result['unverified'].append('explicit_target')
++    # A human-reviewed evidence set can qualify components. It is neither an
++    # automated physical test nor proof of authenticity of operator captures.
++    return dict(
++        report,
++        **dict(
++            result,
++            stack_qualified=report['scope'] == 'stack' and
++            result['qualified'],
++        ),
++    )
++
++
++def _versions():
++    packages = {}
++    for name in ('libvirt-python', 'os-brick', 'nova', 'os-vif'):
++        try:
++            packages[name] = metadata.version(name)
++        except metadata.PackageNotFoundError:
++            packages[name] = None
++    return dict(
++        kernel_release=platform.release(),
++        architecture=platform.machine(),
++        packages=packages,
++    )
++
++
++def _runtime(uri):
++    # No driver construction, RPC, domain lookup or write connection. A report
++    # must add the tested machine/shape observation from the disposable VM.
++    c._require(uri == 'qemu:///system')
++    import libvirt
++
++    connection = libvirt.openReadOnly(uri)
++    try:
++        return dict(
++            kind='runtime',
++            **_versions(),
++            libvirt_uri=connection.getURI(),
++            libvirt_version=connection.getLibVersion(),
++            qemu_version=connection.getVersion(),
++            capabilities_sha256=hashlib.sha256(
++                connection.getCapabilities().encode()
++            ).hexdigest(),
++        )
++    finally:
++        connection.close()
++
++
++def _mount(path, kind):
++    import nova.privsep.checkpoint
++
++    c._require(
++        type(path) is str and
++        path.startswith('/') and
++        os.path.normpath(path) == path
++    )
++    mount = nova.privsep.checkpoint._mount(path)
++    with _directory(path) as fd:
++        marker = nova.privsep.checkpoint._marker(fd)
++        c._require(marker['kind'] == kind)
++        info = os.fstat(fd)
++        c._require(
++            mount['device'] ==
++            '%s:%s' % (os.major(info.st_dev), os.minor(info.st_dev))
++        )
++        fsid = os.fstatvfs(fd).f_fsid
++    # At-rest assurance on a NAS is an infrastructure claim, never an observed
++    # true obtained just by parsing a root-owned marker on the client.
++    return dict(
++        kind=kind,
++        **mount,
++        fsid=fsid,
++        store_uuid=marker['store_uuid'],
++        declared_encryption_at_rest=marker['encryption_at_rest'],
++        server_policy_sha256=marker['server_policy_sha256'],
++        transport_encryption_observed=bool(
++            set(mount['options']) &
++            {'xprtsec=tls', 'xprtsec=mtls', 'sec=krb5p'}
++        ),
++    )
++
++
++def inspect(config_path):
++    c._require(type(config_path) is str and os.path.isabs(config_path))
++    config = configparser.ConfigParser(interpolation=None)
++    config.read_string(
++        _read(
++            os.path.dirname(config_path),
++            os.path.basename(config_path),
++            MAX_JSON,
++        ).decode()
++    )
++    measured = {}
++    uri = config.get(
++        'libvirt', 'connection_uri', fallback='qemu:///system'
++    )
++    try:
++        measured['runtime'] = _runtime(uri)
++    except Exception:
++        measured['runtime'] = dict(
++            kind='runtime', status='unobserved', **_versions()
++        )
++    for kind in ('store', 'staging'):
++        try:
++            path = config.get('checkpoint', kind + '_root')
++            measured[kind] = _mount(path, kind)
++        except Exception:
++            measured[kind] = dict(kind=kind, status='unobserved')
++    return dict(
++        schema_version=1,
++        scope='components',
++        measured=measured,
++        checks={
++            name: dict(status='skipped', evidence=[])
++            for name in COMPONENT_CHECKS
++        },
++        metrics=dict(pause_milliseconds=0, peak_bytes=0),
++        qualified=False,
++        stack_qualified=False,
++        unverified=list(COMPONENT_CHECKS),
++    )
+diff --git a/nova/tests/functional/db/test_checkpoint_temporary_quota.py b/nova/tests/functional/db/test_checkpoint_temporary_quota.py
+index d78976563aa9f5d0b2149ccca74db7c3d9fe2d53..ca80ef02e22525c9c89170203decca68b9e111f7 100644
+--- a/nova/tests/functional/db/test_checkpoint_temporary_quota.py
++++ b/nova/tests/functional/db/test_checkpoint_temporary_quota.py
+@@ -34,6 +34,7 @@ class TemporaryQuotaTest(checkpoints.CheckpointTestCase):
+     independent quota protocol; v2 runtime adapter integration is tested with
+     the executor in its own suite.
+     """
++
+     def setUp(self):
+         super().setUp()
+         self.ledger = quota.QuotaLedger()
+diff --git a/nova/tests/unit/checkpoints/test_qualification.py b/nova/tests/unit/checkpoints/test_qualification.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..01ced76c0a0121b982235cc77f4702032fcd5c49
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/test_qualification.py
+@@ -0,0 +1,250 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import copy
++import hashlib
++import os
++from pathlib import Path
++import tempfile
++from unittest import mock
++
++from oslo_serialization import jsonutils
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import qualification as q
++from nova import test
++from nova.virt.libvirt.checkpoints import profiles
++
++
++class QualificationTest(test.NoDBTestCase):
++    def setUp(self):
++        super().setUp()
++        directory = tempfile.TemporaryDirectory()
++        self.addCleanup(directory.cleanup)
++        self.root = Path(directory.name)
++        self.measured = {
++            kind: dict(kind=kind, test_only=True)
++            for kind in ('runtime', 'store', 'staging')
++        }
++        self.report = dict(
++            schema_version=1,
++            scope='components',
++            measured=self.measured,
++            metrics=dict(pause_milliseconds=1500, peak_bytes=4096),
++            checks={},
++        )
++        for name in q.COMPONENT_CHECKS:
++            evidence = dict(
++                check=name,
++                status='pass',
++                measured_sha256=c.canonical_payload_hash(self.measured),
++                artifacts=[
++                    dict(
++                        path='capture.txt',
++                        sha256=hashlib.sha256(
++                            b'captured output'
++                        ).hexdigest(),
++                    )
++                ],
++            )
++            (self.root / 'capture.txt').write_bytes(b'captured output')
++            path = self.root / (name + '.json')
++            path.write_text(jsonutils.dumps(evidence))
++            self.report['checks'][name] = dict(
++                status='pass',
++                evidence=[
++                    dict(
++                        path=path.name,
++                        sha256=hashlib.sha256(
++                            path.read_bytes()
++                        ).hexdigest(),
++                    )
++                ],
++            )
++
++    def validate(self):
++        return q.validate_report(self.report, str(self.root))
++
++    def test_components_report_is_not_stack_acceptance(self):
++        result = self.validate()
++        self.assertTrue(result['qualified'])
++        self.assertFalse(result['stack_qualified'])
++        self.report['scope'] = 'stack'
++        self.assertFalse(self.validate()['qualified'])
++
++    def test_skipped_required_check_never_qualifies_profile(self):
++        name = q.COMPONENT_CHECKS[0]
++        self.report['checks'][name]['status'] = 'skipped'
++        result = self.validate()
++        self.assertFalse(result['qualified'])
++        self.assertIn(name, result['unverified'])
++
++    def test_missing_evidence_never_qualifies_profile(self):
++        (self.root / (q.COMPONENT_CHECKS[0] + '.json')).unlink()
++        self.assertFalse(self.validate()['qualified'])
++
++    def test_modified_or_missing_raw_capture_never_qualifies(self):
++        (self.root / 'capture.txt').write_bytes(b'changed')
++        self.assertFalse(self.validate()['qualified'])
++
++    def test_claimed_qualified_and_partial_checks_are_not_trusted(self):
++        self.report['qualified'] = True
++        self.report['stack_qualified'] = True
++        self.report['checks'].pop(q.COMPONENT_CHECKS[0])
++        self.assertFalse(self.validate()['qualified'])
++
++    def test_evidence_is_bound_to_measured_tuple(self):
++        self.report['measured']['runtime']['version'] = 'changed'
++        self.assertFalse(self.validate()['qualified'])
++
++    def test_symlink_and_parent_traversal_cannot_supply_evidence(self):
++        name = q.COMPONENT_CHECKS[0]
++        source = self.root / (name + '.json')
++        link = self.root / 'linked.json'
++        os.symlink(source, link)
++        self.report['checks'][name]['evidence'][0]['path'] = link.name
++        self.assertFalse(self.validate()['qualified'])
++        self.report['checks'][name]['evidence'][0]['path'] = (
++            '../' + self.root.name + '/' + source.name
++        )
++        self.assertFalse(self.validate()['qualified'])
++
++    def test_summarize_rejects_invalid_status_and_missing_required(self):
++        self.assertRaises(ValueError, q.summarize, {}, ('required',))
++        self.assertRaises(
++            ValueError, q.summarize, dict(required='ok'), ('required',)
++        )
++        self.assertEqual(
++            dict(qualified=False, unverified=['writer_hard_limit']),
++            q.summarize(
++                dict(
++                    libvirt_repeat_restore='pass',
++                    writer_hard_limit='skipped',
++                ),
++                ('libvirt_repeat_restore', 'writer_hard_limit'),
++            ),
++        )
++
++    def test_negative_or_bool_measurements_rejected(self):
++        for value in (-1, True):
++            self.report['metrics']['peak_bytes'] = value
++            self.assertRaises(ValueError, self.validate)
++
++    def test_profile_tuple_mismatch_is_unsupported(self):
++        observed = self.measured['runtime']
++        profile = profiles.ProfileMatch(
++            uuids.runtime,
++            'runtime',
++            c.canonical_payload_hash(observed),
++            'a' * 64,
++            observed,
++            dict(max_bytes=4096),
++        )
++        changed = dict(observed, version='different')
++        self.assertIsNone(profiles.ProfileSet((profile,)).match(changed))
++
++    def test_inspect_never_changes_vm_or_creates_allowlist(self):
++        config = self.root / 'nova.conf'
++        config.write_text(
++            '[checkpoint]\nprofile_file=/no-profile\n'
++            'store_root=/no-store\nstaging_root=/no-staging\n'
++            '[libvirt]\nconnection_uri=qemu:///system\n'
++        )
++        with mock.patch.object(
++            q,
++            '_runtime',
++            return_value=copy.deepcopy(self.measured['runtime']),
++        ) as runtime:
++            result = q.inspect(str(config))
++        runtime.assert_called_once_with('qemu:///system')
++        self.assertFalse(result['qualified'])
++        self.assertFalse(result['stack_qualified'])
++        self.assertNotIn('records', result)
++        self.assertTrue(
++            all(
++                v['status'] == 'skipped' for v in result['checks'].values()
++            )
++        )
++
++    def test_runtime_inspection_uses_readonly_connection_and_closes(self):
++        libvirt = mock.Mock()
++        connection = mock.Mock()
++        connection.getCapabilities.return_value = '<capabilities/>'
++        connection.getURI.return_value = 'qemu:///system'
++        connection.getLibVersion.return_value = 11010000
++        connection.getVersion.return_value = 9002000
++        libvirt.openReadOnly.return_value = connection
++        libvirt.open.side_effect = AssertionError('write connection')
++        with mock.patch.dict('sys.modules', libvirt=libvirt):
++            value = q._runtime('qemu:///system')
++        libvirt.openReadOnly.assert_called_once_with('qemu:///system')
++        libvirt.open.assert_not_called()
++        self.assertEqual(11010000, value['libvirt_version'])
++        connection.close.assert_called_once_with()
++        self.assertEqual(
++            {
++                'getCapabilities',
++                'getLibVersion',
++                'getVersion',
++                'getURI',
++                'close',
++            },
++            {call[0] for call in connection.mock_calls},
++        )
++
++    def test_stack_evidence_binds_target_and_metrics(self):
++        self.report['scope'] = 'stack'
++        self.report['target'] = dict(
++            instance_uuid=uuids.instance,
++            host='compute',
++            volume_ids=[uuids.volume],
++        )
++        for name in q.STACK_CHECKS:
++            value = dict(
++                check=name,
++                status='pass',
++                measured_sha256=c.canonical_payload_hash(self.measured),
++                target_sha256=c.canonical_payload_hash(
++                    self.report['target']
++                ),
++                artifacts=[
++                    dict(
++                        path='capture.txt',
++                        sha256=hashlib.sha256(
++                            b'captured output'
++                        ).hexdigest(),
++                    )
++                ],
++            )
++            if name == 'pause_and_peak_bytes':
++                value['metrics_sha256'] = c.canonical_payload_hash(
++                    self.report['metrics']
++                )
++            path = self.root / (name + '.json')
++            path.write_text(jsonutils.dumps(value))
++            self.report['checks'][name] = dict(
++                status='pass',
++                evidence=[
++                    dict(
++                        path=path.name,
++                        sha256=hashlib.sha256(
++                            path.read_bytes()
++                        ).hexdigest(),
++                    )
++                ],
++            )
++        self.assertTrue(self.validate()['stack_qualified'])
++        self.report['metrics']['peak_bytes'] += 1
++        self.assertFalse(self.validate()['stack_qualified'])
++        self.report['target']['instance_uuid'] = uuids.foreign
++        self.assertFalse(self.validate()['stack_qualified'])
+diff --git a/nova/tests/unit/compute/test_virtapi.py b/nova/tests/unit/compute/test_virtapi.py
+index 71c909752586f5309ec14a6198d52c94dc49445e..e74250fdb3580413b8e9feb418bda23836139abc 100644
+--- a/nova/tests/unit/compute/test_virtapi.py
++++ b/nova/tests/unit/compute/test_virtapi.py
+@@ -45,6 +45,18 @@ class VirtAPIBaseTest(test.NoDBTestCase, test.APICoverage):
+                           getattr(self.virtapi, method),
+                           *args, **kwargs)
+ 
++    def test_checkpoint_update_bdm(self):
++        self.assertExpected(
++            'checkpoint_update_bdm',
++            nova_context.get_admin_context(),
++            uuids.instance,
++            uuids.operation,
++            1,
++            uuids.bdm,
++            uuids.attachment,
++            {'serial': uuids.volume},
++        )
++
+     def test_wait_for_instance_event(self):
+         self.assertExpected('wait_for_instance_event',
+                             'instance', ['event'])
+@@ -75,6 +87,13 @@ class FakeVirtAPITest(VirtAPIBaseTest):
+             self.virtapi.exit_wait_early(*args, **kwargs)
+         elif method == 'update_compute_provider_status':
+             self.virtapi.update_compute_provider_status(*args, **kwargs)
++        elif method == 'checkpoint_update_bdm':
++            self.assertRaises(
++                NotImplementedError,
++                self.virtapi.checkpoint_update_bdm,
++                *args,
++                **kwargs,
++            )
+         else:
+             self.fail("Unhandled FakeVirtAPI method: %s" % method)
+ 
+@@ -126,6 +145,29 @@ class ComputeVirtAPITest(VirtAPIBaseTest):
+         self.compute = FakeCompute()
+         self.virtapi = compute_manager.ComputeVirtAPI(self.compute)
+ 
++    @mock.patch.object(objects.BlockDeviceMapping, 'checkpoint_update')
++    def test_checkpoint_update_bdm(self, update):
++        ctx = nova_context.get_admin_context()
++        connection = {'serial': uuids.volume}
++        self.virtapi.checkpoint_update_bdm(
++            ctx,
++            uuids.instance,
++            uuids.operation,
++            1,
++            uuids.bdm,
++            uuids.attachment,
++            connection,
++        )
++        update.assert_called_once_with(
++            ctx,
++            uuids.instance,
++            uuids.operation,
++            1,
++            uuids.bdm,
++            uuids.attachment,
++            connection,
++        )
++
+     def test_exit_wait_early(self):
+         self.assertRaises(self.virtapi._exit_early_exc,
+                           self.virtapi.exit_wait_early,
+diff --git a/nova/tests/unit/db/main/test_api.py b/nova/tests/unit/db/main/test_api.py
+index fd73e71e2fd07bdcd87516a71f4b5bb3e57df3b3..8683c914cd4de242a0cecfb1fcb29d1036ada0e8 100644
+--- a/nova/tests/unit/db/main/test_api.py
++++ b/nova/tests/unit/db/main/test_api.py
+@@ -6008,14 +6008,23 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
+         for table_name in metadata.tables:
+             # some tables don't have shadow tables so skip these
+             if table_name in [
+-                'tags', 'resource_providers', 'allocations',
+-                'inventories', 'resource_provider_aggregates',
+-                'console_auth_tokens', 'share_mapping',
+-                'instance_checkpoints', 'instance_checkpoint_disks',
++                'tags',
++                'resource_providers',
++                'allocations',
++                'inventories',
++                'resource_provider_aggregates',
++                'console_auth_tokens',
++                'share_mapping',
++                'instance_checkpoints',
++                'instance_checkpoint_disks',
+                 'instance_checkpoint_artifacts',
+-                'instance_checkpoint_operations', 'instance_checkpoint_steps',
++                'instance_checkpoint_operations',
++                'instance_checkpoint_steps',
+                 'instance_checkpoint_guards',
+                 'instance_checkpoint_admission_tombstones',
++                'instance_checkpoint_effects',
++                'instance_checkpoint_artifact_reservations',
++                'instance_checkpoint_temporary_budgets',
+             ]:
+                 continue
+ 
+diff --git a/nova/virt/libvirt/checkpoints/topology.py b/nova/virt/libvirt/checkpoints/topology.py
+index 128b73577374b995e0a0eee899e1169e7d8d6bae..7758187602fff1464d43d0a8d97b579dc108bed1 100644
+--- a/nova/virt/libvirt/checkpoints/topology.py
++++ b/nova/virt/libvirt/checkpoints/topology.py
+@@ -15,6 +15,7 @@
+ import contextlib
+ import copy
+ import hashlib
++from importlib import metadata as package_metadata
+ import os
+ from pathlib import Path
+ from urllib import parse
+@@ -262,6 +263,12 @@ class Topology:
+         )
+         return dict(
+             kind='runtime',
++            kernel_release=os.uname().release,
++            os_brick_version=package_metadata.version('os-brick'),
++            libvirt_python_version=package_metadata.version('libvirt-python'),
++            device_allowlist=sorted(DEVICE_TAGS),
++            disk_formats=['raw'],
++            disk_cache_modes=['none', 'directsync'],
+             libvirt_version=conn.getLibVersion(),
+             qemu_version=conn.getVersion(),
+             architecture=os.uname().machine,
+diff --git a/tools/checkpoint/profile.schema.json b/tools/checkpoint/profile.schema.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..80c229e4eece6cd70234a00156a7a6812b5d040e
+--- /dev/null
++++ b/tools/checkpoint/profile.schema.json
+@@ -0,0 +1,64 @@
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "$id": "urn:openstack:nova:checkpoint:profiles:1",
++  "title": "Operator-controlled qualified checkpoint component allowlist",
++  "type": "object",
++  "additionalProperties": false,
++  "required": [
++    "schema_version",
++    "records"
++  ],
++  "properties": {
++    "schema_version": {
++      "const": 1
++    },
++    "records": {
++      "type": "array",
++      "items": {
++        "type": "object",
++        "additionalProperties": false,
++        "required": [
++          "id",
++          "kind",
++          "identity_sha256",
++          "qualification_sha256",
++          "observed",
++          "limits"
++        ],
++        "properties": {
++          "id": {
++            "type": "string",
++            "format": "uuid"
++          },
++          "kind": {
++            "enum": [
++              "runtime",
++              "store",
++              "staging"
++            ]
++          },
++          "identity_sha256": {
++            "type": "string",
++            "pattern": "^[0-9a-f]{64}$"
++          },
++          "qualification_sha256": {
++            "type": "string",
++            "pattern": "^[0-9a-f]{64}$"
++          },
++          "observed": {
++            "type": "object",
++            "minProperties": 1
++          },
++          "limits": {
++            "type": "object",
++            "minProperties": 1,
++            "additionalProperties": {
++              "type": "integer",
++              "minimum": 1
++            }
++          }
++        }
++      }
++    }
++  }
++}
+diff --git a/tools/checkpoint/profiles.example.json b/tools/checkpoint/profiles.example.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..1745d7867ca226bb1e714707b7ffc32ce84a37af
+--- /dev/null
++++ b/tools/checkpoint/profiles.example.json
+@@ -0,0 +1,4 @@
++{
++  "schema_version": 1,
++  "records": []
++}
+diff --git a/tools/checkpoint/qualification.py b/tools/checkpoint/qualification.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..ce930f267903c7045ea81424704f1af40b2333b6
+--- /dev/null
++++ b/tools/checkpoint/qualification.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Collect read-only observations or validate operator-supplied evidence."""
++
++import argparse
++import os
++
++from oslo_serialization import jsonutils
++
++from nova.checkpoints import qualification
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    commands = parser.add_subparsers(dest='command', required=True)
++    inspect = commands.add_parser('inspect')
++    inspect.add_argument('--config', required=True)
++    inspect.add_argument('--output', required=True)
++    validate = commands.add_parser('validate-report')
++    validate.add_argument('--report', required=True)
++    validate.add_argument('--evidence-root', required=True)
++    validate.add_argument('--output', required=True)
++    args = parser.parse_args()
++    try:
++        if args.command == 'inspect':
++            result = qualification.inspect(os.path.abspath(args.config))
++        else:
++            path = os.path.abspath(args.report)
++            report = jsonutils.loads(
++                qualification._read(
++                    os.path.dirname(path),
++                    os.path.basename(path),
++                    qualification.MAX_JSON,
++                )
++            )
++            result = qualification.validate_report(
++                report, os.path.abspath(args.evidence_root)
++            )
++        descriptor = os.open(
++            args.output,
++            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
++            0o600,
++        )
++        with os.fdopen(descriptor, 'w') as stream:
++            jsonutils.dump(
++                result,
++                stream,
++                ensure_ascii=False,
++                indent=2,
++                allow_nan=False,
++            )
++            stream.write('\n')
++            stream.flush()
++            os.fsync(stream.fileno())
++        return 0 if args.command == 'inspect' or result['qualified'] else 1
++    except (OSError, ValueError, KeyError, TypeError):
++        parser.exit(
++            2,
++            'Invalid or inaccessible checkpoint evidence/configuration.\n',
++        )
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())

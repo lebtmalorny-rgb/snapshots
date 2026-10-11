@@ -1,0 +1,1521 @@
+From 4d2e9733dde5ec7d648f9ff126bf2734795959a3 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 21:47:22 +0300
+Subject: [PATCH 05/10] feat: integrate scoped Cinder checkpoint continuation
+
+---
+ nova/checkpoints/api.py                       |  25 +-
+ nova/checkpoints/contracts_v2.py              |  10 +
+ nova/db/main/checkpoint_effects.py            |   4 +
+ .../functional/db/test_checkpoint_effects.py  |  14 +
+ .../test_checkpoint_cinder_contract.py        | 291 ++++++++
+ nova/tests/unit/checkpoints/test_api.py       |  25 +
+ nova/tests/unit/volume/test_checkpoints.py    | 376 ++++++++++
+ nova/volume/checkpoints.py                    | 675 ++++++++++++++++++
+ 8 files changed, 1419 insertions(+), 1 deletion(-)
+ create mode 100644 nova/tests/functional/test_checkpoint_cinder_contract.py
+ create mode 100644 nova/tests/unit/volume/test_checkpoints.py
+ create mode 100644 nova/volume/checkpoints.py
+
+diff --git a/nova/checkpoints/api.py b/nova/checkpoints/api.py
+index c6680741231912deaa85c1e2fcf73d9d766923f8..eb49d3051c3f5920e35cab454bcbb3b04a62a2f4 100644
+--- a/nova/checkpoints/api.py
++++ b/nova/checkpoints/api.py
+@@ -25,12 +25,35 @@ from nova import context as nova_context
+ from nova import exception
+ from nova import objects
+ from nova.policies import server_checkpoints as policies
++from nova.volume import checkpoints as cinder_checkpoints
+ 
+ 
+ class API:
+-    def __init__(self, conductor_api=None, ledger=None):
++    def __init__(self, conductor_api=None, ledger=None,
++                 checkpoint_client=None):
+         self.conductor = conductor_api or conductor.ComputeTaskAPI()
+         self.ledger = ledger or quota.QuotaLedger()
++        self.checkpoint_client = checkpoint_client
++
++    def resume_reserve_with_user(self, context, operation_id):
++        """Replay a keyed reserve in its targeted cell with a fresh user token.
++
++        The HTTP client requires the exact persisted reserve intent and rejects
++        completed/cancelled children. Background reconciliation only uses GET.
++        """
++        operation = objects.InstanceCheckpointOperation.get_by_uuid(
++            context, operation_id)
++        if (operation.contract_version != 2 or not context.auth_token or
++                context.user_id != operation.actor_user_id or
++                context.project_id != operation.project_id):
++            raise exception.CheckpointConflict(reason='identity_changed')
++        context.can(policies.POLICY_ROOT % operation.kind,
++                    target={'project_id': operation.project_id})
++        client = (self.checkpoint_client or
++                  cinder_checkpoints.CheckpointClient())
++        volumes = cinder_checkpoints.reserve_payload(operation)['volume_ids']
++        client.reserve(context, operation.uuid, operation.checkpoint_id,
++                       operation.instance_uuid, operation.kind, tuple(volumes))
+ 
+     @contextlib.contextmanager
+     def _server(self, context, instance_uuid, action):
+diff --git a/nova/checkpoints/contracts_v2.py b/nova/checkpoints/contracts_v2.py
+index c8aeb1c62709087e80627a9e9157196ee55e3208..5ed19032c93788e2c44a357ce04ae7714480ac63 100644
+--- a/nova/checkpoints/contracts_v2.py
++++ b/nova/checkpoints/contracts_v2.py
+@@ -440,3 +440,13 @@ def artifact_logical_id(binding, artifact_id):
+         name: value[name] for name in ('deployment_id', 'cell_uuid',
+         'project_id', 'instance_uuid', 'checkpoint_id')} |
+         {'artifact_id': artifact_id})
++
++
++def cinder_reserve_payload(operation):
++    """Exact Cinder 3.73 body, derived from immutable admission identity."""
++    return dict(request_id=operation.request_id,
++        checkpoint_id=operation.checkpoint_id,
++        instance_uuid=operation.instance_uuid, kind=operation.kind,
++        volume_ids=sorted(d['volume_id'] for d in
++            operation.admission['device_manifest']['disks']),
++        nova_operation_id=operation.uuid, allow_service_continuation=True)
+diff --git a/nova/db/main/checkpoint_effects.py b/nova/db/main/checkpoint_effects.py
+index 71494a6e5750da7172988dbd2d320d47889e953e..dd62cf3e0d9222cc165bfc9565204aaf3608e80f 100644
+--- a/nova/db/main/checkpoint_effects.py
++++ b/nova/db/main/checkpoint_effects.py
+@@ -12,6 +12,7 @@
+ 
+ """Cell-owned effects serialized by the Instance and guard fence."""
+ 
++from types import SimpleNamespace
+ import uuid
+ 
+ from oslo_serialization import jsonutils
+@@ -141,6 +142,9 @@ def claim_parent(context, instance, checkpoint, operation, phase):
+                      checkpoint_id=checkpoint.uuid,
+                      volume_ids=[d.volume_id for d in journal._disks(
+                          context, checkpoint.uuid)], artifacts=artifacts)
++    if phase == 'cinder_reserve':
++        resources['cinder_reserve'] = v2.cinder_reserve_payload(
++            SimpleNamespace(**journal._row(operation)))
+     graph = workflow.child_plan(operation.kind, phase, resources)
+     from nova.db.main import checkpoint_temporary as temporary
+     # Preflight/reserve may precede the temporary ticket confirmation.
+diff --git a/nova/tests/functional/db/test_checkpoint_effects.py b/nova/tests/functional/db/test_checkpoint_effects.py
+index b046b68d8ff0a2222d89e39d5c26afe17772b24c..5022a2e8340501de864d3345b04b685045b0fce7 100644
+--- a/nova/tests/functional/db/test_checkpoint_effects.py
++++ b/nova/tests/functional/db/test_checkpoint_effects.py
+@@ -31,9 +31,23 @@ from nova import exception
+ from nova import objects
+ from nova import test
+ from nova.tests.unit.checkpoints import test_cell_db
++from nova.volume import checkpoints as cinder_client
+ 
+ 
+ class EffectTests:
++    def test_cinder_reserve_payload_is_durable_before_http(self):
++        self.finish(self.children()[0], dict(
++            fingerprint=self.admission.fingerprint,
++            host='compute', node='node'))
++        self.parent = journal.claim_step(self.ctx, uuids.operation, 1,
++            'cinder_reserve', 'test-executor')
++        self.claim(self.children()[0])
++        intent = cinder_client.reserve_intent(self.ctx, uuids.operation)
++        self.assertEqual('dispatching', intent['status'])
++        self.assertEqual(cinder_client.reserve_payload(self.operation),
++                         intent['body'])
++        self.assertNotIn('auth_token', str(intent))
++
+     def prepare_effects(self):
+         self.flags(enabled=True, deployment_id=uuids.deployment,
+                    group='checkpoint')
+diff --git a/nova/tests/functional/test_checkpoint_cinder_contract.py b/nova/tests/functional/test_checkpoint_cinder_contract.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e691e01ab5fce99824842eb0cd426a5af76d10f
+--- /dev/null
++++ b/nova/tests/functional/test_checkpoint_cinder_contract.py
+@@ -0,0 +1,291 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Mandatory wire gate against the pinned C1.1 authenticated HTTP fixture."""
++
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++import time
++from types import SimpleNamespace
++
++from keystoneauth1 import session
++from oslo_serialization import jsonutils
++from oslo_utils import uuidutils
++
++from nova import context
++from nova import exception
++from nova import test
++from nova.tests.unit.volume.test_checkpoints import MarkerAuth
++from nova.volume import checkpoints
++
++CINDER_HEAD = 'd065a55cbe5cb8cd59489752846a41145d72bd27'
++CINDER_TREE = '53888d9cea7fa1b12d35a0b9afd894eeee270843'
++
++
++class CinderContinuationContractTest(test.NoDBTestCase):
++    def setUp(self):
++        super().setUp()
++        checkout = os.environ.get('N2_CINDER_CHECKOUT')
++        python = os.environ.get('N2_CINDER_PYTHON')
++        self.assertTrue(
++            checkout and python,
++            'N2_CINDER_CHECKOUT and N2_CINDER_PYTHON are required',
++        )
++        temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(temporary.cleanup)
++        root = Path(temporary.name)
++        git_env = dict(os.environ)
++        git_dir = os.environ.get('N2_CINDER_GIT_DIR')
++        if git_dir:
++            git_env.update(GIT_DIR=git_dir, GIT_WORK_TREE=checkout)
++        for revision, expected in (
++            ('HEAD', CINDER_HEAD),
++            ('HEAD^{tree}', CINDER_TREE),
++        ):
++            actual = subprocess.check_output(
++                ['git', '-C', checkout, 'rev-parse', revision],
++                env=git_env,
++                text=True,
++            ).strip()
++            self.assertEqual(expected, actual)
++        git_env['GIT_INDEX_FILE'] = str(root / 'dependency.index')
++        subprocess.run(
++            ['git', '-C', checkout, 'read-tree', 'HEAD'],
++            env=git_env,
++            check=True,
++        )
++        subprocess.run(
++            ['git', '-C', checkout, 'diff', '--exit-code', 'HEAD', '--'],
++            env=git_env,
++            check=True,
++            stdout=subprocess.DEVNULL,
++        )
++        ready, log = root / 'ready.json', root / 'cinder.log'
++        output = log.open('w')
++        self.addCleanup(output.close)
++        # Do not send Nova discovery paths or its opportunistic DB selection
++        # into Cinder's separate interpreter and disposable fixture database.
++        env = {
++            k: v
++            for k, v in os.environ.items()
++            if not k.startswith(('OS_TEST_', 'NOVA_', 'N2_', 'GIT_')) and
++            k not in ('PYTHONPATH', 'PYTHONHOME', 'VIRTUAL_ENV')
++        }
++        env.update(
++            PYTHONPATH=checkout,
++            PBR_VERSION='0.0.0',
++            PYTHONDONTWRITEBYTECODE='1',
++        )
++        process = subprocess.Popen(
++            [
++                python,
++                '-m',
++                'cinder.tests.functional.checkpoint_continuation_fixture',
++                '--ready',
++                str(ready),
++            ],
++            cwd=checkout,
++            env=env,
++            stdout=output,
++            stderr=subprocess.STDOUT,
++        )
++
++        def stop():
++            process.terminate()
++            try:
++                process.wait(timeout=15)
++            except subprocess.TimeoutExpired:
++                process.kill()
++                process.wait(timeout=5)
++
++        self.addCleanup(stop)
++        deadline = time.monotonic() + 30
++        while not ready.exists() and time.monotonic() < deadline:
++            if process.poll() is not None:
++                self.fail(log.read_text())
++            time.sleep(0.02)
++        self.assertTrue(ready.exists(), log.read_text())
++        self.fixture = f = jsonutils.loads(ready.read_text())
++        self.ctx = context.RequestContext(
++            f['actor_user_id'],
++            f['owner_project_id'],
++            auth_token=f['user_token'],
++        )
++        self.user = MarkerAuth(
++            f['user_token'],
++            f['actor_user_id'],
++            f['owner_project_id'],
++            f['endpoint'] + '/' + f['owner_project_id'],
++        )
++        service = MarkerAuth(
++            f['service_token'],
++            f['executor_service_user_id'],
++            f['service_project_id'],
++            f['endpoint'] + '/' + f['service_project_id'],
++        )
++        self.ctx.get_auth_plugin = lambda: self.user
++        self.recovery = context.get_admin_context()
++        self.operations = {}
++        self.intents = {}
++        self.client = checkpoints.CheckpointClient(
++            session=session.Session(),
++            service_auth_factory=lambda: service,
++            operation_loader=lambda ctx, ident: self.operations[ident],
++            intent_loader=lambda ctx, ident: self.intents[ident],
++        )
++
++    def reserve(self, kind, checkpoint_id):
++        f = self.fixture
++        op = SimpleNamespace(
++            uuid=uuidutils.generate_uuid(),
++            checkpoint_id=checkpoint_id,
++            instance_uuid=f['instance_uuid'],
++            request_id=uuidutils.generate_uuid(),
++            project_id=f['owner_project_id'],
++            actor_user_id=f['actor_user_id'],
++            kind=kind,
++            generation=1,
++            contract_version=2,
++            quota_ready=True,
++            admission={
++                'device_manifest': {
++                    'disks': [
++                        dict(volume_id=ident) for ident in f['volume_ids']
++                    ]
++                }
++            },
++        )
++        self.operations[op.uuid] = op
++        self.intents[op.uuid] = dict(
++            body=checkpoints.reserve_payload(op), status='dispatching'
++        )
++        accepted = self.client.reserve(
++            self.ctx,
++            op.uuid,
++            op.checkpoint_id,
++            op.instance_uuid,
++            kind,
++            tuple(f['volume_ids']),
++        )
++        self.assertEqual('reserved', accepted['status'])
++        return op, accepted
++
++    def wait(self, op, status, child=None):
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline:
++            result = (
++                self.client.get_attachment_request(
++                    self.recovery, op.uuid, child
++                )
++                if child
++                else self.client.get(self.recovery, op.uuid)
++            )
++            if result['status'] == status:
++                return result
++            time.sleep(0.02)
++        self.fail('Cinder did not reach %s' % status)
++
++    def test_actual_c11_create_revert_delete_and_scoped_attachments(self):
++        volume_ids = tuple(self.fixture['volume_ids'])
++        capabilities = self.client.preflight_capabilities(
++            self.ctx, volume_ids
++        )
++        self.assertEqual(set(volume_ids), set(capabilities))
++        resources = self.client.preflight_resources(
++            self.ctx, volume_ids, ()
++        )
++        self.assertEqual(set(volume_ids), set(resources['volumes']))
++        op, accepted = self.reserve('create', uuidutils.generate_uuid())
++        for volume_id in volume_ids:
++            self.assertTrue(
++                self.client.capabilities(
++                    self.recovery, op.uuid, volume_id
++                )['supported']
++            )
++        # Loss of the reserve response does not need another user in recovery.
++        self.user.token = 'expired-user-marker'
++        self.ctx.auth_token = 'expired-user-marker'
++        self.assertEqual(accepted, self.client.get(self.recovery, op.uuid))
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.client.reserve,
++            self.ctx,
++            op.uuid,
++            op.checkpoint_id,
++            op.instance_uuid,
++            op.kind,
++            volume_ids,
++        )
++        self.client.action(self.recovery, op.uuid, 'execute', 1)
++        self.wait(op, 'succeeded')
++        self.client.action(self.recovery, op.uuid, 'release', 1, 'commit')
++        self.user.token = self.fixture['user_token']
++        self.ctx.auth_token = self.fixture['user_token']
++        snapshots = tuple(r['snapshot_id'] for r in accepted['resources'])
++        self.client.preflight_resources(self.ctx, volume_ids, snapshots)
++        revert, accepted = self.reserve('revert', op.checkpoint_id)
++
++        def attachment(action, volume, ident=None):
++            request = dict(
++                id=uuidutils.generate_uuid(),
++                generation=1,
++                volume_id=volume,
++                action=action,
++                attachment_id=ident,
++                connector=(
++                    {'host': 'compute-one', 'ip': '192.0.2.10'}
++                    if action == 'update'
++                    else None
++                ),
++                mountpoint='/dev/vda' if action == 'update' else None,
++            )
++            self.client.submit_attachment(
++                self.recovery, revert.uuid, request
++            )
++            result = self.wait(revert, 'succeeded', child=request['id'])
++            replay = self.client.submit_attachment(
++                self.recovery, revert.uuid, request
++            )
++            self.assertEqual(result, replay)
++            return result['attachment_id']
++
++        for volume in volume_ids:
++            original = resources['volumes'][volume]['attachments'][0][
++                'attachment_id'
++            ]
++            attachment('delete', volume, original)
++        self.client.action(self.recovery, revert.uuid, 'execute', 1)
++        self.wait(revert, 'succeeded')
++        for volume in volume_ids:
++            ident = attachment('create', volume)
++            attachment('update', volume, ident)
++            detail = self.client.get_attachment(
++                self.recovery, revert.uuid, ident
++            )
++            self.assertEqual(volume, detail['volume_id'])
++            self.assertIsInstance(detail['connection_info'], dict)
++            attachment('complete', volume, ident)
++        self.client.action(
++            self.recovery, revert.uuid, 'release', 1, 'commit'
++        )
++        delete, unused = self.reserve('delete', op.checkpoint_id)
++        self.client.action(self.recovery, delete.uuid, 'execute', 1)
++        self.wait(delete, 'succeeded')
++        self.client.action(
++            self.recovery, delete.uuid, 'release', 1, 'commit'
++        )
++        self.assertEqual(
++            'released',
++            self.client.get(self.recovery, delete.uuid)['status'],
++        )
+diff --git a/nova/tests/unit/checkpoints/test_api.py b/nova/tests/unit/checkpoints/test_api.py
+index 7a3cd40ba6b971e6a0c2fa27287b9cb5eddc8233..b537ea7278de24f292ea235922408ec4b55d3849 100644
+--- a/nova/tests/unit/checkpoints/test_api.py
++++ b/nova/tests/unit/checkpoints/test_api.py
+@@ -390,3 +390,28 @@ class CheckpointAPITest(APIFixture):
+         )
+         self.assertRaises(exception.NotFound, self.create)
+         self.task_rpc.checkpoint_probe.assert_not_called()
++
++
++class CinderReserveReplayTest(test.NoDBTestCase):
++    def test_replay_requires_original_actor_and_current_policy(self):
++        from nova.checkpoints import api
++        from nova.tests.unit.volume import test_checkpoints as fixture
++        op = fixture.operation()
++        ctx = context.RequestContext('actor', 'owner-project',
++                                     auth_token='fresh')
++        ctx.can = mock.Mock(return_value=True)
++        client = mock.Mock()
++        service = api.API(checkpoint_client=client)
++        with mock.patch.object(objects.InstanceCheckpointOperation,
++                               'get_by_uuid', return_value=op):
++            service.resume_reserve_with_user(ctx, op.uuid)
++            client.reserve.assert_called_once_with(ctx, op.uuid,
++                op.checkpoint_id, op.instance_uuid, op.kind, (uuids.volume,))
++            ctx.can.assert_called_once_with(
++                'os_compute_api:server_checkpoints:create',
++                target={'project_id': 'owner-project'})
++            client.reset_mock()
++            ctx.user_id = 'foreign'
++            self.assertRaises(exception.CheckpointConflict,
++                service.resume_reserve_with_user, ctx, op.uuid)
++            client.reserve.assert_not_called()
+diff --git a/nova/tests/unit/volume/test_checkpoints.py b/nova/tests/unit/volume/test_checkpoints.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..73832ebbc00c76502b24deb61084cf48b7970c62
+--- /dev/null
++++ b/nova/tests/unit/volume/test_checkpoints.py
+@@ -0,0 +1,376 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import copy
++from types import SimpleNamespace
++from unittest import mock
++
++from keystoneauth1 import plugin
++from keystoneauth1 import session
++from oslo_utils.fixture import uuidsentinel as uuids
++from requests_mock.contrib import fixture as requests_fixture
++
++from nova import context
++from nova import exception
++from nova import test
++from nova.volume import checkpoints
++
++
++class MarkerAuth(plugin.BaseAuthPlugin):
++    def __init__(self, token, user, project, endpoint):
++        self.token, self.user, self.project = token, user, project
++        self.endpoint = endpoint
++
++    def get_headers(self, session, **kwargs):
++        return {'X-Auth-Token': self.token}
++
++    def get_token(self, session):
++        return self.token
++
++    def get_user_id(self, session):
++        return self.user
++
++    def get_project_id(self, session):
++        return self.project
++
++    def get_endpoint(self, session, **kwargs):
++        return self.endpoint
++
++
++def operation():
++    return SimpleNamespace(
++        uuid=uuids.operation,
++        checkpoint_id=uuids.checkpoint,
++        instance_uuid=uuids.instance,
++        request_id=uuids.request,
++        project_id='owner-project',
++        actor_user_id='actor',
++        kind='create',
++        generation=1,
++        contract_version=2,
++        quota_ready=True,
++        admission={
++            'device_manifest': {'disks': [{'volume_id': uuids.volume}]}
++        },
++    )
++
++
++def reserve_body(op):
++    return dict(
++        request_id=op.request_id,
++        checkpoint_id=op.checkpoint_id,
++        instance_uuid=op.instance_uuid,
++        kind=op.kind,
++        volume_ids=[
++            d['volume_id']
++            for d in op.admission['device_manifest']['disks']
++        ],
++        nova_operation_id=op.uuid,
++        allow_service_continuation=True,
++    )
++
++
++def response(op, service='nova-service'):
++    return dict(
++        id=uuids.cinder,
++        request_id=op.request_id,
++        checkpoint_id=op.checkpoint_id,
++        instance_uuid=op.instance_uuid,
++        kind=op.kind,
++        generation=1,
++        status='reserved',
++        release_outcome=None,
++        error_code=None,
++        resources=[
++            dict(
++                id=uuids.resource,
++                volume_id=uuids.volume,
++                snapshot_id=uuids.snapshot,
++                volume_size=1,
++                status='creating',
++            )
++        ],
++        steps=[
++            dict(
++                id=uuids.step,
++                resource_id=uuids.resource,
++                phase='snapshot',
++                generation=1,
++                status='prepared',
++                error_code=None,
++            )
++        ],
++        continuation=dict(
++            version=1,
++            nova_operation_id=op.uuid,
++            owner_project_id=op.project_id,
++            actor_user_id=op.actor_user_id,
++            executor_service_user_id=service,
++            generation=1,
++        ),
++    )
++
++
++class CheckpointClientTest(test.NoDBTestCase):
++    def setUp(self):
++        super().setUp()
++        self.http = self.useFixture(requests_fixture.Fixture())
++        self.endpoint = 'http://cinder.test/v3/service-project'
++        self.service = MarkerAuth(
++            'service-marker',
++            'nova-service',
++            'service-project',
++            self.endpoint,
++        )
++        self.user = MarkerAuth(
++            'user-marker',
++            'actor',
++            'owner-project',
++            'http://cinder.test/v3/owner-project',
++        )
++        self.ctx = context.RequestContext(
++            'actor', 'owner-project', auth_token='user-marker'
++        )
++        self.ctx.get_auth_plugin = lambda: self.user
++        self.recovery = context.get_admin_context()
++        self.op = operation()
++        self.intent = dict(
++            body=reserve_body(self.op), status='dispatching'
++        )
++        self.session = session.Session()
++        self.client = checkpoints.CheckpointClient(
++            session=self.session,
++            service_auth_factory=lambda: self.service,
++            operation_loader=lambda ctx, ident: self.op,
++            intent_loader=lambda ctx, ident: self.intent,
++        )
++        self.url = (
++            'http://cinder.test/v3/checkpoint-service-operations/' +
++            self.op.uuid
++        )
++        self.reply = response(self.op)
++        self.respond(
++            'GET', self.url, json={'checkpoint_operation': self.reply}
++        )
++
++    def respond(self, *args, **kwargs):
++        kwargs.setdefault(
++            'headers', {'OpenStack-API-Version': 'volume 3.73'}
++        )
++        return self.http.register_uri(*args, **kwargs)
++
++    def test_background_uses_only_fresh_service_identity(self):
++        self.user.token = 'expired-user-marker'
++        result = self.client.get(self.recovery, self.op.uuid)
++        self.assertEqual(
++            self.op.uuid, result['continuation']['nova_operation_id']
++        )
++        request = self.http.last_request
++        self.assertEqual('service-marker', request.headers['X-Auth-Token'])
++        self.assertNotIn('X-Service-Token', request.headers)
++        self.assertNotIn('expired-user-marker', request.headers.values())
++        self.assertEqual(
++            'volume 3.73', request.headers['OpenStack-API-Version']
++        )
++
++    def test_missing_grant_does_not_fall_back_to_reserve(self):
++        self.respond('GET', self.url, status_code=404, json={})
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.client.get,
++            self.recovery,
++            self.op.uuid,
++        )
++        self.assertEqual(
++            ['GET'], [r.method for r in self.http.request_history]
++        )
++
++    def test_unknown_field_and_binding_mismatch_rejected(self):
++        for change in (
++            {'unexpected': True},
++            {'checkpoint_id': uuids.foreign},
++            {'generation': 2},
++        ):
++            invalid = dict(self.reply, **change)
++            self.respond(
++                'GET', self.url, json={'checkpoint_operation': invalid}
++            )
++            self.assertRaises(
++                exception.CheckpointConflict,
++                self.client.get,
++                self.recovery,
++                self.op.uuid,
++            )
++
++    def test_wrong_resource_set_rejected(self):
++        invalid = copy.deepcopy(self.reply)
++        invalid['resources'][0]['volume_id'] = uuids.foreign
++        self.respond(
++            'GET', self.url, json={'checkpoint_operation': invalid}
++        )
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.client.get,
++            self.recovery,
++            self.op.uuid,
++        )
++
++    def test_reserve_exact_stored_body_dual_auth_and_202(self):
++        url = 'http://cinder.test/v3/checkpoint-operations'
++        self.respond(
++            'POST',
++            url,
++            status_code=202,
++            json={'checkpoint_operation': self.reply},
++        )
++        result = self.client.reserve(
++            self.ctx,
++            self.op.uuid,
++            self.op.checkpoint_id,
++            self.op.instance_uuid,
++            'create',
++            (uuids.volume,),
++        )
++        self.assertEqual('reserved', result['status'])
++        self.assertEqual(
++            {'checkpoint_operation': self.intent['body']},
++            self.http.last_request.json(),
++        )
++        self.assertEqual(
++            'user-marker', self.http.last_request.headers['X-Auth-Token']
++        )
++        self.assertEqual(
++            'service-marker',
++            self.http.last_request.headers['X-Service-Token'],
++        )
++
++    def test_reserve_without_user_or_for_foreign_actor_is_denied(self):
++        for ctx in (
++            self.recovery,
++            context.RequestContext(
++                'another', 'owner-project', auth_token='user-marker'
++            ),
++        ):
++            self.assertRaises(
++                exception.CheckpointConflict,
++                self.client.reserve,
++                ctx,
++                self.op.uuid,
++                self.op.checkpoint_id,
++                self.op.instance_uuid,
++                'create',
++                (uuids.volume,),
++            )
++        self.assertEqual([], self.http.request_history)
++
++    def test_modified_stored_payload_is_not_replayed(self):
++        self.intent['body']['request_id'] = uuids.foreign
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.client.reserve,
++            self.ctx,
++            self.op.uuid,
++            self.op.checkpoint_id,
++            self.op.instance_uuid,
++            'create',
++            (uuids.volume,),
++        )
++        self.assertEqual([], self.http.request_history)
++
++    def test_no_logging_or_automatic_post_retry(self):
++        self.respond(
++            'POST',
++            self.url + '/action',
++            status_code=503,
++            json={'error': {'message': 'sensitive'}},
++        )
++        with mock.patch.object(
++            self.session, 'request', wraps=self.session.request
++        ) as request:
++            self.assertRaises(
++                exception.CheckpointUnavailable,
++                self.client.action,
++                self.recovery,
++                self.op.uuid,
++                'execute',
++                1,
++            )
++        self.assertFalse(request.call_args.kwargs['log'])
++        self.assertFalse(request.call_args.kwargs['allow_reauth'])
++        self.assertEqual(0, request.call_args.kwargs['connect_retries'])
++        self.assertEqual(1, len(self.http.request_history))
++
++    def test_372_response_cannot_be_used_as_continuation(self):
++        invalid = dict(self.reply)
++        invalid.pop('continuation')
++        self.respond(
++            'GET', self.url, json={'checkpoint_operation': invalid}
++        )
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.client.get,
++            self.recovery,
++            self.op.uuid,
++        )
++
++    def test_foreign_service_in_reply_is_rejected(self):
++        invalid = response(self.op, service='foreign-service')
++        self.respond(
++            'GET', self.url, json={'checkpoint_operation': invalid}
++        )
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.client.get,
++            self.recovery,
++            self.op.uuid,
++        )
++
++    def test_old_microversion_header_rejected(self):
++        self.respond(
++            'GET',
++            self.url,
++            headers={'OpenStack-API-Version': 'volume 3.72'},
++            json={'checkpoint_operation': self.reply},
++        )
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.client.get,
++            self.recovery,
++            self.op.uuid,
++        )
++
++    def test_foreign_cinder_operation_attachment_reply_rejected(self):
++        self.op.kind = 'revert'
++        reply = response(self.op)
++        self.respond('GET', self.url, json={'checkpoint_operation': reply})
++        value = dict(
++            id=uuids.child,
++            operation_id=uuids.foreign,
++            generation=1,
++            volume_id=uuids.volume,
++            action='create',
++            status='succeeded',
++            attachment_id=uuids.attachment,
++            error_code=None,
++        )
++        self.respond(
++            'GET',
++            self.url + '/attachment-requests/' + uuids.child,
++            json={'attachment_request': value},
++        )
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.client.get_attachment_request,
++            self.recovery,
++            self.op.uuid,
++            uuids.child,
++        )
+diff --git a/nova/volume/checkpoints.py b/nova/volume/checkpoints.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d6f1fe0200aa90998be3bb7f36935c0de740623
+--- /dev/null
++++ b/nova/volume/checkpoints.py
+@@ -0,0 +1,675 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Private Cinder 3.73 client, bound to durable Nova operation identities.
++
++Only reserve/preflight uses a live user credential. Continuation obtains its
++own service authentication and addresses the delegated operation UUID. No
++response URL, serialized context, bearer, or connection secret is persisted.
++"""
++
++import functools
++import re
++from urllib import parse
++
++from keystoneauth1 import exceptions as ks_exc
++from keystoneauth1 import loading
++from keystoneauth1 import service_token
++import requests
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova import conf
++from nova import exception
++from nova import objects
++from nova.volume import cinder
++
++CAPABILITIES = (
++    'native_snapshot',
++    'arbitrary_inplace_revert',
++    'preserves_other_checkpoints',
++    'independent_snapshot_delete',
++    'operation_reconciliation',
++)
++OP_STATES = (
++    'reserved',
++    'running',
++    'succeeded',
++    'failed',
++    'recovery_required',
++    'released',
++)
++STEP_STATES = (
++    'prepared',
++    'dispatching',
++    'pending',
++    'succeeded',
++    'failed_no_effect',
++    'unknown',
++)
++
++
++def checked(method):
++    @functools.wraps(method)
++    def wrapped(*args, **kwargs):
++        try:
++            return method(*args, **kwargs)
++        except (
++            ValueError,
++            KeyError,
++            TypeError,
++            AttributeError,
++            StopIteration,
++        ):
++            raise exception.CheckpointConflict(
++                reason='identity_changed'
++            ) from None
++        except (ks_exc.ClientException, requests.RequestException):
++            raise exception.CheckpointUnavailable() from None
++
++    return wrapped
++
++
++def _service_auth():
++    c._require(conf.CONF.service_user.send_service_user_token)
++    auth = loading.load_auth_from_conf_options(conf.CONF, 'service_user')
++    c._require(auth is not None)
++    return auth
++
++
++def reserve_payload(operation):
++    """Exact C1.1 request body; the parent journal persists it before HTTP."""
++    return v2.cinder_reserve_payload(operation)
++
++
++def reserve_intent(context, operation_id):
++    steps = objects.InstanceCheckpointStepList.get_by_operation(
++        context, operation_id
++    )
++    parent = next(s for s in steps if s.phase == 'cinder_reserve')
++    children = objects.CheckpointEffect.get_children(context, parent.uuid)
++    c._require(
++        len(children) == 1 and
++        children[0]['action'] == 'reserve' and
++        children[0]['operation_id'] == operation_id and
++        parent.contract_version == 2 and
++        parent.generation == 1 and
++        parent.payload_hash == c.canonical_payload_hash(parent.payload)
++    )
++    result = children[0]['result']
++    accepted_id = (
++        result['evidence']['operation_id']
++        if result and result['status'] == 'succeeded'
++        else None
++    )
++    return dict(
++        body=parent.payload['resources']['cinder_reserve'],
++        status=children[0]['status'],
++        cinder_operation_id=accepted_id,
++    )
++
++
++def _error(value):
++    c._require(
++        value is None or
++        type(value) is str and
++        re.fullmatch('[a-z][a-z0-9_]{0,63}', value) is not None
++    )
++
++
++def validate_capabilities(value):
++    c._keys(
++        value,
++        set(CAPABILITIES) |
++        {
++            'contract_version',
++            'supported',
++            'snapshot_semantics',
++            'consistent_group_snapshot',
++            'driver_identity',
++            'unsupported_reasons',
++        },
++    )
++    c._integer(value['contract_version'], minimum=1, maximum=1)
++    c._require(
++        value['supported'] is True and
++        all(value[k] is True for k in CAPABILITIES) and
++        value['snapshot_semantics'] in ('cow', 'row') and
++        type(value['consistent_group_snapshot']) is bool and
++        value['unsupported_reasons'] == []
++    )
++    identity = value['driver_identity']
++    c._keys(identity, ('driver_class', 'driver_version', 'profile'))
++    for field in identity.values():
++        c._string(field)
++    return value
++
++
++class CheckpointClient:
++    def __init__(
++        self,
++        session=None,
++        service_auth_factory=None,
++        operation_loader=None,
++        intent_loader=None,
++    ):
++        if session is None:
++            cinder._load_session()
++            session = cinder._SESSION
++        self.session = session
++        self.service_auth_factory = service_auth_factory or _service_auth
++        self.operation_loader = (
++            operation_loader or
++            objects.InstanceCheckpointOperation.get_by_uuid
++        )
++        self.intent_loader = intent_loader or reserve_intent
++
++    def _operation(self, context, operation_id):
++        c._uuid(operation_id)
++        op = self.operation_loader(context, operation_id)
++        c._require(
++            op.uuid == operation_id and
++            op.contract_version == 2 and
++            op.generation == 1
++        )
++        return op
++
++    def _auth(self, context, user=False):
++        service = self.service_auth_factory()
++        ident = service.get_user_id(self.session)
++        c._string(ident)
++        if user:
++            c._require(
++                bool(context.auth_token) and
++                bool(context.user_id) and
++                bool(context.project_id)
++            )
++            auth = service_token.ServiceTokenAuthWrapper(
++                user_auth=context.get_auth_plugin(), service_auth=service
++            )
++        else:
++            auth = service
++        return auth, ident
++
++    def _endpoint(self, auth):
++        service_type, name, interface = (
++            conf.CONF.cinder.catalog_info.split(':')
++        )
++        filters = dict(
++            service_type=service_type,
++            interface=interface,
++            region_name=conf.CONF.cinder.os_region_name,
++        )
++        if name:
++            filters['service_name'] = name
++        template = conf.CONF.cinder.endpoint_template
++        if template:
++            # Substitute only the authenticated principal's project, never
++            # impersonate the original owner with a fabricated context.
++            project = auth.get_project_id(self.session)
++            c._string(project)
++            endpoint = template % {
++                'project_id': project,
++                'tenant_id': project,
++            }
++        else:
++            endpoint = self.session.get_endpoint(auth=auth, **filters)
++        c._require(type(endpoint) is str)
++        url = parse.urlsplit(endpoint)
++        c._require(
++            url.scheme in ('https', 'http') and
++            bool(url.netloc) and
++            not url.username and
++            not url.password and
++            not url.query and
++            not url.fragment
++        )
++        # Cinder exposes both unscoped and legacy project-prefixed routes.
++        # Use its unscoped v3 route even with a service-project catalog URL.
++        match = re.fullmatch(r'(.*?/v3)(?:/[^/]+)?/?', url.path)
++        c._require(match is not None)
++        return parse.urlunsplit((url.scheme, url.netloc, match[1], '', ''))
++
++    def _fetch(self, context, method, path, field, body=None, user=False):
++        auth, identity = self._auth(context, user=user)
++        response = self.session.request(
++            self._endpoint(auth) + path,
++            method,
++            json=body,
++            auth=auth,
++            headers={'OpenStack-API-Version': 'volume 3.73'},
++            raise_exc=False,
++            redirect=False,
++            log=False,
++            allow_reauth=method == 'GET' and not user,
++            connect_retries=0,
++            status_code_retries=0,
++            timeout=self.session.timeout or 60,
++        )
++        if response.status_code in (401, 403, 404, 409):
++            raise exception.CheckpointConflict(reason='recovery_required')
++        if response.status_code == 406:
++            raise exception.CheckpointNotSupported(
++                reason='incompatible_service'
++            )
++        if response.status_code != (200 if method == 'GET' else 202):
++            raise exception.CheckpointUnavailable()
++        c._require(
++            response.headers.get('OpenStack-API-Version') == 'volume 3.73'
++        )
++        c._require(len(response.content) <= 2 * 1024 * 1024)
++        value = response.json()
++        c._keys(value, (field,))
++        c._require(type(value[field]) is dict)
++        return value[field], identity
++
++    def _validate_operation(self, context, value, operation, identity):
++        c._keys(
++            value,
++            (
++                'id',
++                'request_id',
++                'checkpoint_id',
++                'instance_uuid',
++                'kind',
++                'generation',
++                'status',
++                'release_outcome',
++                'error_code',
++                'resources',
++                'steps',
++                'continuation',
++            ),
++        )
++        c._uuid(value['id'])
++        accepted = self.intent_loader(context, operation.uuid).get(
++            'cinder_operation_id'
++        )
++        c._require(accepted is None or value['id'] == accepted)
++        for field in (
++            'request_id',
++            'checkpoint_id',
++            'instance_uuid',
++            'kind',
++        ):
++            c._require(value[field] == getattr(operation, field))
++        c._integer(value['generation'], minimum=1, maximum=1)
++        c._require(
++            value['status'] in OP_STATES and
++            value['release_outcome'] in (None, 'commit', 'abort')
++        )
++        _error(value['error_code'])
++        scope = value['continuation']
++        c._keys(
++            scope,
++            (
++                'version',
++                'nova_operation_id',
++                'owner_project_id',
++                'actor_user_id',
++                'executor_service_user_id',
++                'generation',
++            ),
++        )
++        c._integer(scope['version'], minimum=1, maximum=1)
++        c._integer(scope['generation'], minimum=1, maximum=1)
++        c._require(
++            scope['nova_operation_id'] == operation.uuid and
++            scope['owner_project_id'] == operation.project_id and
++            scope['actor_user_id'] == operation.actor_user_id and
++            scope['executor_service_user_id'] == identity
++        )
++        c._require(
++            type(value['resources']) is list and
++            type(value['steps']) is list
++        )
++        volumes, resources, snapshots = [], [], []
++        for row in value['resources']:
++            c._keys(
++                row,
++                (
++                    'id',
++                    'volume_id',
++                    'snapshot_id',
++                    'volume_size',
++                    'status',
++                ),
++            )
++            for field in ('id', 'volume_id', 'snapshot_id'):
++                c._uuid(row[field])
++            c._integer(row['volume_size'], minimum=1)
++            c._require(
++                row['status'] in ('creating', 'available', 'deleted')
++            )
++            volumes.append(row['volume_id'])
++            resources.append(row['id'])
++            snapshots.append(row['snapshot_id'])
++        expected = reserve_payload(operation)['volume_ids']
++        c._require(
++            sorted(volumes) == expected and
++            len(set(resources)) == len(resources) and
++            len(set(snapshots)) == len(snapshots)
++        )
++        steps = []
++        covered = set()
++        for row in value['steps']:
++            c._keys(
++                row,
++                (
++                    'id',
++                    'resource_id',
++                    'phase',
++                    'generation',
++                    'status',
++                    'error_code',
++                ),
++            )
++            c._uuid(row['id'])
++            c._require(
++                row['resource_id'] in resources and
++                row['phase']
++                in ('snapshot', 'revert', 'delete_snapshot') and
++                row['status'] in STEP_STATES
++            )
++            c._integer(row['generation'], minimum=1, maximum=1)
++            _error(row['error_code'])
++            steps.append(row['id'])
++            covered.add(row['resource_id'])
++        c._require(
++            len(set(steps)) == len(steps) and covered == set(resources)
++        )
++        return value
++
++    @checked
++    def reserve(
++        self,
++        context,
++        nova_operation_id,
++        checkpoint_id,
++        instance_uuid,
++        kind,
++        volume_ids,
++    ):
++        op = self._operation(context, nova_operation_id)
++        c._require(
++            context.user_id == op.actor_user_id and
++            context.project_id == op.project_id and
++            bool(context.auth_token) and
++            op.quota_ready and
++            (checkpoint_id, instance_uuid, kind) ==
++            (op.checkpoint_id, op.instance_uuid, op.kind)
++        )
++        expected = reserve_payload(op)
++        c._ids(volume_ids, nonempty=True)
++        c._require(sorted(volume_ids) == expected['volume_ids'])
++        stored = self.intent_loader(context, op.uuid)
++        c._require(
++            stored['body'] == expected and
++            stored['status'] in ('dispatching', 'pending', 'unknown')
++        )
++        value, identity = self._fetch(
++            context,
++            'POST',
++            '/checkpoint-operations',
++            'checkpoint_operation',
++            {'checkpoint_operation': stored['body']},
++            user=True,
++        )
++        return self._validate_operation(context, value, op, identity)
++
++    @checked
++    def get(self, context, nova_operation_id):
++        op = self._operation(context, nova_operation_id)
++        value, identity = self._fetch(
++            context,
++            'GET',
++            '/checkpoint-service-operations/' + op.uuid,
++            'checkpoint_operation',
++        )
++        return self._validate_operation(context, value, op, identity)
++
++    @checked
++    def action(
++        self, context, nova_operation_id, name, generation, outcome=None
++    ):
++        op = self._operation(context, nova_operation_id)
++        c._integer(generation, minimum=1, maximum=1)
++        c._require(name in ('execute', 'reconcile', 'cleanup', 'release'))
++        args = dict(generation=generation)
++        if name == 'release':
++            c._require(outcome in ('commit', 'abort'))
++            args['outcome'] = outcome
++        else:
++            c._require(outcome is None)
++        value, identity = self._fetch(
++            context,
++            'POST',
++            '/checkpoint-service-operations/' + op.uuid + '/action',
++            'checkpoint_operation',
++            {name: args},
++        )
++        return self._validate_operation(context, value, op, identity)
++
++    @checked
++    def capabilities(self, context, nova_operation_id, volume_id):
++        op = self._operation(context, nova_operation_id)
++        c._uuid(volume_id)
++        c._require(volume_id in reserve_payload(op)['volume_ids'])
++        value, unused = self._fetch(
++            context,
++            'GET',
++            '/checkpoint-service-operations/' +
++            op.uuid +
++            '/volumes/' +
++            volume_id +
++            '/capabilities',
++            'checkpoint_capabilities',
++        )
++        return validate_capabilities(value)
++
++    @checked
++    def preflight_capabilities(self, context, volume_ids):
++        c._ids(volume_ids, nonempty=True)
++        result = {}
++        for ident in volume_ids:
++            value, unused = self._fetch(
++                context,
++                'GET',
++                '/volumes/' + ident + '/checkpoint-capabilities',
++                'checkpoint_capabilities',
++                user=True,
++            )
++            result[ident] = validate_capabilities(value)
++        return result
++
++    @checked
++    def preflight_resources(self, context, volume_ids, snapshot_ids):
++        c._ids(volume_ids, nonempty=True)
++        c._ids(snapshot_ids)
++        result = {'volumes': {}, 'snapshots': {}}
++        for kind, ids in (
++            ('volume', volume_ids),
++            ('snapshot', snapshot_ids),
++        ):
++            for ident in ids:
++                value, unused = self._fetch(
++                    context,
++                    'GET',
++                    '/' + kind + 's/' + ident,
++                    kind,
++                    user=True,
++                )
++                c._require(value['id'] == ident)
++                if kind == 'volume':
++                    keys = (
++                        'id',
++                        'status',
++                        'size',
++                        'attachments',
++                        'encrypted',
++                        'multiattach',
++                    )
++                else:
++                    c._require(value['volume_id'] in volume_ids)
++                    keys = ('id', 'volume_id', 'status', 'size')
++                result[kind + 's'][ident] = {k: value[k] for k in keys}
++        return result
++
++    @staticmethod
++    def _attachment(
++        value, op, child_id, cinder_operation_id, request=None
++    ):
++        c._keys(
++            value,
++            (
++                'id',
++                'operation_id',
++                'generation',
++                'volume_id',
++                'action',
++                'status',
++                'attachment_id',
++                'error_code',
++            ),
++        )
++        c._require(value['operation_id'] == cinder_operation_id)
++        c._require(
++            value['id'] == child_id and
++            value['volume_id'] in reserve_payload(op)['volume_ids'] and
++            value['action']
++            in ('create', 'update', 'complete', 'delete') and
++            value['status'] in STEP_STATES
++        )
++        c._integer(value['generation'], minimum=1, maximum=1)
++        if (
++            value['attachment_id'] is not None or
++            value['status'] == 'succeeded'
++        ):
++            c._uuid(value['attachment_id'])
++        _error(value['error_code'])
++        if request:
++            c._require(
++                value['action'] == request['action'] and
++                value['volume_id'] == request['volume_id']
++            )
++            if request['action'] != 'create':
++                c._require(
++                    value['attachment_id'] == request['attachment_id']
++                )
++        return value
++
++    @checked
++    def submit_attachment(self, context, nova_operation_id, request):
++        op = self._operation(context, nova_operation_id)
++        c._keys(
++            request,
++            (
++                'id',
++                'generation',
++                'volume_id',
++                'action',
++                'attachment_id',
++                'connector',
++                'mountpoint',
++            ),
++        )
++        c._uuid(request['id'])
++        c._integer(request['generation'], minimum=1, maximum=1)
++        c._require(
++            op.kind == 'revert' and
++            request['volume_id'] in reserve_payload(op)['volume_ids']
++        )
++        c._require(
++            request['action'] in ('create', 'update', 'complete', 'delete')
++        )
++        if request['action'] == 'create':
++            c._require(
++                all(
++                    request[k] is None
++                    for k in ('attachment_id', 'connector', 'mountpoint')
++                )
++            )
++        else:
++            c._uuid(request['attachment_id'])
++            if request['action'] == 'update':
++                c._require(type(request['connector']) is dict)
++            else:
++                c._require(
++                    request['connector'] is None and
++                    request['mountpoint'] is None
++                )
++        grant = self.get(context, nova_operation_id)
++        value, unused = self._fetch(
++            context,
++            'POST',
++            '/checkpoint-service-operations/' +
++            op.uuid +
++            '/attachment-requests',
++            'attachment_request',
++            {'attachment_request': request},
++        )
++        return self._attachment(
++            value, op, request['id'], grant['id'], request
++        )
++
++    @checked
++    def get_attachment_request(self, context, nova_operation_id, child_id):
++        op = self._operation(context, nova_operation_id)
++        c._uuid(child_id)
++        grant = self.get(context, nova_operation_id)
++        value, unused = self._fetch(
++            context,
++            'GET',
++            '/checkpoint-service-operations/' +
++            op.uuid +
++            '/attachment-requests/' +
++            child_id,
++            'attachment_request',
++        )
++        return self._attachment(value, op, child_id, grant['id'])
++
++    @checked
++    def get_attachment(self, context, nova_operation_id, attachment_id):
++        op = self._operation(context, nova_operation_id)
++        c._uuid(attachment_id)
++        value, unused = self._fetch(
++            context,
++            'GET',
++            '/checkpoint-service-operations/' +
++            op.uuid +
++            '/attachments/' +
++            attachment_id,
++            'attachment',
++        )
++        c._keys(
++            value,
++            (
++                'id',
++                'volume_id',
++                'instance',
++                'status',
++                'attach_mode',
++                'attached_at',
++                'detached_at',
++                'connection_info',
++            ),
++        )
++        c._require(
++            value['id'] == attachment_id and
++            value['instance'] == op.instance_uuid and
++            value['volume_id'] in reserve_payload(op)['volume_ids'] and
++            (
++                value['connection_info'] is None or
++                type(value['connection_info']) is dict
++            )
++        )
++        return value

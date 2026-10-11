@@ -1,0 +1,1591 @@
+From 5050499a992e96255d455dbc53306572c3ea6878 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 11:08:46 +0300
+Subject: [PATCH 05/10] feat: add gated checkpoint RPC and durable execution
+ engine
+
+---
+ nova/checkpoints/compute.py                   | 241 ++++++++++
+ nova/checkpoints/coordinator.py               | 103 ++++
+ nova/checkpoints/workflow.py                  |  69 ++-
+ nova/compute/manager.py                       |  18 +-
+ nova/compute/rpcapi.py                        |  23 +
+ nova/conductor/api.py                         |   8 +
+ nova/conductor/manager.py                     |  11 +-
+ nova/conductor/rpcapi.py                      |  16 +
+ nova/db/main/checkpoints.py                   |  43 +-
+ nova/objects/service.py                       |   4 +-
+ nova/tests/unit/checkpoints/fake_executor.py  | 223 +++++++++
+ nova/tests/unit/checkpoints/test_execution.py | 440 ++++++++++++++++++
+ nova/tests/unit/checkpoints/test_rpc.py       | 103 ++++
+ nova/virt/driver.py                           |  14 +
+ 14 files changed, 1291 insertions(+), 25 deletions(-)
+ create mode 100644 nova/checkpoints/compute.py
+ create mode 100644 nova/checkpoints/coordinator.py
+ create mode 100644 nova/tests/unit/checkpoints/fake_executor.py
+ create mode 100644 nova/tests/unit/checkpoints/test_execution.py
+ create mode 100644 nova/tests/unit/checkpoints/test_rpc.py
+
+diff --git a/nova/checkpoints/compute.py b/nova/checkpoints/compute.py
+new file mode 100644
+index 0000000..c180302
+--- /dev/null
++++ b/nova/checkpoints/compute.py
+@@ -0,0 +1,241 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Compute journal consumer using remotable Nova objects for persistence."""
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import guards
++from nova.checkpoints import workflow
++from nova import conf
++from nova import exception
++from nova import objects
++
++
++class ComputeExecutor:
++    def __init__(self, driver, host):
++        self.driver = driver
++        self.host = host
++
++    def probe(self, context, instance, manifest, existing=False):
++        if not existing and not conf.CONF.checkpoint.enabled:
++            return c.unsupported('disabled')
++        if instance.host != self.host or manifest.get('host') != self.host:
++            return c.unsupported('identity_changed')
++        try:
++            value = self.driver.checkpoint_probe(context, instance, manifest)
++            probe = c.validate_probe(value)
++            if probe.supported and (
++                probe.fingerprint != c.device_fingerprint(manifest) or
++                probe.executor_profile != c.PROFILE or
++                probe.device_manifest['node'] != instance.node
++            ):
++                return c.unsupported('identity_changed')
++            return probe
++        except Exception:
++            return c.unsupported('executor_unavailable')
++
++    def _load(self, context, instance, operation_id, generation):
++        operation = objects.InstanceCheckpointOperation.get_by_uuid(
++            context, operation_id
++        )
++        if (
++            type(generation) is not int or
++            generation != 1 or
++            operation.generation != generation or
++            instance.uuid != operation.instance_uuid or
++            operation.host != self.host or
++            instance.host != self.host or
++            instance.node != operation.node
++        ):
++            raise exception.CheckpointConflict(reason='identity_changed')
++        current = objects.Instance.get_by_uuid(context, instance.uuid)
++        if (current.host, current.node) != (operation.host, operation.node):
++            raise exception.CheckpointConflict(reason='identity_changed')
++        if operation.state in ('succeeded', 'released'):
++            return operation, current
++        if not operation.quota_ready:
++            raise exception.CheckpointConflict()
++        manifest = objects.InstanceCheckpointOperation.device_manifest(
++            context, instance.uuid
++        )
++        if (
++            c.device_fingerprint(manifest) !=
++            operation.admission['fingerprint']
++        ):
++            raise exception.CheckpointConflict(reason='identity_changed')
++        probe = self.probe(context, current, manifest, existing=True)
++        if not probe.supported:
++            raise exception.CheckpointNotSupported(reason=probe.reasons[0])
++        if probe.executor_id != operation.executor_id:
++            raise exception.CheckpointConflict(reason='identity_changed')
++        return operation, current
++
++    @staticmethod
++    def _intent(step):
++        return c.StepIntent(
++            step.uuid,
++            step.operation_id,
++            step.generation,
++            step.phase,
++            step.executor_id,
++            step.payload_hash,
++            step.payload,
++        )
++
++    def _effect(self, context, instance, operation, intent, query=False):
++        guard = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++            context, instance.uuid
++        )
++        value = c.Scope(
++            instance.uuid,
++            'checkpoint',
++            operation.uuid,
++            operation.generation,
++            intent.phase,
++            guard.token,
++        )
++        try:
++            with guards.scope(context, value) as ctx:
++                with guards._bound_objects(instance, ctx):
++                    method = (
++                        self.driver.checkpoint_query
++                        if query
++                        else self.driver.checkpoint_execute
++                    )
++                    result = c.validate_result(
++                        intent.phase,
++                        method(ctx, instance, intent.to_primitive()),
++                    )
++        except Exception:
++            # A thrown exception after durable claim is never no-effect proof.
++            result = c.StepResult('unknown', {}, 'executor_unavailable')
++        objects.InstanceCheckpointOperation.finish_step(
++            context, intent.id, operation.generation, result.to_primitive()
++        )
++        return objects.InstanceCheckpointStep.get_by_uuid(context, intent.id)
++
++    @staticmethod
++    def _report(operation):
++        return dict(
++            schema_version=1,
++            operation_id=operation.uuid,
++            generation=operation.generation,
++            state=operation.state,
++            phase=operation.phase,
++            error_code=operation.error_code,
++        )
++
++    def _advance(
++        self, context, instance, operation_id, generation, query_only
++    ):
++        operation, current = self._load(
++            context, instance, operation_id, generation
++        )
++        if operation.state in ('succeeded', 'released'):
++            return self._report(operation)
++        operation_obj = objects.InstanceCheckpointOperation
++        step_list = objects.InstanceCheckpointStepList
++        # One normal pass and, only after a proven create failure, cleanup.
++        for attempt in range(2):
++            steps = {
++                step.phase: step
++                for step in step_list.get_by_operation(
++                    context, operation_id
++                )
++            }
++            phases, cleaning = workflow.execution_plan(
++                operation.kind,
++                {name: step.status for name, step in steps.items()},
++            )
++            for phase in phases:
++                step = steps.get(phase)
++                if step and step.status == 'succeeded':
++                    if phase == 'artifact_publish':
++                        operation_obj.confirm_artifact_usage(
++                            context, operation_id, step.result['evidence']
++                        )
++                    continue
++                if step and step.status == 'failed_no_effect':
++                    break
++                if step is None:
++                    if query_only:
++                        break
++                    primitive = operation_obj.claim_step(
++                        context,
++                        operation_id,
++                        generation,
++                        phase,
++                        operation.executor_id,
++                    )
++                    if primitive is not None:
++                        intent = c.StepIntent.from_primitive(primitive)
++                        step = self._effect(
++                            context, current, operation, intent
++                        )
++                    else:
++                        # Another request claimed it. Only query that intent.
++                        concurrent = step_list.get_by_operation(
++                            context, operation_id
++                        )
++                        step = next(
++                            item for item in concurrent if item.phase == phase
++                        )
++                        if step.status in (
++                            'dispatching',
++                            'pending',
++                            'unknown',
++                        ):
++                            step = self._effect(
++                                context,
++                                current,
++                                operation,
++                                self._intent(step),
++                                query=True,
++                            )
++                else:
++                    step = self._effect(
++                        context,
++                        current,
++                        operation,
++                        self._intent(step),
++                        query=True,
++                    )
++                if step.status != 'succeeded':
++                    break
++                if phase == 'artifact_publish':
++                    operation_obj.confirm_artifact_usage(
++                        context, operation_id, step.result['evidence']
++                    )
++            else:
++                operation_obj.finalize(
++                    context, operation_id, generation, 'succeeded'
++                )
++                break
++            if (
++                cleaning or
++                query_only or
++                operation.kind != 'create' or
++                step is None or
++                step.status != 'failed_no_effect'
++            ):
++                break
++        return self._report(
++            operation_obj.get_by_uuid(
++                context, operation_id
++            )
++        )
++
++    def execute(self, context, instance, operation_id, generation):
++        self._advance(context, instance, operation_id, generation, False)
++
++    def query(self, context, instance, operation_id, generation):
++        return self._advance(context, instance, operation_id, generation, True)
+diff --git a/nova/checkpoints/coordinator.py b/nova/checkpoints/coordinator.py
+new file mode 100644
+index 0000000..d4d27d7
+--- /dev/null
++++ b/nova/checkpoints/coordinator.py
+@@ -0,0 +1,103 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Conductor coordination; cell/RPC/API DB transitions are separate calls."""
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import quota
++from nova.compute import rpcapi
++from nova import conf
++from nova import context as nova_context
++from nova import exception
++from nova import objects
++
++
++class Coordinator:
++    def __init__(self, compute_rpc=None, ledger=None):
++        self.compute_rpc = compute_rpc or rpcapi.ComputeAPI()
++        self.ledger = ledger or quota.QuotaLedger()
++
++    @staticmethod
++    def _cell(context, instance_uuid):
++        mapping = objects.InstanceMapping.get_by_instance_uuid(
++            context, instance_uuid
++        )
++        if mapping.cell_mapping is None or mapping.cell_mapping.is_cell0():
++            raise exception.CheckpointUnavailable(reason='cell_unavailable')
++        return mapping.cell_mapping
++
++    def probe(self, context, instance_uuid):
++        if not conf.CONF.checkpoint.enabled:
++            return c.unsupported('disabled')
++        try:
++            cell = self._cell(context, instance_uuid)
++            with nova_context.target_cell(context, cell) as ctx:
++                instance = objects.Instance.get_by_uuid(ctx, instance_uuid)
++                service = objects.Service.get_by_host_and_binary(
++                    ctx, instance.host, 'nova-compute'
++                )
++                if service.version < 69:
++                    return c.unsupported('incompatible_service')
++                manifest = objects.InstanceCheckpointOperation.device_manifest(
++                    ctx, instance_uuid
++                )
++                # A supported version cap is not a positive live probe.
++                probe = c.validate_probe(
++                    self.compute_rpc.checkpoint_probe(ctx, instance, manifest)
++                )
++                if probe.supported and probe.fingerprint != (
++                    c.device_fingerprint(manifest)
++                ):
++                    return c.unsupported('identity_changed')
++                return probe
++        except exception.CheckpointNotSupported:
++            return c.unsupported('incompatible_service')
++        except exception.CheckpointUnavailable:
++            return c.unsupported('cell_unavailable')
++        except Exception:
++            return c.unsupported('executor_unavailable')
++
++    def run(self, context, instance_uuid, operation_id, generation):
++        cell = self._cell(context, instance_uuid)
++        with nova_context.target_cell(context, cell) as ctx:
++            operation = objects.InstanceCheckpointOperation.get_by_uuid(
++                ctx, operation_id
++            )
++            if (
++                operation.instance_uuid != instance_uuid or
++                operation.cell_uuid != cell.uuid
++            ):
++                raise exception.CheckpointConflict(reason='identity_changed')
++            instance = objects.Instance.get_by_uuid(ctx, instance_uuid)
++            self.compute_rpc.checkpoint_execute(
++                ctx, instance, operation_id, generation
++            )
++            operation = objects.InstanceCheckpointOperation.get_by_uuid(
++                ctx, operation_id
++            )
++            checkpoint = objects.InstanceCheckpoint.get_by_uuid(
++                ctx, operation.checkpoint_id
++            )
++            proof = objects.InstanceCheckpointOperation.close_proof(
++                ctx, checkpoint.create_operation_id
++            )
++        if proof:
++            self.ledger.release(context, operation.quota_ticket_id)
++            with nova_context.target_cell(context, cell) as ctx:
++                objects.InstanceCheckpointOperation.mark_quota_released(
++                    ctx, operation_id, operation.quota_ticket_id
++                )
++                objects.InstanceCheckpointOperation.finalize(
++                    ctx, operation_id, generation, 'succeeded'
++                )
++        elif operation.kind == 'create' and operation.state == 'succeeded':
++            self.ledger.settle(context, operation.quota_ticket_id)
+diff --git a/nova/checkpoints/workflow.py b/nova/checkpoints/workflow.py
+index 24a4654..c47129d 100644
+--- a/nova/checkpoints/workflow.py
++++ b/nova/checkpoints/workflow.py
+@@ -13,17 +13,37 @@
+ """Allowed effects, excluding local journal and quota transitions."""
+ 
+ _STEPS = {
+-    'create': ('preflight', 'cinder_reserve', 'runtime_save', 'disk_snapshot',
+-               'artifact_publish', 'runtime_restore_current',
+-               'cinder_release'),
+-    'revert': ('preflight', 'cinder_reserve', 'runtime_stop',
+-               'volume_disconnect',
+-               'disk_revert', 'volume_reconnect', 'runtime_restore_checkpoint',
+-               'cinder_release'),
+-    'delete': ('cinder_reserve', 'disk_snapshot_delete', 'artifact_delete',
+-               'cinder_release'),
+-    'cleanup': ('cleanup_runtime_restore_current', 'cleanup_disk_snapshots',
+-                'cleanup_artifacts', 'cleanup_cinder_release'),
++    'create': (
++        'preflight',
++        'cinder_reserve',
++        'runtime_save',
++        'disk_snapshot',
++        'artifact_publish',
++        'runtime_restore_current',
++        'cinder_release',
++    ),
++    'revert': (
++        'preflight',
++        'cinder_reserve',
++        'runtime_stop',
++        'volume_disconnect',
++        'disk_revert',
++        'volume_reconnect',
++        'runtime_restore_checkpoint',
++        'cinder_release',
++    ),
++    'delete': (
++        'cinder_reserve',
++        'disk_snapshot_delete',
++        'artifact_delete',
++        'cinder_release',
++    ),
++    'cleanup': (
++        'cleanup_runtime_restore_current',
++        'cleanup_disk_snapshots',
++        'cleanup_artifacts',
++        'cleanup_cinder_release',
++    ),
+ }
+ PHASES = frozenset(phase for steps in _STEPS.values() for phase in steps)
+ 
+@@ -33,3 +53,30 @@ def steps_for(kind):
+         return _STEPS[kind]
+     except (KeyError, TypeError):
+         raise ValueError('Invalid checkpoint operation kind') from None
++
++
++def execution_plan(kind, statuses):
++    """Derive cleanup only from terminal, late-effect-fenced create results."""
++    normal = steps_for(kind)
++    failed = any(statuses.get(p) == 'failed_no_effect' for p in normal)
++    unresolved = any(
++        statuses[p] not in ('succeeded', 'failed_no_effect')
++        for p in normal
++        if p in statuses
++    )
++    if kind != 'create' or not failed or unresolved:
++        return normal, False
++
++    def succeeded(phase):
++        return statuses.get(phase) == 'succeeded'
++
++    cleanup = []
++    if succeeded('runtime_save') and not succeeded('runtime_restore_current'):
++        cleanup.append('cleanup_runtime_restore_current')
++    if succeeded('disk_snapshot'):
++        cleanup.append('cleanup_disk_snapshots')
++    if succeeded('runtime_save'):
++        cleanup.append('cleanup_artifacts')
++    if succeeded('cinder_reserve') and not succeeded('cinder_release'):
++        cleanup.append('cleanup_cinder_release')
++    return tuple(cleanup), True
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 2c789e8..839b85d 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -59,6 +59,7 @@ from oslo_utils import units
+ 
+ from nova.accelerator import cyborg
+ from nova import block_device
++from nova.checkpoints import compute as checkpoint_compute
+ from nova.checkpoints import guards
+ from nova.compute import api as compute
+ from nova.compute import build_results
+@@ -621,7 +622,7 @@ class ComputeVirtAPI(virtapi.VirtAPI):
+ class ComputeManager(manager.Manager):
+     """Manages the running instances from creation to destruction."""
+ 
+-    target = messaging.Target(version='6.4')
++    target = messaging.Target(version='6.5')
+ 
+     def __init__(self, compute_driver=None, *args, **kwargs):
+         """Load configuration options and connect to the hypervisor."""
+@@ -12276,6 +12277,21 @@ class ComputeManager(manager.Manager):
+                       "%(profile)s", {'port_id': port_id,
+                                       'profile': profile})
+ 
++    def checkpoint_probe(self, context, instance, manifest):
++        return checkpoint_compute.ComputeExecutor(
++            self.driver, host=self.host).probe(
++                context, instance, manifest).to_primitive()
++
++    def checkpoint_execute(self, context, instance, operation_id, generation):
++        checkpoint_compute.ComputeExecutor(
++            self.driver, host=self.host).execute(
++                context, instance, operation_id, generation)
++
++    def checkpoint_query(self, context, instance, operation_id, generation):
++        return checkpoint_compute.ComputeExecutor(
++            self.driver, host=self.host).query(
++                context, instance, operation_id, generation)
++
+ 
+ # TODO(sbauza): Remove this proxy class in the X release once we drop the 5.x
+ # support.
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index 5c9d8aa..18db153 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -407,6 +407,7 @@ class ComputeAPI(object):
+         * 6.2 - Add target_state parameter to rebuild_instance()
+         * 6.3 - Add delete_attachment parameter to remove_volume_connection
+         * 6.4 - Add allow_share() and deny_share()
++        * 6.5 - Add private checkpoint probe, execute and query
+     '''
+ 
+     VERSION_ALIASES = {
+@@ -1585,3 +1586,25 @@ class ComputeAPI(object):
+                                call_monitor_timeout=CONF.rpc_response_timeout,
+                                timeout=CONF.long_rpc_timeout)
+         return cctxt.call(ctxt, 'cache_images', image_ids=image_ids)
++
++    def _checkpoint_client(self, context, instance):
++        client = self.router.client(context)
++        if not client.can_send_version('6.5'):
++            raise exception.CheckpointNotSupported(
++                reason='incompatible_service')
++        return client.prepare(server=_compute_host(None, instance),
++                              version='6.5')
++
++    def checkpoint_probe(self, context, instance, manifest):
++        return self._checkpoint_client(context, instance).call(
++            context, 'checkpoint_probe', instance=instance, manifest=manifest)
++
++    def checkpoint_execute(self, context, instance, operation_id, generation):
++        return self._checkpoint_client(context, instance).call(
++            context, 'checkpoint_execute', instance=instance,
++            operation_id=operation_id, generation=generation)
++
++    def checkpoint_query(self, context, instance, operation_id, generation):
++        return self._checkpoint_client(context, instance).call(
++            context, 'checkpoint_query', instance=instance,
++            operation_id=operation_id, generation=generation)
+diff --git a/nova/conductor/api.py b/nova/conductor/api.py
+index 843c8ce..0aada3e 100644
+--- a/nova/conductor/api.py
++++ b/nova/conductor/api.py
+@@ -188,3 +188,11 @@ class ComputeTaskAPI(object):
+             self, ctxt, instance, migration):
+         self.conductor_compute_rpcapi.revert_snapshot_based_resize(
+             ctxt, instance, migration)
++
++    def checkpoint_probe(self, context, instance_uuid):
++        return self.conductor_compute_rpcapi.checkpoint_probe(
++            context, instance_uuid)
++
++    def checkpoint_run(self, context, instance_uuid, operation_id, generation):
++        self.conductor_compute_rpcapi.checkpoint_run(
++            context, instance_uuid, operation_id, generation)
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index d72aa19..4845c51 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -35,6 +35,7 @@ from oslo_utils import versionutils
+ 
+ from nova.accelerator import cyborg
+ from nova import availability_zones
++from nova.checkpoints import coordinator as checkpoint_coordinator
+ from nova.checkpoints import guards
+ from nova.compute import instance_actions
+ from nova.compute import rpcapi as compute_rpcapi
+@@ -238,7 +239,7 @@ class ComputeTaskManager:
+     may involve coordinating activities on multiple compute nodes.
+     """
+ 
+-    target = messaging.Target(namespace='compute_task', version='1.25')
++    target = messaging.Target(namespace='compute_task', version='1.26')
+ 
+     def __init__(self):
+         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
+@@ -2233,3 +2234,11 @@ class ComputeTaskManager:
+         task = cross_cell_migrate.RevertResizeTask(
+             context, instance, migration, self.notifier, self.compute_rpcapi)
+         task.execute()
++
++    def checkpoint_probe(self, context, instance_uuid):
++        return checkpoint_coordinator.Coordinator().probe(
++            context, instance_uuid).to_primitive()
++
++    def checkpoint_run(self, context, instance_uuid, operation_id, generation):
++        checkpoint_coordinator.Coordinator().run(
++            context, instance_uuid, operation_id, generation)
+diff --git a/nova/conductor/rpcapi.py b/nova/conductor/rpcapi.py
+index 4f9efcc..ed237e1 100644
+--- a/nova/conductor/rpcapi.py
++++ b/nova/conductor/rpcapi.py
+@@ -289,6 +289,7 @@ class ComputeTaskAPI(object):
+     1.23 - Added revert_snapshot_based_resize()
+     1.24 - Add reimage_boot_volume parameter to rebuild_instance()
+     1.25 - Add target_state parameter to rebuild_instance()
++    1.26 - Add private checkpoint probe and run
+     """
+ 
+     def __init__(self):
+@@ -496,3 +497,18 @@ class ComputeTaskAPI(object):
+         kw = {'instance': instance, 'migration': migration}
+         cctxt = self.client.prepare(version=version)
+         cctxt.cast(ctxt, 'revert_snapshot_based_resize', **kw)
++
++    def _checkpoint_client(self):
++        if not self.client.can_send_version('1.26'):
++            raise exception.CheckpointNotSupported(
++                reason='incompatible_service')
++        return self.client.prepare(version='1.26')
++
++    def checkpoint_probe(self, context, instance_uuid):
++        return self._checkpoint_client().call(
++            context, 'checkpoint_probe', instance_uuid=instance_uuid)
++
++    def checkpoint_run(self, context, instance_uuid, operation_id, generation):
++        self._checkpoint_client().cast(
++            context, 'checkpoint_run', instance_uuid=instance_uuid,
++            operation_id=operation_id, generation=generation)
+diff --git a/nova/db/main/checkpoints.py b/nova/db/main/checkpoints.py
+index 08986b6..545a18a 100644
+--- a/nova/db/main/checkpoints.py
++++ b/nova/db/main/checkpoints.py
+@@ -592,10 +592,12 @@ def claim_step(context, operation_id, generation, phase, executor_id):
+         (instance.host, instance.node) != (operation.host, operation.node)
+     ):
+         _conflict()
+-    phases = workflow.steps_for(operation.kind)
++    steps = {step.phase: step for step in _steps(context, operation_id)}
++    phases, cleaning = workflow.execution_plan(
++        operation.kind, {name: step.status for name, step in steps.items()}
++    )
+     if phase not in phases:
+         _conflict()
+-    steps = {step.phase: step for step in _steps(context, operation_id)}
+     if phase in steps:
+         return None
+     if any(
+@@ -611,6 +613,10 @@ def claim_step(context, operation_id, generation, phase, executor_id):
+         host=operation.host,
+         node=operation.node,
+         fingerprint=checkpoint.fingerprint,
++        format_version=checkpoint.format_version,
++        executor_profile=c.PROFILE,
++        artifact_upper_bound=checkpoint.artifact_upper_bound,
++        artifact_budget_version=checkpoint.artifact_budget_version,
+         device_manifest=jsonutils.loads(checkpoint.device_manifest),
+         disks=[
+             {
+@@ -673,8 +679,14 @@ def _bind_result(context, checkpoint, step, result):
+         valid &= e['fingerprint'] == checkpoint.fingerprint
+     if 'host' in e:
+         valid &= (e['host'], e['node']) == (checkpoint.host, checkpoint.node)
++    snapshot_disks = [disk for disk in disks if disk.snapshot_id]
++    bound_disks = (
++        snapshot_disks if step.phase == 'cleanup_disk_snapshots' else disks
++    )
+     if 'volume_ids' in e:
+-        valid &= set(e['volume_ids']) == {disk.volume_id for disk in disks}
++        valid &= set(e['volume_ids']) == {
++            disk.volume_id for disk in bound_disks
++        }
+     if 'port_ids' in e:
+         manifest = jsonutils.loads(checkpoint.device_manifest)
+         valid &= set(e['port_ids']) == {
+@@ -683,7 +695,7 @@ def _bind_result(context, checkpoint, step, result):
+     if 'snapshots' in e and step.phase != 'disk_snapshot':
+         valid &= {
+             (item['volume_id'], item['snapshot_id']) for item in e['snapshots']
+-        } == {(disk.volume_id, disk.snapshot_id) for disk in disks}
++        } == {(disk.volume_id, disk.snapshot_id) for disk in bound_disks}
+     if 'artifact_ids' in e:
+         valid &= set(e['artifact_ids']) == {item.uuid for item in artifacts}
+     if step.phase == 'artifact_publish':
+@@ -699,7 +711,7 @@ def _bind_result(context, checkpoint, step, result):
+             checkpoint.artifact_upper_bound
+         )
+         valid &= any(a['kind'] == 'ram' for a in e['artifacts'])
+-    if step.phase == 'cinder_release':
++    if step.phase in ('cinder_release', 'cleanup_cinder_release'):
+         reserve = (
+             context.session.query(m.InstanceCheckpointStep)
+             .filter_by(operation_id=step.operation_id, phase='cinder_reserve')
+@@ -747,10 +759,10 @@ def _record_resources(context, checkpoint, step, result):
+             disk.snapshot_id = snapshots[disk.volume_id]
+             disk.cinder_operation_id = cinder_id
+             disk.state = 'available'
+-    elif step.phase == 'disk_snapshot_delete':
++    elif step.phase in ('disk_snapshot_delete', 'cleanup_disk_snapshots'):
+         for disk in _disks(context, checkpoint.uuid):
+             disk.state = 'deleted'
+-    elif step.phase == 'artifact_delete':
++    elif step.phase in ('artifact_delete', 'cleanup_artifacts'):
+         for item in _artifacts(context, checkpoint.uuid):
+             item.state = 'deleted'
+ 
+@@ -778,7 +790,8 @@ def finish_step(context, step_id, generation, result):
+     step.status = result.status
+     step.version += 1
+     operation.version += 1
+-    operation.error_code = result.error_code
++    if not step.phase.startswith('cleanup_') or result.error_code:
++        operation.error_code = result.error_code
+     if result.status in ('unknown', 'failed_no_effect'):
+         operation.state = 'recovery_required'
+         instance.task_state = task_states.CHECKPOINT_RECOVERING
+@@ -799,8 +812,10 @@ def finalize(context, operation_id, generation, outcome):
+     instance, guard, checkpoint, operation = _owned(
+         context, operation_id, generation
+     )
+-    phases = workflow.steps_for(operation.kind)
+     steps = {step.phase: step for step in _steps(context, operation_id)}
++    phases, cleaning = workflow.execution_plan(
++        operation.kind, {name: step.status for name, step in steps.items()}
++    )
+     # An executor's diagnostic code is not a cell cancellation proof.
+     cancelled = (
+         operation.kind == 'create' and
+@@ -814,8 +829,14 @@ def finalize(context, operation_id, generation, outcome):
+         for phase in phases
+     ):
+         _conflict('resources_remaining')
+-    closing = operation.kind == 'delete' or cancelled
++    closing = operation.kind == 'delete' or cancelled or cleaning
+     if closing:
++        if cleaning:
++            # The terminal failed_no_effect result fences a snapshot command
++            # that did not create resources; absent snapshots need no delete.
++            for disk in _disks(context, checkpoint.uuid):
++                if disk.snapshot_id is None:
++                    disk.state = 'deleted'
+         if any(
+             item.state != 'deleted'
+             for item in _disks(context, checkpoint.uuid) +
+@@ -823,7 +844,7 @@ def finalize(context, operation_id, generation, outcome):
+         ):
+             _conflict('resources_remaining')
+         checkpoint.terminal_operation_id = operation_id
+-        operation.state = 'failed' if cancelled else 'running'
++        operation.state = 'failed' if cancelled or cleaning else 'running'
+         if not operation.quota_released:
+             context.session.flush()
+             return _row(operation)
+diff --git a/nova/objects/service.py b/nova/objects/service.py
+index 6c4cca7..efd0772 100644
+--- a/nova/objects/service.py
++++ b/nova/objects/service.py
+@@ -31,7 +31,7 @@ LOG = logging.getLogger(__name__)
+ 
+ 
+ # NOTE(danms): This is the global service version counter
+-SERVICE_VERSION = 68
++SERVICE_VERSION = 69
+ 
+ 
+ # NOTE(danms): This is our SERVICE_VERSION history. The idea is that any
+@@ -237,6 +237,8 @@ SERVICE_VERSION_HISTORY = (
+     # Version 68: Compute RPC v6.4:
+     # Add support for shares
+     {'compute_rpc': '6.4'},
++    # Version 69: private checkpoint execution RPC 6.5.
++    {'compute_rpc': '6.5'},
+ )
+ 
+ # This is the version after which we can rely on having a persistent
+diff --git a/nova/tests/unit/checkpoints/fake_executor.py b/nova/tests/unit/checkpoints/fake_executor.py
+new file mode 100644
+index 0000000..075c0a9
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/fake_executor.py
+@@ -0,0 +1,223 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Test-only N2 protocol backend; no hypervisor/storage registration."""
++
++import copy
++import hashlib
++import uuid
++
++from nova.checkpoints import contracts as c
++
++
++def stable_id(owner, name):
++    return str(uuid.uuid5(uuid.UUID(owner), name))
++
++
++class FakeCheckpointDriver:
++    executor_id = 'test-executor'
++    executor_profile = c.PROFILE
++
++    def __init__(self):
++        self.executed = []
++        self.queried = []
++        self.results = {}
++        self.responses = {}
++        self.lose_reply = set()
++        self.volumes = {}
++        self.snapshots = {}
++        self.artifacts = {}
++        self.current_runtime = {}
++        self.runtime = 'initial-ram'
++        self.power_state = 'RUNNING'
++
++    def checkpoint_probe(self, context, instance, manifest):
++        return c.Probe(
++            True,
++            (),
++            self.executor_id,
++            self.executor_profile,
++            c.device_fingerprint(manifest),
++            manifest,
++            4096,
++        ).to_primitive()
++
++    def checkpoint_execute(self, context, instance, primitive):
++        intent = c.StepIntent.from_primitive(primitive)
++        assert intent.id not in self.results, 'effect executed twice'
++        self.executed.append((intent.phase, intent.id))
++        if intent.phase in self.responses:
++            result = self.responses[intent.phase]
++            if callable(result):
++                result = result(intent)
++        else:
++            result = c.StepResult('succeeded', self._effect(intent), None)
++        if isinstance(result, c.StepResult):
++            result = result.to_primitive()
++        self.results[intent.id] = copy.deepcopy(result)
++        if intent.phase in self.lose_reply:
++            self.lose_reply.remove(intent.phase)
++            raise TimeoutError('fake reply lost after effect')
++        return result
++
++    def checkpoint_query(self, context, instance, primitive):
++        intent = c.StepIntent.from_primitive(primitive)
++        self.queried.append((intent.phase, intent.id))
++        return copy.deepcopy(
++            self.results.get(
++                intent.id,
++                c.StepResult(
++                    'unknown', {}, 'executor_unavailable'
++                ).to_primitive(),
++            )
++        )
++
++    def _effect(self, intent):
++        p, phase = intent.payload, intent.phase
++        volumes = [disk['volume_id'] for disk in p['disks']]
++        fingerprint = p['fingerprint']
++        checkpoint_id = p['checkpoint_id']
++        reservation_id = stable_id(intent.operation_id, 'cinder')
++        if phase == 'preflight':
++            return dict(
++                fingerprint=fingerprint, host=p['host'], node=p['node']
++            )
++        if phase == 'cinder_reserve':
++            return dict(
++                operation_id=reservation_id,
++                generation=1,
++                volume_ids=volumes,
++                state='reserved',
++            )
++        if phase == 'runtime_save':
++            self.current_runtime[intent.operation_id] = self.runtime
++            artifact_id = stable_id(checkpoint_id, 'ram')
++            self.artifacts[artifact_id] = self.runtime
++            self.power_state = 'SHUTOFF'
++            return dict(
++                writes_stopped=True,
++                artifacts=[
++                    dict(
++                        id=artifact_id,
++                        kind='ram',
++                        logical_id=artifact_id,
++                        bytes=1024,
++                        checksum=hashlib.sha256(
++                            self.runtime.encode()
++                        ).hexdigest(),
++                    )
++                ],
++            )
++        if phase == 'disk_snapshot':
++            snapshots = []
++            for volume in volumes:
++                snapshot = stable_id(checkpoint_id, volume)
++                self.snapshots[snapshot] = self.volumes.get(volume, 'initial')
++                snapshots.append(
++                    dict(
++                        volume_id=volume,
++                        snapshot_id=snapshot,
++                        status='available',
++                    )
++                )
++            return dict(volume_ids=volumes, snapshots=snapshots)
++        if phase == 'artifact_publish':
++            return dict(
++                staging_deleted=True,
++                artifacts=[
++                    dict(
++                        id=a['uuid'],
++                        kind=a['kind'],
++                        logical_id=a['logical_id'],
++                        bytes=a['actual_bytes'],
++                        checksum=a['checksum'],
++                    )
++                    for a in p['artifacts']
++                ],
++            )
++        if phase in (
++            'runtime_restore_current',
++            'cleanup_runtime_restore_current',
++        ):
++            self.runtime = self.current_runtime[intent.operation_id]
++            self.power_state = 'RUNNING'
++            return dict(fingerprint=fingerprint, power_state='RUNNING')
++        if phase == 'runtime_stop':
++            self.power_state = 'SHUTOFF'
++            return dict(writes_stopped=True, power_state='SHUTOFF')
++        if phase == 'volume_disconnect':
++            return dict(volume_ids=volumes, disconnected_volume_ids=volumes)
++        if phase == 'disk_revert':
++            snapshots = []
++            for disk in p['disks']:
++                self.volumes[disk['volume_id']] = self.snapshots[
++                    disk['snapshot_id']
++                ]
++                snapshots.append(
++                    dict(
++                        volume_id=disk['volume_id'],
++                        snapshot_id=disk['snapshot_id'],
++                        status='reverted',
++                    )
++                )
++            return dict(volume_ids=volumes, snapshots=snapshots)
++        if phase == 'volume_reconnect':
++            return dict(
++                volume_ids=volumes,
++                port_ids=[
++                    port['uuid'] for port in p['device_manifest']['ports']
++                ],
++                attachments=[
++                    dict(
++                        volume_id=volume,
++                        attachment_id=stable_id(intent.id, volume),
++                    )
++                    for volume in volumes
++                ],
++            )
++        if phase == 'runtime_restore_checkpoint':
++            self.runtime = self.artifacts[p['artifacts'][0]['uuid']]
++            self.power_state = 'RUNNING'
++            return dict(fingerprint=fingerprint, power_state='RUNNING')
++        if phase in ('disk_snapshot_delete', 'cleanup_disk_snapshots'):
++            snapshots = []
++            for disk in p['disks']:
++                if disk['snapshot_id']:
++                    self.snapshots.pop(disk['snapshot_id'], None)
++                    snapshots.append(
++                        dict(
++                            volume_id=disk['volume_id'],
++                            snapshot_id=disk['snapshot_id'],
++                            status='deleted',
++                        )
++                    )
++            return dict(
++                volume_ids=[s['volume_id'] for s in snapshots],
++                snapshots=snapshots,
++            )
++        if phase in ('artifact_delete', 'cleanup_artifacts'):
++            ids = [a['uuid'] for a in p['artifacts']]
++            for artifact_id in ids:
++                self.artifacts.pop(artifact_id, None)
++            return dict(artifact_ids=ids, deleted_artifact_ids=ids)
++        if phase in ('cinder_release', 'cleanup_cinder_release'):
++            return dict(
++                operation_id=reservation_id,
++                generation=1,
++                state='released',
++                outcome=(
++                    'succeeded'
++                    if phase == 'cinder_release'
++                    else 'failed_no_effect'
++                ),
++            )
++        raise AssertionError('unexpected phase %s' % phase)
+diff --git a/nova/tests/unit/checkpoints/test_execution.py b/nova/tests/unit/checkpoints/test_execution.py
+new file mode 100644
+index 0000000..e1a708e
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/test_execution.py
+@@ -0,0 +1,440 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from dataclasses import replace
++from unittest import mock
++
++import ddt
++from oslo_db.sqlalchemy import enginefacade
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import coordinator
++from nova.checkpoints import quota
++from nova.checkpoints import workflow
++from nova import context
++from nova.db.api import checkpoints as quota_db
++from nova.db.main import api as db_api
++from nova.db.main import checkpoints as db
++from nova import exception
++from nova import objects
++from nova import test
++from nova.tests import fixtures
++from nova.tests.unit.checkpoints import fake_executor
++from nova.tests.unit.checkpoints import test_cell_db
++from nova.tests.unit.objects import test_objects
++from nova.virt import driver as virt_driver
++
++
++@ddt.ddt
++class ExecutionTest(test.TestCase):
++    def setUp(self):
++        super().setUp()
++        from nova.checkpoints import compute
++
++        self.flags(
++            enabled=True,
++            max_artifact_bytes_per_project=16384,
++            group='checkpoint',
++        )
++        self.ctx = context.RequestContext('actor', 'project')
++        test_cell_db.make_instance(self.ctx)
++        self.admission = test_cell_db.admission(self.ctx)
++        self.instance = objects.Instance.get_by_uuid(self.ctx, uuids.instance)
++        self.driver = fake_executor.FakeCheckpointDriver()
++        self.executor = compute.ComputeExecutor(self.driver, host='compute')
++
++    def ready(self, ready=True):
++        db.admit(self.ctx, self.admission, uuids.ticket)
++        if ready:
++            db.mark_quota_ready(self.ctx, uuids.operation, uuids.ticket)
++
++    def execute(self, generation=1):
++        return self.executor.execute(
++            self.ctx, self.instance, uuids.operation, generation
++        )
++
++    def test_default_driver_unsupported_even_enabled(self):
++        driver = virt_driver.ComputeDriver(mock.sentinel.virtapi)
++        result = driver.checkpoint_probe(
++            self.ctx,
++            self.instance,
++            self.admission.to_primitive()['device_manifest'],
++        )
++        self.assertFalse(c.validate_probe(result).supported)
++
++    def test_execute_twice_calls_effect_once(self):
++        self.ready()
++        self.execute()
++        self.execute()
++        self.assertEqual(
++            list(workflow.steps_for('create')),
++            [phase for phase, ident in self.driver.executed],
++        )
++        self.assertEqual(
++            'available',
++            db.checkpoint_get(self.ctx, uuids.checkpoint)['status'],
++        )
++        self.assertIsNone(
++            db.guard_get(self.ctx, uuids.instance)['operation_id']
++        )
++
++    def test_lost_reply_queries_same_step_uuid(self):
++        self.ready()
++        self.driver.lose_reply.add('runtime_save')
++        self.execute()
++        self.assertEqual('SHUTOFF', self.driver.power_state)
++        first_id = self.driver.executed[-1][1]
++        self.execute()
++        self.assertIn(('runtime_save', first_id), self.driver.queried)
++        self.assertEqual(
++            1,
++            [
++                ident
++                for phase, ident in self.driver.executed
++                if phase == 'runtime_save'
++            ].count(first_id),
++        )
++        self.assertEqual(
++            'available',
++            db.checkpoint_get(self.ctx, uuids.checkpoint)['status'],
++        )
++
++    def test_wrong_host_generation_profile_never_calls_driver(self):
++        from nova.checkpoints import compute
++
++        self.ready()
++        foreign = compute.ComputeExecutor(self.driver, host='elsewhere')
++        self.assertRaises(
++            exception.CheckpointConflict,
++            foreign.execute,
++            self.ctx,
++            self.instance,
++            uuids.operation,
++            1,
++        )
++        self.assertRaises(exception.CheckpointConflict, self.execute, 2)
++        self.driver.executor_profile = 'unknown-profile'
++        self.assertRaises(exception.CheckpointNotSupported, self.execute)
++        self.assertEqual([], self.driver.executed)
++
++    def test_success_missing_disk_proof_is_unknown(self):
++        self.ready()
++        self.driver.responses['disk_snapshot'] = c.StepResult(
++            'succeeded', {'volume_ids': [], 'snapshots': []}, None
++        )
++        self.execute()
++        self.assertEqual('SHUTOFF', self.driver.power_state)
++        operation = db.get_by_uuid(self.ctx, uuids.operation)
++        self.assertEqual('recovery_required', operation['state'])
++        self.assertEqual('disk_snapshot', operation['phase'])
++        self.assertEqual(
++            uuids.operation,
++            db.guard_get(self.ctx, uuids.instance)['operation_id'],
++        )
++
++    def test_quota_not_ready_never_claims(self):
++        self.ready(ready=False)
++        self.assertRaises(exception.CheckpointConflict, self.execute)
++        self.assertEqual([], self.driver.executed)
++        self.assertEqual([], db.steps_get(self.ctx, uuids.operation))
++
++    def test_partial_revert_never_reaches_runtime_restore(self):
++        self.ready()
++        self.execute()
++        revert = replace(
++            self.admission,
++            operation_id=uuids.revert,
++            key=replace(
++                self.admission.key,
++                kind='revert',
++                request_id=uuids.revert_request,
++            ),
++        )
++        db.admit(self.ctx, revert, uuids.ticket)
++        db.mark_quota_ready(self.ctx, uuids.revert, uuids.ticket)
++        self.driver.responses['disk_revert'] = c.StepResult(
++            'unknown', {}, 'executor_unavailable'
++        )
++        self.executor.execute(self.ctx, self.instance, uuids.revert, 1)
++        self.assertEqual('SHUTOFF', self.driver.power_state)
++        self.assertNotIn(
++            'runtime_restore_checkpoint',
++            [phase for phase, ident in self.driver.executed],
++        )
++        self.assertEqual(
++            uuids.revert,
++            db.guard_get(self.ctx, uuids.instance)['operation_id'],
++        )
++
++    def test_no_sql_access_from_compute(self):
++        self.ready()
++        factory = enginefacade._TransactionFactory
++        create_session, start = factory._create_session, factory._start
++
++        class Conductor(test_objects.FakeIndirectionHack):
++            # Only the actual serialized OVO request handler may access SQL.
++            # A direct compute/helper SQL call still hits DatabasePoison.
++            def object_class_action(self, *args, **kwargs):
++                with mock.patch.object(
++                    factory, '_create_session', create_session
++                ), mock.patch.object(factory, '_start', start):
++                    return super().object_class_action(*args, **kwargs)
++
++            def object_action(self, *args, **kwargs):
++                with mock.patch.object(
++                    factory, '_create_session', create_session
++                ), mock.patch.object(factory, '_start', start):
++                    return super().object_action(*args, **kwargs)
++
++            def object_class_action_versions(self, *args, **kwargs):
++                with mock.patch.object(
++                    factory, '_create_session', create_session
++                ), mock.patch.object(factory, '_start', start):
++                    return super().object_class_action_versions(
++                        *args, **kwargs
++                    )
++
++        remote = Conductor(serializer=objects.base.NovaObjectSerializer())
++        with fixtures.DatabasePoisonFixture(), fixtures.IndirectionAPIFixture(
++            remote
++        ):
++            self.execute()
++        self.assertEqual(
++            'available',
++            db.checkpoint_get(self.ctx, uuids.checkpoint)['status'],
++        )
++
++    def test_known_create_failure_cleans_with_distinct_ids_before_refund(self):
++        self.ready()
++        self.driver.responses['artifact_publish'] = c.StepResult(
++            'failed_no_effect',
++            dict(no_effect=True, late_effect_impossible=True),
++            'executor_unavailable',
++        )
++        self.execute()
++        steps = db.steps_get(self.ctx, uuids.operation)
++        phases = [phase for phase, ident in self.driver.executed]
++        self.assertEqual(list(workflow.steps_for('cleanup')), phases[-4:])
++        self.assertEqual(len(steps), len({step['uuid'] for step in steps}))
++        self.assertEqual('RUNNING', self.driver.power_state)
++        self.assertEqual({}, self.driver.artifacts)
++        self.assertEqual({}, self.driver.snapshots)
++        self.assertIsNotNone(db.close_proof(self.ctx, uuids.operation))
++        self.assertEqual(
++            uuids.operation,
++            db.guard_get(self.ctx, uuids.instance)['operation_id'],
++        )
++        db.mark_quota_released(self.ctx, uuids.operation, uuids.ticket)
++        db.finalize(self.ctx, uuids.operation, 1, 'succeeded')
++        self.assertEqual(
++            'deleted', db.checkpoint_get(self.ctx, uuids.checkpoint)['status']
++        )
++        self.assertEqual(
++            0, db.guard_get(self.ctx, uuids.instance)['checkpoint_count']
++        )
++
++    def test_unknown_create_cannot_claim_cleanup(self):
++        self.ready()
++        self.driver.lose_reply.add('runtime_save')
++        self.execute()
++        for phase in workflow.steps_for('cleanup'):
++            self.assertRaises(
++                exception.CheckpointConflict,
++                db.claim_step,
++                self.ctx,
++                uuids.operation,
++                1,
++                phase,
++                'test-executor',
++            )
++        self.assertIsNone(db.close_proof(self.ctx, uuids.operation))
++
++    def test_query_resolves_existing_step_without_claiming_next(self):
++        self.ready()
++        self.driver.lose_reply.add('runtime_save')
++        self.execute()
++        before = list(self.driver.executed)
++        self.executor.query(self.ctx, self.instance, uuids.operation, 1)
++        self.assertEqual(before, self.driver.executed)
++        self.assertEqual(
++            ['preflight', 'cinder_reserve', 'runtime_save'],
++            [phase for phase, ident in self.driver.executed],
++        )
++
++    def test_intent_carries_durable_artifact_budget(self):
++        self.ready()
++        self.execute()
++        save = next(
++            step
++            for step in db.steps_get(self.ctx, uuids.operation)
++            if step['phase'] == 'runtime_save'
++        )
++        self.assertEqual(4096, save['payload']['artifact_upper_bound'])
++        self.assertEqual(1, save['payload']['artifact_budget_version'])
++        self.assertEqual(1, save['payload']['format_version'])
++        self.assertEqual(c.PROFILE, save['payload']['executor_profile'])
++
++    @ddt.data(*workflow.steps_for('create'))
++    def test_no_effect_create_failure_at_each_phase(self, phase):
++        self.ready()
++        self.driver.responses[phase] = c.StepResult(
++            'failed_no_effect',
++            dict(no_effect=True, late_effect_impossible=True),
++            'executor_unavailable',
++        )
++        self.execute()
++        self.assertIsNotNone(db.close_proof(self.ctx, uuids.operation))
++        self.assertEqual('RUNNING', self.driver.power_state)
++        self.assertEqual({}, self.driver.artifacts)
++        self.assertEqual({}, self.driver.snapshots)
++        before = list(self.driver.executed)
++        self.execute()
++        self.assertEqual(before, self.driver.executed)
++
++    def test_lost_cleanup_reply_keeps_guard_and_queries_same_id(self):
++        self.ready()
++        self.driver.responses['disk_snapshot'] = c.StepResult(
++            'failed_no_effect',
++            dict(no_effect=True, late_effect_impossible=True),
++            'executor_unavailable',
++        )
++        self.driver.lose_reply.add('cleanup_artifacts')
++        self.execute()
++        self.assertIsNone(db.close_proof(self.ctx, uuids.operation))
++        phase, step_id = self.driver.executed[-1]
++        self.assertEqual('cleanup_artifacts', phase)
++        self.execute()
++        self.assertIn((phase, step_id), self.driver.queried)
++        self.assertEqual(1, self.driver.executed.count((phase, step_id)))
++        self.assertIsNotNone(db.close_proof(self.ctx, uuids.operation))
++
++
++class CoordinatorTest(test.TestCase):
++    NUMBER_OF_CELLS = 2
++
++    def setUp(self):
++        super().setUp()
++        from nova.checkpoints import compute
++
++        self.flags(
++            enabled=True,
++            max_artifact_bytes_per_project=16384,
++            group='checkpoint',
++        )
++        self.ctx = context.RequestContext('actor', 'project')
++        self.cell = self.cell_mappings['cell1']
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            test_cell_db.make_instance(ctx)
++            self.admission = replace(
++                test_cell_db.admission(ctx), cell_uuid=self.cell.uuid
++            )
++            objects.Service(
++                ctx, host='compute', binary='nova-compute', topic='compute'
++            ).create()
++        objects.InstanceMapping(
++            self.ctx,
++            instance_uuid=uuids.instance,
++            cell_mapping=self.cell,
++            project_id='project',
++        ).create()
++        self.driver = fake_executor.FakeCheckpointDriver()
++        self.executor = compute.ComputeExecutor(self.driver, 'compute')
++        self.rpc = mock.Mock()
++        self.rpc.checkpoint_probe.side_effect = lambda *a: (
++            self.executor.probe(*a).to_primitive()
++        )
++        self.rpc.checkpoint_execute.side_effect = self.executor.execute
++        self.ledger = quota.QuotaLedger()
++        self.coordinator = coordinator.Coordinator(self.rpc, self.ledger)
++
++    def admit(self):
++        ticket = self.ledger.reserve(self.ctx, self.admission)
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            db.admit(ctx, self.admission, ticket.id)
++        self.ledger.confirm(self.ctx, ticket.id)
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            db.mark_quota_ready(ctx, self.admission.operation_id, ticket.id)
++        return ticket
++
++    def test_live_probe_matches_real_manifest_and_never_reserves_quota(self):
++        probe = self.coordinator.probe(self.ctx, uuids.instance)
++        self.assertTrue(probe.supported)
++        self.assertEqual(self.admission.fingerprint, probe.fingerprint)
++        self.rpc.checkpoint_probe.assert_called_once()
++        self.assertEqual(
++            0, quota_db.get_usage(self.ctx, 'project')['checkpoint_count']
++        )
++
++    def test_old_service_never_probes_or_reserves(self):
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            service = objects.Service.get_by_host_and_binary(
++                ctx, 'compute', 'nova-compute'
++            )
++            db_api.service_update(ctx, service.id, {'version': 68})
++        self.assertEqual(
++            ('incompatible_service',),
++            self.coordinator.probe(self.ctx, uuids.instance).reasons,
++        )
++        self.rpc.checkpoint_probe.assert_not_called()
++
++    def test_live_probe_failure_is_not_inferred_support(self):
++        self.rpc.checkpoint_probe.side_effect = TimeoutError('private detail')
++        probe = self.coordinator.probe(self.ctx, uuids.instance)
++        self.assertFalse(probe.supported)
++        self.assertEqual(('executor_unavailable',), probe.reasons)
++        self.assertNotIn('private detail', str(probe.to_primitive()))
++
++    def test_create_settles_and_delete_refunds_only_after_terminal_proof(self):
++        ticket = self.admit()
++        self.coordinator.run(self.ctx, uuids.instance, uuids.operation, 1)
++        self.assertEqual(
++            1024, self.ledger.get(self.ctx, ticket.id).reserved_bytes
++        )
++        delete = replace(
++            self.admission,
++            operation_id=uuids.delete,
++            key=replace(
++                self.admission.key,
++                kind='delete',
++                request_id=uuids.delete_request,
++            ),
++        )
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            db.admit(ctx, delete, ticket.id)
++            db.mark_quota_ready(ctx, uuids.delete, ticket.id)
++        self.flags(enabled=False, group='checkpoint')
++        self.coordinator.run(self.ctx, uuids.instance, uuids.delete, 1)
++        self.assertEqual(
++            'released', self.ledger.get(self.ctx, ticket.id).state
++        )
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            self.assertEqual(
++                'deleted', db.checkpoint_get(ctx, uuids.checkpoint)['status']
++            )
++            self.assertIsNone(
++                db.guard_get(ctx, uuids.instance)['operation_id']
++            )
++
++    def test_known_create_failure_refunds_after_cleanup(self):
++        ticket = self.admit()
++        self.driver.responses['disk_snapshot'] = c.StepResult(
++            'failed_no_effect',
++            dict(no_effect=True, late_effect_impossible=True),
++            'executor_unavailable',
++        )
++        self.coordinator.run(self.ctx, uuids.instance, uuids.operation, 1)
++        self.assertEqual(
++            'released', self.ledger.get(self.ctx, ticket.id).state
++        )
++        self.assertEqual('RUNNING', self.driver.power_state)
++        self.assertEqual({}, self.driver.artifacts)
+diff --git a/nova/tests/unit/checkpoints/test_rpc.py b/nova/tests/unit/checkpoints/test_rpc.py
+new file mode 100644
+index 0000000..be644af
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/test_rpc.py
+@@ -0,0 +1,103 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from unittest import mock
++
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import contracts as c
++from nova.compute import manager as compute_manager
++from nova.compute import rpcapi as compute_rpcapi
++from nova.conductor import manager as conductor_manager
++from nova.conductor import rpcapi as conductor_rpcapi
++from nova import context
++from nova import exception
++from nova import objects
++from nova.objects import service
++from nova import test
++
++
++class CheckpointRPCTest(test.NoDBTestCase):
++    def setUp(self):
++        super().setUp()
++        self.ctx = context.RequestContext('actor', 'project')
++        self.instance = objects.Instance(
++            self.ctx, uuid=uuids.instance, host='compute', node='node'
++        )
++
++    def test_private_versions(self):
++        self.assertEqual(69, service.SERVICE_VERSION)
++        self.assertEqual(
++            '6.5', service.SERVICE_VERSION_HISTORY[69]['compute_rpc']
++        )
++        self.assertEqual('6.5', compute_manager.ComputeManager.target.version)
++        self.assertEqual(
++            '1.26', conductor_manager.ComputeTaskManager.target.version
++        )
++        self.assertEqual(
++            '3.0', conductor_manager.ConductorManager.target.version
++        )
++
++    def test_old_compute_rejects_before_rpc(self):
++        api = compute_rpcapi.ComputeAPI()
++        client = mock.Mock()
++        client.can_send_version.return_value = False
++        with mock.patch.object(api.router, 'client', return_value=client):
++            self.assertRaises(
++                exception.CheckpointNotSupported,
++                api.checkpoint_probe,
++                self.ctx,
++                self.instance,
++                {},
++            )
++        client.prepare.assert_not_called()
++
++    def test_old_conductor_rejects_before_rpc(self):
++        api = conductor_rpcapi.ComputeTaskAPI()
++        api.client = mock.Mock()
++        api.client.can_send_version.return_value = False
++        self.assertRaises(
++            exception.CheckpointNotSupported,
++            api.checkpoint_probe,
++            self.ctx,
++            uuids.instance,
++        )
++        api.client.prepare.assert_not_called()
++
++    def test_compute_probe_calls_live_endpoint(self):
++        api = compute_rpcapi.ComputeAPI()
++        client = mock.Mock()
++        client.can_send_version.return_value = True
++        client.prepare.return_value.call.return_value = c.unsupported(
++            'executor_unsupported'
++        ).to_primitive()
++        with mock.patch.object(api.router, 'client', return_value=client):
++            result = api.checkpoint_probe(self.ctx, self.instance, {})
++        self.assertFalse(c.validate_probe(result).supported)
++        client.prepare.assert_called_once_with(server='compute', version='6.5')
++        client.prepare.return_value.call.assert_called_once_with(
++            self.ctx, 'checkpoint_probe', instance=self.instance, manifest={}
++        )
++
++    def test_conductor_probe_calls_live_endpoint(self):
++        api = conductor_rpcapi.ComputeTaskAPI()
++        api.client = mock.Mock()
++        api.client.can_send_version.return_value = True
++        api.client.prepare.return_value.call.return_value = c.unsupported(
++            'executor_unsupported'
++        ).to_primitive()
++        result = api.checkpoint_probe(self.ctx, uuids.instance)
++        self.assertFalse(c.validate_probe(result).supported)
++        api.client.prepare.assert_called_once_with(version='1.26')
++        api.client.prepare.return_value.call.assert_called_once_with(
++            self.ctx, 'checkpoint_probe', instance_uuid=uuids.instance
++        )
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index a268d43..db1249f 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -35,6 +35,7 @@ from oslo_utils import importutils
+ import nova.conf
+ import nova.virt.node
+ 
++from nova.checkpoints import contracts as checkpoint_contracts
+ from nova import context as nova_context
+ from nova.i18n import _
+ from nova.network import model as network_model
+@@ -2010,6 +2011,19 @@ class ComputeDriver(object):
+         """
+         return True
+ 
++    def checkpoint_probe(self, context, instance, manifest):
++        """N1 has no physical executor. N2 must override all three hooks."""
++        return checkpoint_contracts.unsupported(
++            'executor_unsupported').to_primitive()
++
++    def checkpoint_execute(self, context, instance, intent):
++        return checkpoint_contracts.StepResult(
++            'unknown', {}, 'executor_unsupported').to_primitive()
++
++    def checkpoint_query(self, context, instance, intent):
++        return checkpoint_contracts.StepResult(
++            'unknown', {}, 'executor_unsupported').to_primitive()
++
+ 
+ def load_compute_driver(virtapi, compute_driver=None):
+     """Load a compute driver module.

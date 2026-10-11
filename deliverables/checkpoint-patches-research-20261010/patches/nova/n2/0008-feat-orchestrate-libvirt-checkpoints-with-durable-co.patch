@@ -1,0 +1,3734 @@
+From 7b996bd81a6b0cea8b2970fb5f99d16140819d62 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 22:58:43 +0300
+Subject: [PATCH 08/10] feat: orchestrate libvirt checkpoints with durable
+ continuation
+
+---
+ nova/checkpoints/api.py                       | 112 +++-
+ nova/checkpoints/attachments.py               |   6 +-
+ nova/checkpoints/compute.py                   |  44 +-
+ nova/checkpoints/compute_v2.py                | 297 +++++++++
+ nova/checkpoints/contracts_v2.py              |  24 +-
+ nova/checkpoints/coordinator.py               | 152 ++++-
+ nova/checkpoints/recovery.py                  |   6 +
+ nova/checkpoints/workflow_v2.py               |  61 ++
+ nova/compute/manager.py                       |  26 +-
+ nova/compute/rpcapi.py                        |  61 +-
+ nova/db/main/checkpoint_effects.py            | 251 +++++++-
+ nova/db/main/checkpoints.py                   |  14 +-
+ nova/objects/checkpoint_effect.py             |   4 +
+ nova/tests/fixtures/checkpoints.py            |  12 +-
+ nova/tests/fixtures/checkpoints_v2.py         | 525 +++++++++++++++
+ .../functional/test_checkpoint_executor.py    | 505 +++++++++++++++
+ nova/tests/unit/checkpoints/test_api.py       |   2 +
+ .../unit/checkpoints/test_execution_v2.py     | 150 +++++
+ nova/tests/unit/checkpoints/test_rpc.py       |  35 +
+ nova/tests/unit/objects/test_objects.py       |   2 +-
+ .../virt/libvirt/checkpoints/test_runtime.py  |  18 +
+ .../virt/libvirt/checkpoints/test_topology.py |  26 +
+ nova/virt/libvirt/checkpoints/executor.py     | 601 ++++++++++++++++++
+ nova/virt/libvirt/checkpoints/factory.py      |  98 +++
+ nova/virt/libvirt/checkpoints/runtime.py      |   9 +
+ nova/virt/libvirt/checkpoints/topology.py     |  87 ++-
+ nova/virt/libvirt/driver.py                   |  68 +-
+ 27 files changed, 3127 insertions(+), 69 deletions(-)
+ create mode 100644 nova/checkpoints/compute_v2.py
+ create mode 100644 nova/tests/fixtures/checkpoints_v2.py
+ create mode 100644 nova/tests/functional/test_checkpoint_executor.py
+ create mode 100644 nova/tests/unit/checkpoints/test_execution_v2.py
+ create mode 100644 nova/virt/libvirt/checkpoints/executor.py
+ create mode 100644 nova/virt/libvirt/checkpoints/factory.py
+
+diff --git a/nova/checkpoints/api.py b/nova/checkpoints/api.py
+index eb49d3051c3f5920e35cab454bcbb3b04a62a2f4..d9a20731ac7a69fa324b55f010045e139b1a9555 100644
+--- a/nova/checkpoints/api.py
++++ b/nova/checkpoints/api.py
+@@ -18,6 +18,7 @@ import uuid
+ from oslo_utils import uuidutils
+ 
+ from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
+ from nova.checkpoints import quota
+ from nova.conductor import api as conductor
+ from nova import conf
+@@ -29,6 +30,8 @@ from nova.volume import checkpoints as cinder_checkpoints
+ 
+ 
+ class API:
++    contract_version = 2
++
+     def __init__(self, conductor_api=None, ledger=None,
+                  checkpoint_client=None):
+         self.conductor = conductor_api or conductor.ComputeTaskAPI()
+@@ -110,8 +113,24 @@ class API:
+             c.canonical_payload_hash(payload),
+         )
+ 
+-    def _probe(self, context, instance_uuid, checkpoint_id=None):
++    def _probe(
++        self,
++        context,
++        instance_uuid,
++        checkpoint_id=None,
++        purpose='create',
++        contract_version=None,
++    ):
+         try:
++            if (contract_version or self.contract_version) == 2:
++                return v2.validate_probe(
++                    self.conductor.checkpoint_probe_v2(
++                        context,
++                        instance_uuid,
++                        purpose,
++                        checkpoint_id=checkpoint_id,
++                    )
++                )
+             kwargs = (
+                 {}
+                 if checkpoint_id is None
+@@ -135,6 +154,41 @@ class API:
+             raise exception.CheckpointUnavailable(reason=reason)
+         raise exception.CheckpointNotSupported(reason=reason)
+ 
++    @staticmethod
++    def _admission(
++        key, operation_id, checkpoint_id, cell, probe, size, name
++    ):
++        manifest = probe.to_primitive()['device_manifest']
++        args = dict(
++            key=key,
++            operation_id=operation_id,
++            checkpoint_id=checkpoint_id,
++            cell_uuid=cell.uuid,
++            host=manifest['host'],
++            node=manifest['node'],
++            fingerprint=probe.fingerprint,
++            device_manifest=manifest,
++            artifact_upper_bound=size,
++            executor_id=probe.executor_id,
++            name=name,
++        )
++        if isinstance(probe, v2.ProbeV2):
++            args.update(
++                {
++                    name: getattr(probe, name)
++                    for name in (
++                        'runtime_fingerprint',
++                        'runtime_profile_id',
++                        'store_profile_id',
++                        'staging_profile_id',
++                        'save_bytes_limit',
++                        'restore_bytes_limit',
++                    )
++                }
++            )
++            return v2.AdmissionV2(**args)
++        return c.Admission(**args)
++
+     def capabilities(self, context, instance_uuid):
+         with self._server(context, instance_uuid, 'capabilities'):
+             probe = (
+@@ -186,6 +240,26 @@ class API:
+             return operation
+         operation = self.ledger.ensure_operation_ready(context, operation)
+         try:
++            if operation.contract_version == 2 and context.auth_token:
++                with nova_context.target_cell(context, cell) as ctx:
++                    step_list = objects.InstanceCheckpointStepList
++                    steps = step_list.get_by_operation(ctx, operation.uuid)
++                    reserved = next(
++                        (s for s in steps if s.phase == 'cinder_reserve'),
++                        None,
++                    )
++                    if reserved is not None:
++                        rows = objects.CheckpointEffect.get_children(
++                            ctx, reserved.uuid
++                        )
++                        if any(
++                            r['status']
++                            in ('dispatching', 'pending', 'unknown')
++                            for r in rows
++                        ):
++                            self.resume_reserve_with_user(
++                                ctx, operation.uuid
++                            )
+             self.conductor.checkpoint_run(
+                 context,
+                 operation.instance_uuid,
+@@ -216,23 +290,18 @@ class API:
+                     raise exception.CheckpointNotSupported(reason='disabled')
+                 probe = self._probe(context, instance_uuid)
+                 self._supported(probe)
+-                manifest = probe.to_primitive()['device_manifest']
+-                admission = c.Admission(
++                admission = self._admission(
+                     key,
+                     uuidutils.generate_uuid(),
+                     uuidutils.generate_uuid(),
+-                    cell.uuid,
+-                    manifest['host'],
+-                    manifest['node'],
+-                    probe.fingerprint,
+-                    manifest,
++                    cell,
++                    probe,
+                     probe.artifact_upper_bound,
+-                    probe.executor_id,
+-                    name=payload['name'],
++                    payload['name'],
+                 )
+                 ticket = self.ledger.reserve(context, admission)
+                 # A concurrent request may have won the unique ticket key.
+-                admission = c.Admission.from_primitive(ticket.admission)
++                admission = v2.decode_admission(ticket.admission)
+                 if (
+                     ticket.cell_uuid != cell.uuid or
+                     admission.cell_uuid != cell.uuid
+@@ -274,21 +343,22 @@ class API:
+                 checkpoint = self._checkpoint(
+                     ctx, instance_uuid, checkpoint_id
+                 )
+-                probe = self._probe(context, instance_uuid, checkpoint_id)
++                probe = self._probe(
++                    context,
++                    instance_uuid,
++                    checkpoint_id,
++                    purpose=kind,
++                    contract_version=checkpoint.contract_version,
++                )
+                 self._supported(probe)
+-                manifest = probe.to_primitive()['device_manifest']
+-                admission = c.Admission(
++                admission = self._admission(
+                     key,
+                     uuidutils.generate_uuid(),
+                     checkpoint_id,
+-                    cell.uuid,
+-                    manifest['host'],
+-                    manifest['node'],
+-                    probe.fingerprint,
+-                    manifest,
++                    cell,
++                    probe,
+                     checkpoint.artifact_upper_bound,
+-                    probe.executor_id,
+-                    name=checkpoint.name,
++                    checkpoint.name,
+                 )
+                 operation = objects.InstanceCheckpointOperation.admit(
+                     ctx, admission.to_primitive(), checkpoint.quota_ticket_id
+diff --git a/nova/checkpoints/attachments.py b/nova/checkpoints/attachments.py
+index bf9716852cdb6929da12dcfb498c210120339fee..ed7e3d5e7dadc96550453c53388f4f07455c5734 100644
+--- a/nova/checkpoints/attachments.py
++++ b/nova/checkpoints/attachments.py
+@@ -377,7 +377,11 @@ class AttachmentCoordinator:
+                     row['id'],
+                     1,
+                     binding.executor_id,
+-                    row['revision'],
++                    getattr(
++                        context,
++                        '_checkpoint_continuation_revision',
++                        row['revision'],
++                    ),
+                 )
+                 if row is None:
+                     return unknown()
+diff --git a/nova/checkpoints/compute.py b/nova/checkpoints/compute.py
+index e80024267bb0bb9e240ed563e0decd336e1f9980..2d90f5149545aecf82e18a6e43a9e613428dabee 100644
+--- a/nova/checkpoints/compute.py
++++ b/nova/checkpoints/compute.py
+@@ -57,7 +57,11 @@ class ComputeExecutor:
+ 
+     def probe_v2(self, context, instance, manifest, purpose,
+                  checkpoint_id=None, operation_id=None):
+-        if operation_id is None and not conf.CONF.checkpoint.enabled:
++        if (
++            purpose == 'create' and
++            operation_id is None and
++            not conf.CONF.checkpoint.enabled
++        ):
+             return v2.unsupported('disabled')
+         try:
+             self.check_probe_binding(context, instance, purpose, checkpoint_id,
+@@ -293,7 +297,45 @@ class ComputeExecutor:
+         )
+ 
+     def execute(self, context, instance, operation_id, generation):
++        operation = objects.InstanceCheckpointOperation.get_by_uuid(
++            context, operation_id
++        )
++        if operation.contract_version == 2:
++            from nova.checkpoints.compute_v2 import ComputeV2
++
++            return ComputeV2(self.driver, self.host).advance(
++                context, instance, operation_id, generation
++            )
+         self._advance(context, instance, operation_id, generation, False)
+ 
+     def query(self, context, instance, operation_id, generation):
++        operation = objects.InstanceCheckpointOperation.get_by_uuid(
++            context, operation_id
++        )
++        if operation.contract_version == 2:
++            from nova.checkpoints.compute_v2 import ComputeV2
++
++            return ComputeV2(self.driver, self.host).advance(
++                context, instance, operation_id, generation, query=True
++            )
+         return self._advance(context, instance, operation_id, generation, True)
++
++    def continue_step(
++        self,
++        context,
++        instance,
++        operation_id,
++        generation,
++        step_id,
++        journal_revision,
++    ):
++        from nova.checkpoints.compute_v2 import ComputeV2
++
++        return ComputeV2(self.driver, self.host).continue_step(
++            context,
++            instance,
++            operation_id,
++            generation,
++            step_id,
++            journal_revision,
++        )
+diff --git a/nova/checkpoints/compute_v2.py b/nova/checkpoints/compute_v2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0092a77bc63c4e64a19bd7aba9c976882b63ee7b
+--- /dev/null
++++ b/nova/checkpoints/compute_v2.py
+@@ -0,0 +1,297 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Compute-side v2 orchestration; persistence is exclusively remotable OVO."""
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova.checkpoints import guards
++from nova.checkpoints import workflow_v2 as workflow
++from nova import objects
++
++TERMINAL = ('succeeded', 'released')
++FAILED = ('failed_no_effect', 'failed_with_effects')
++
++
++def plan(context, operation):
++    steps = {
++        s.phase: s
++        for s in objects.InstanceCheckpointStepList.get_by_operation(
++            context, operation.uuid
++        )
++    }
++    children = {
++        name: objects.CheckpointEffect.get_children(context, step.uuid)
++        for name, step in steps.items()
++    }
++    phases, cleaning = workflow.execution_plan(
++        operation.kind,
++        {name: step.status for name, step in steps.items()},
++        children,
++    )
++    return steps, children, phases, cleaning
++
++
++class ComputeV2:
++    def __init__(self, driver, host):
++        self.driver, self.host = driver, host
++
++    def _load(self, context, instance, operation_id, generation):
++        v2.validate_generation(generation)
++        op = objects.InstanceCheckpointOperation.get_by_uuid(
++            context, operation_id
++        )
++        c._require(
++            op.contract_version == 2 and
++            op.generation == generation and
++            op.instance_uuid == instance.uuid and
++            op.host == self.host
++        )
++        current = objects.Instance.get_by_uuid(context, instance.uuid)
++        c._require(
++            (current.host, current.node, current.project_id) ==
++            (op.host, op.node, op.project_id)
++        )
++        if op.state not in TERMINAL:
++            c._require(op.quota_ready)
++            manifest = objects.InstanceCheckpointOperation.device_manifest(
++                context, current.uuid
++            )
++            c._require(
++                c.device_fingerprint(manifest) ==
++                op.admission['fingerprint']
++            )
++        return op, current
++
++    @staticmethod
++    def _intent(step):
++        return v2.StepIntentV2(
++            step.uuid,
++            step.operation_id,
++            step.generation,
++            step.phase,
++            step.executor_id,
++            step.payload_hash,
++            step.payload,
++        )
++
++    @staticmethod
++    def report(context, operation_id, status, step=None):
++        op = objects.InstanceCheckpointOperation.get_by_uuid(
++            context, operation_id
++        )
++        result = dict(
++            schema_version=2,
++            operation_id=op.uuid,
++            generation=1,
++            state=op.state,
++            phase=op.phase,
++            error_code=op.error_code,
++            status=status,
++        )
++        if status == 'ready':
++            result['continuation'] = objects.CheckpointEffect.continuation(
++                context, step.uuid
++            )
++        return result
++
++    def _effect(
++        self,
++        context,
++        instance,
++        operation,
++        step,
++        query=False,
++        revision=None,
++    ):
++        guard = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++            context, instance.uuid
++        )
++        scope = c.Scope(
++            instance.uuid,
++            'checkpoint',
++            operation.uuid,
++            1,
++            step.phase,
++            guard.token,
++        )
++        try:
++            with guards.scope(context, scope) as ctx:
++                if revision is not None:
++                    ctx._checkpoint_continuation_revision = revision
++                method = (
++                    self.driver.checkpoint_query_v2
++                    if query
++                    else self.driver.checkpoint_execute_v2
++                )
++                result = v2.validate_result(
++                    step.phase,
++                    method(
++                        ctx, instance, self._intent(step).to_primitive()
++                    ),
++                )
++        except Exception:
++            result = v2.EffectResult('unknown', {}, 'executor_unavailable')
++        objects.InstanceCheckpointOperation.finish_step(
++            context, step.uuid, 1, result.to_primitive()
++        )
++        return result
++
++    @staticmethod
++    def _failure(context, operation, step):
++        objects.CheckpointEffect.cancel_prepared(
++            context, operation.uuid, 1
++        )
++        rows = objects.CheckpointEffect.get_children(context, step.uuid)
++        if any(r['status'] not in ('succeeded',) + FAILED for r in rows):
++            return v2.EffectResult('unknown', {}, 'recovery_required')
++        if all(r['status'] == 'failed_no_effect' for r in rows):
++            return v2.EffectResult(
++                'failed_no_effect',
++                dict(no_effect=True, late_effect_impossible=True),
++                'resources_remaining',
++            )
++        ids = {
++            r['id']
++            for r in objects.CheckpointArtifactReservation.get_by_checkpoint(
++                context, operation.checkpoint_id
++            )
++            if r['child_id'] in {r['id'] for r in rows}
++        }
++        for row in rows:
++            if (
++                row['action'] == 'submit_disk_operation' and
++                row['status'] == 'failed_with_effects'
++            ):
++                ids.update(row['result']['evidence']['resource_ids'])
++        c._require(bool(ids))
++        return v2.EffectResult(
++            'failed_with_effects',
++            dict(
++                resource_ids=sorted(ids),
++                terminal_child_ids=sorted(r['id'] for r in rows),
++                late_effect_impossible=True,
++            ),
++            'resources_remaining',
++        )
++
++    def advance(
++        self, context, instance, operation_id, generation, query=False
++    ):
++        op, current = self._load(
++            context, instance, operation_id, generation
++        )
++        if op.state in TERMINAL:
++            return self.report(context, op.uuid, 'terminal')
++        steps, children, phases, cleaning = plan(context, op)
++        if (
++            op.kind == 'create' and
++            not cleaning and
++            'staging_cleanup' in steps and
++            steps['staging_cleanup'].status == 'succeeded'
++        ):
++            objects.InstanceCheckpointOperation.confirm_artifact_usage(
++                context,
++                op.uuid,
++                steps['artifact_publish_shared'].result['evidence'],
++            )
++        for phase in phases:
++            step = steps.get(phase)
++            if step is not None and step.status == 'succeeded':
++                continue
++            if step is not None and step.status in FAILED:
++                return self.report(context, op.uuid, 'unknown')
++            if step is None:
++                if query:
++                    return self.report(context, op.uuid, 'progress')
++                primitive = objects.InstanceCheckpointOperation.claim_step(
++                    context, op.uuid, 1, phase, op.executor_id
++                )
++                if primitive is None:
++                    return self.report(context, op.uuid, 'unknown')
++                intent = v2.StepIntentV2.from_primitive(primitive)
++                step = objects.InstanceCheckpointStep.get_by_uuid(
++                    context, intent.id
++                )
++                result = self._effect(context, current, op, step)
++            elif any(r['status'] in FAILED for r in children[phase]):
++                if query:
++                    return self.report(context, op.uuid, 'fence_required')
++                result = self._failure(context, op, step)
++                objects.InstanceCheckpointOperation.finish_step(
++                    context, step.uuid, 1, result.to_primitive()
++                )
++            elif step.status == 'ready':
++                return self.report(context, op.uuid, 'ready', step)
++            else:
++                result = self._effect(
++                    context, current, op, step, query=True
++                )
++            if result.status == 'succeeded':
++                status = 'progress'
++            elif result.status in FAILED:
++                status = 'progress'
++            elif result.status == 'unknown':
++                rows = objects.CheckpointEffect.get_children(
++                    context, step.uuid
++                )
++                status = (
++                    'fence_required'
++                    if any(r['status'] in FAILED for r in rows)
++                    else 'unknown'
++                )
++            else:
++                status = result.status
++            return self.report(context, op.uuid, status, step)
++        objects.InstanceCheckpointOperation.finalize(
++            context, op.uuid, 1, 'succeeded'
++        )
++        updated = objects.InstanceCheckpointOperation.get_by_uuid(
++            context, op.uuid
++        )
++        return self.report(
++            context,
++            op.uuid,
++            'terminal' if updated.state in TERMINAL else 'closing',
++        )
++
++    def continue_step(
++        self,
++        context,
++        instance,
++        operation_id,
++        generation,
++        step_id,
++        journal_revision,
++    ):
++        op, current = self._load(
++            context, instance, operation_id, generation
++        )
++        c._integer(journal_revision, minimum=1)
++        step = objects.InstanceCheckpointStep.get_by_uuid(context, step_id)
++        value = objects.CheckpointEffect.continuation(context, step_id)
++        c._require(
++            step.operation_id == op.uuid and
++            step.phase == op.phase and
++            step.status == 'ready' and
++            value is not None and
++            value['journal_revision'] == journal_revision
++        )
++        result = self._effect(
++            context, current, op, step, revision=journal_revision
++        )
++        status = (
++            'progress'
++            if result.status in ('succeeded',) + FAILED
++            else result.status
++        )
++        return self.report(context, op.uuid, status, step)
+diff --git a/nova/checkpoints/contracts_v2.py b/nova/checkpoints/contracts_v2.py
+index bad0b5bbf4d2dba9661793128655299f3cd9b5e3..a1059b6d38183402f06325da1abf99b0fcb17bc8 100644
+--- a/nova/checkpoints/contracts_v2.py
++++ b/nova/checkpoints/contracts_v2.py
+@@ -200,7 +200,8 @@ class AdmissionV2(_Contract):
+             v1._uuid(getattr(self, name))
+         for name in ('save_bytes_limit', 'restore_bytes_limit'):
+             v1._integer(getattr(self, name), minimum=1)
+-        v1._require(self.artifact_upper_bound >= self.save_bytes_limit)
++        if self.key.kind == 'create':
++            v1._require(self.artifact_upper_bound >= self.save_bytes_limit)
+ 
+ 
+ def decode_admission(value):
+@@ -373,7 +374,26 @@ def validate_result(phase, value):
+ 
+ 
+ def _child_success(action, evidence):
+-    if action == 'host_disconnect':
++    if action == 'submit_disk_operation':
++        v1._keys(evidence, ('phase', 'volume_ids', 'snapshots'))
++        v1._require(
++            evidence['phase']
++            in (
++                'disk_snapshot',
++                'disk_revert',
++                'disk_snapshot_delete',
++                'cleanup_disk_snapshots',
++            )
++        )
++        v1._success_evidence(
++            evidence['phase'],
++            {
++                key: value
++                for key, value in evidence.items()
++                if key != 'phase'
++            },
++        )
++    elif action == 'host_disconnect':
+         v1._keys(evidence, ('volume_id', 'disconnected'))
+         v1._uuid(evidence['volume_id'])
+         v1._require(evidence['disconnected'] is True)
+diff --git a/nova/checkpoints/coordinator.py b/nova/checkpoints/coordinator.py
+index 1186980ec015134c85c7a1b72266f96100545942..ce7b56f0587c616fd3dccb128a04fa9040121a8b 100644
+--- a/nova/checkpoints/coordinator.py
++++ b/nova/checkpoints/coordinator.py
+@@ -24,6 +24,8 @@ from nova import objects
+ 
+ 
+ class Coordinator:
++    max_transitions = 256
++
+     def __init__(self, compute_rpc=None, ledger=None):
+         self.compute_rpc = compute_rpc or rpcapi.ComputeAPI()
+         self.ledger = ledger or quota.QuotaLedger()
+@@ -82,7 +84,11 @@ class Coordinator:
+ 
+     def probe_v2(self, context, instance_uuid, purpose, checkpoint_id=None,
+                  operation_id=None):
+-        if operation_id is None and not conf.CONF.checkpoint.enabled:
++        if (
++            purpose == 'create' and
++            operation_id is None and
++            not conf.CONF.checkpoint.enabled
++        ):
+             return v2.unsupported('disabled')
+         try:
+             cell = self._cell(context, instance_uuid)
+@@ -131,6 +137,10 @@ class Coordinator:
+                 operation.cell_uuid != cell.uuid
+             ):
+                 raise exception.CheckpointConflict(reason='identity_changed')
++            if operation.contract_version == 2:
++                return self._run_v2(
++                    context, cell, operation_id, generation
++                )
+             checkpoint = objects.InstanceCheckpoint.get_by_uuid(
+                 ctx, operation.checkpoint_id
+             )
+@@ -179,3 +189,143 @@ class Coordinator:
+                 )
+         elif operation.kind == 'create' and operation.state == 'succeeded':
+             self.ledger.settle(context, operation.quota_ticket_id)
++
++    def _run_v2(self, context, cell, operation_id, generation):
++        from nova.checkpoints import compute_v2
++        operation_api = objects.InstanceCheckpointOperation
++
++        with nova_context.target_cell(context, cell) as ctx:
++            op = operation_api.get_by_uuid(
++                ctx, operation_id
++            )
++            if op.state in ('succeeded', 'released'):
++                if op.kind == 'create' and op.state == 'succeeded':
++                    self.ledger.settle(context, op.quota_ticket_id)
++                return
++            op = self.ledger.ensure_operation_ready(context, op)
++            temporary = None
++            if op.kind == 'revert':
++                rows = objects.CheckpointArtifactReservation.get_by_checkpoint(
++                    ctx, op.checkpoint_id
++                )
++                limit = max(
++                    op.admission['restore_bytes_limit'],
++                    sum(
++                        r['upper_bound']
++                        for r in rows
++                        if r['location'] == 'shared' and
++                        r['writer_state'] == 'closed'
++                    ),
++                )
++                temporary = self.ledger.reserve_temporary(
++                    context, op.uuid, cell.uuid, limit
++                )
++                proof = operation_api.temporary_close_proof(
++                    ctx, op.uuid, temporary.id
++                )
++                if temporary.state != 'released' and proof is None:
++                    self.ledger.confirm_temporary(context, temporary.id)
++            for unused in range(self.max_transitions):
++                op = operation_api.get_by_uuid(
++                    ctx, operation_id
++                )
++                proof = operation_api.close_proof(
++                    ctx,
++                    (
++                        op.admission['operation_id']
++                        if op.kind == 'create'
++                        else objects.InstanceCheckpoint.get_by_uuid(
++                            ctx, op.checkpoint_id
++                        ).create_operation_id
++                    ),
++                )
++                if proof:
++                    self.ledger.release(context, op.quota_ticket_id)
++                    operation_api.mark_quota_released(
++                        ctx, op.uuid, op.quota_ticket_id
++                    )
++                    operation_api.finalize(
++                        ctx, op.uuid, generation, 'succeeded'
++                    )
++                    return
++                steps, children, phases, cleaning = compute_v2.plan(ctx, op)
++                if temporary and temporary.state != 'released':
++                    close = operation_api.temporary_close_proof(
++                        ctx, op.uuid, temporary.id
++                    )
++                    if close or (
++                        cleaning and
++                        all(
++                            p in steps and steps[p].status == 'succeeded'
++                            for p in phases
++                        )
++                    ):
++                        temporary = self.ledger.release_temporary(
++                            context, temporary.id
++                        )
++                if op.state in ('succeeded', 'released'):
++                    if op.kind == 'create' and op.state == 'succeeded':
++                        self.ledger.settle(context, op.quota_ticket_id)
++                    return
++                instance = objects.Instance.get_by_uuid(
++                    ctx, op.instance_uuid
++                )
++                ready = next(
++                    (s for s in steps.values() if s.status == 'ready'),
++                    None,
++                )
++                needs_fence = any(
++                    s.status
++                    not in (
++                        'succeeded',
++                        'failed_no_effect',
++                        'failed_with_effects',
++                    ) and
++                    any(
++                        r['status']
++                        in ('failed_no_effect', 'failed_with_effects')
++                        for r in children[name]
++                    )
++                    for name, s in steps.items()
++                )
++                if ready is not None and not needs_fence:
++                    continuation = objects.CheckpointEffect.continuation(
++                        ctx, ready.uuid
++                    )
++                    if continuation is None:
++                        return
++                    report = self.compute_rpc.checkpoint_continue(
++                        ctx,
++                        instance,
++                        op.uuid,
++                        generation,
++                        ready.uuid,
++                        continuation['journal_revision'],
++                    )
++                else:
++                    unresolved = any(
++                        s.status in ('dispatching', 'pending', 'unknown')
++                        for s in steps.values()
++                    )
++                    method = (
++                        self.compute_rpc.checkpoint_query
++                        if unresolved and not needs_fence
++                        else self.compute_rpc.checkpoint_execute
++                    )
++                    report = method(
++                        ctx,
++                        instance,
++                        op.uuid,
++                        generation,
++                        contract_version=2,
++                    )
++                if not isinstance(report, dict) or report.get(
++                    'status'
++                ) not in (
++                    'ready',
++                    'progress',
++                    'fence_required',
++                    'terminal',
++                    'closing',
++                ):
++                    return
+diff --git a/nova/checkpoints/recovery.py b/nova/checkpoints/recovery.py
+index f4ed512f0af31f40967474a86549c158a148a078..42963752e916bc00eda6c23b23a75b264bec4118 100644
+--- a/nova/checkpoints/recovery.py
++++ b/nova/checkpoints/recovery.py
+@@ -24,6 +24,7 @@ class RecoveryManager:
+         self.coordinator = coordinator.Coordinator(compute_rpc, self.ledger)
+         self.cell_markers = {}
+         self.quota_marker = None
++        self.temporary_marker = None
+ 
+     @staticmethod
+     def _service_context(context):
+@@ -92,4 +93,9 @@ class RecoveryManager:
+             ctx, limit=limit, marker=self.quota_marker
+         )
+         self.quota_marker = report['next_marker']
++        temporary = self.ledger.reconcile_temporary(
++            ctx, limit=limit, marker=self.temporary_marker
++        )
++        self.temporary_marker = temporary['next_marker']
++        report['temporary'] = temporary
+         return report
+diff --git a/nova/checkpoints/workflow_v2.py b/nova/checkpoints/workflow_v2.py
+index 03bfc41bbba3292bb52babd4070881173ffa876f..2429bcc2bf149de7458d0e25ddfdce5aa99a7b01 100644
+--- a/nova/checkpoints/workflow_v2.py
++++ b/nova/checkpoints/workflow_v2.py
+@@ -116,3 +116,64 @@ def child_plan(kind, phase, resources):
+     else:
+         raise ValueError('Unsupported checkpoint phase')
+     return tuple(entries)
++
++
++def execution_plan(kind, statuses, children):
++    """Compensate only terminal effects; a partial revert stays guarded."""
++    normal = steps_for(kind)
++    failed = any(
++        statuses.get(p) in ('failed_no_effect', 'failed_with_effects')
++        for p in normal
++    )
++    terminal = ('succeeded', 'failed_no_effect', 'failed_with_effects')
++    if (
++        not failed or
++        kind == 'delete' or
++        any(
++            value not in terminal
++            for phase, value in statuses.items()
++            if phase in normal
++        ) or
++        any(
++            row['status'] not in terminal
++            for phase, rows in children.items()
++            if phase in normal
++            for row in rows
++        )
++    ):
++        return normal, False
++    saved = next(
++        (
++            r['status']
++            for r in children.get('runtime_save', [])
++            if r['action'] == 'save'
++        ),
++        None,
++    )
++    stopped = next(
++        (
++            r['status']
++            for r in children.get('runtime_stop', [])
++            if r['action'] == 'stop'
++        ),
++        None,
++    )
++    if (kind == 'create' and saved == 'failed_with_effects') or (
++        kind == 'revert' and stopped not in (None, 'failed_no_effect')
++    ):
++        return normal, False
++    cleanup = []
++    if (
++        saved == 'succeeded' and
++        statuses.get('runtime_restore_current') != 'succeeded'
++    ):
++        cleanup.append('cleanup_runtime_restore_current')
++    if kind == 'create' and statuses.get('cinder_reserve') == 'succeeded':
++        cleanup.append('cleanup_disk_snapshots')
++    if kind == 'create' and 'artifact_publish_shared' in statuses:
++        cleanup.append('cleanup_artifacts')
++    if 'runtime_save' in statuses or 'artifact_stage' in statuses:
++        cleanup.append('staging_cleanup')
++    if statuses.get('cinder_reserve') == 'succeeded':
++        cleanup.append('cleanup_cinder_release')
++    return tuple(cleanup), True
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index d44cc113fb5b20c30c3c145c42ef61be02986a09..125692237fcd7f099d87b2d01b8a5c1de6e644dc 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -12357,9 +12357,29 @@ class ComputeManager(manager.Manager):
+                 context, instance, manifest, existing=existing).to_primitive()
+ 
+     def checkpoint_execute(self, context, instance, operation_id, generation):
+-        checkpoint_compute.ComputeExecutor(
+-            self.driver, host=self.host).execute(
+-                context, instance, operation_id, generation)
++        return checkpoint_compute.ComputeExecutor(
++            self.driver, host=self.host
++        ).execute(context, instance, operation_id, generation)
++
++    def checkpoint_continue(
++        self,
++        context,
++        instance,
++        operation_id,
++        generation,
++        step_id,
++        journal_revision,
++    ):
++        return checkpoint_compute.ComputeExecutor(
++            self.driver, host=self.host
++        ).continue_step(
++            context,
++            instance,
++            operation_id,
++            generation,
++            step_id,
++            journal_revision,
++        )
+ 
+     def checkpoint_query(self, context, instance, operation_id, generation):
+         return checkpoint_compute.ComputeExecutor(
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index d29a8d2ed2e6d7fb58645cc33a01439cea150877..334bd842aaacfe27d8efa3485ba45d7ca36fd549 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -1609,12 +1609,57 @@ class ComputeAPI(object):
+             context, 'checkpoint_probe', instance=instance, manifest=manifest,
+             **kwargs)
+ 
+-    def checkpoint_execute(self, context, instance, operation_id, generation):
+-        return self._checkpoint_client(context, instance).call(
+-            context, 'checkpoint_execute', instance=instance,
+-            operation_id=operation_id, generation=generation)
++    def checkpoint_execute(
++        self,
++        context,
++        instance,
++        operation_id,
++        generation,
++        contract_version=1,
++    ):
++        return self._checkpoint_client(
++            context, instance, '6.6' if contract_version == 2 else '6.5'
++        ).call(
++            context,
++            'checkpoint_execute',
++            instance=instance,
++            operation_id=operation_id,
++            generation=generation,
++        )
+ 
+-    def checkpoint_query(self, context, instance, operation_id, generation):
+-        return self._checkpoint_client(context, instance).call(
+-            context, 'checkpoint_query', instance=instance,
+-            operation_id=operation_id, generation=generation)
++    def checkpoint_query(
++        self,
++        context,
++        instance,
++        operation_id,
++        generation,
++        contract_version=1,
++    ):
++        return self._checkpoint_client(
++            context, instance, '6.6' if contract_version == 2 else '6.5'
++        ).call(
++            context,
++            'checkpoint_query',
++            instance=instance,
++            operation_id=operation_id,
++            generation=generation,
++        )
++
++    def checkpoint_continue(
++        self,
++        context,
++        instance,
++        operation_id,
++        generation,
++        step_id,
++        journal_revision,
++    ):
++        return self._checkpoint_client(context, instance, '6.6').call(
++            context,
++            'checkpoint_continue',
++            instance=instance,
++            operation_id=operation_id,
++            generation=generation,
++            step_id=step_id,
++            journal_revision=journal_revision,
++        )
+diff --git a/nova/db/main/checkpoint_effects.py b/nova/db/main/checkpoint_effects.py
+index 83a4807526514e19a1fa275de1ad4ef37fcc4dcc..f6bd2ae0a7de7f88cad734d39b692012067e1ed1 100644
+--- a/nova/db/main/checkpoint_effects.py
++++ b/nova/db/main/checkpoint_effects.py
+@@ -118,14 +118,45 @@ def _artifact_plan(context, operation, checkpoint, phase):
+                      kind=item.kind, location=location,
+                      upper_bound=item.upper_bound, source_id=item.id)
+                 for item in source]
+-    return [dict(id=item.id, kind=item.kind, location=item.location,
+-                 upper_bound=item.upper_bound)
+-            for item in existing if item.writer_state != 'deleted']
++    return [
++        dict(
++            id=item.id,
++            kind=item.kind,
++            location=item.location,
++            upper_bound=item.upper_bound,
++        )
++        for item in existing
++        if item.writer_state != 'deleted' and
++        (
++            (
++                phase == 'staging_cleanup' and
++                item.location == 'staging' and
++                item.operation_id == operation.uuid
++            ) or
++            (
++                phase in ('artifact_delete', 'cleanup_artifacts') and
++                item.location == 'shared'
++            ) or
++            phase
++            not in (
++                'staging_cleanup',
++                'artifact_delete',
++                'cleanup_artifacts',
++            )
++        )
++    ]
+ 
+ 
+ def claim_parent(context, instance, checkpoint, operation, phase):
+-    phases = workflow.steps_for(operation.kind)
+     steps = {s.phase: s for s in journal._steps(context, operation.uuid)}
++    phases, cleaning = workflow.execution_plan(
++        operation.kind,
++        {name: step.status for name, step in steps.items()},
++        {
++            name: [journal._row(r) for r in _rows(context, step)]
++            for name, step in steps.items()
++        },
++    )
+     if phase not in phases:
+         journal._conflict()
+     if phase in steps:
+@@ -147,7 +178,9 @@ def claim_parent(context, instance, checkpoint, operation, phase):
+     if phase == 'cinder_reserve':
+         resources['cinder_reserve'] = v2.cinder_reserve_payload(
+             SimpleNamespace(**journal._row(operation)))
+-    graph = workflow.child_plan(operation.kind, phase, resources)
++    graph = workflow.child_plan(
++        'cleanup' if cleaning else operation.kind, phase, resources
++    )
+     from nova.db.main import checkpoint_temporary as temporary
+     # Preflight/reserve may precede the temporary ticket confirmation.
+     if operation.kind == 'revert' and phase in (
+@@ -258,9 +291,26 @@ def _bind_child(context, checkpoint, operation, child, result):
+                     if r.child_id == child.id]
+     valid = True
+     if result.status == 'failed_with_effects':
+-        valid = (set(evidence['terminal_child_ids']) == {child.id} and
+-                 set(evidence['resource_ids']) == {r.id for r in reservations})
++        expected = (
++            {d.volume_id for d in journal._disks(context, checkpoint.uuid)}
++            if child.action == 'submit_disk_operation'
++            else {r.id for r in reservations}
++        )
++        valid = (
++            set(evidence['terminal_child_ids']) == {child.id} and
++            set(evidence['resource_ids']) == expected
++        )
+     if result.status == 'succeeded':
++        if child.action == 'submit_disk_operation':
++            parent = context.session.get(
++                m.InstanceCheckpointStep, child.parent_step_id
++            )
++            valid &= evidence['phase'] == parent.phase and set(
++                evidence['volume_ids']
++            ) == {
++                d.volume_id
++                for d in journal._disks(context, checkpoint.uuid)
++            }
+         if 'volume_id' in evidence:
+             valid &= evidence['volume_id'] == child.resource_id
+         if 'guest_fingerprint' in evidence:
+@@ -483,6 +533,18 @@ def _parent_success(parent, children, evidence):
+     if any(row.status != 'succeeded' for row in children):
+         return False
+     proofs = [jsonutils.loads(row.result)['evidence'] for row in children]
++    if parent.phase in (
++        'disk_snapshot',
++        'disk_revert',
++        'disk_snapshot_delete',
++        'cleanup_disk_snapshots',
++    ):
++        return (
++            len(proofs) == 1 and
++            proofs[0]['phase'] == parent.phase and
++            {k: v for k, v in proofs[0].items() if k != 'phase'} ==
++            evidence
++        )
+     if parent.phase in ('runtime_save', 'artifact_publish_shared',
+                         'artifact_stage'):
+         refs = []
+@@ -533,12 +595,25 @@ def finish_parent(context, instance, checkpoint, operation, parent, value):
+     elif result.status == 'ready':
+         valid = dict(result.evidence) == _continuation(context, parent)
+     elif result.status == 'failed_with_effects':
+-        valid = (all(row.status in TERMINAL for row in children) and
+-                 set(result.evidence['terminal_child_ids']) ==
+-                 {row.id for row in children} and
+-                 set(result.evidence['resource_ids']) == {r.id for r in
+-                     _reservations(context, checkpoint.uuid)
+-                     if r.child_id in {row.id for row in children}})
++        expected = {
++            r.id
++            for r in _reservations(context, checkpoint.uuid)
++            if r.child_id in {row.id for row in children}
++        }
++        for row in children:
++            if (
++                row.action == 'submit_disk_operation' and
++                row.status == 'failed_with_effects'
++            ):
++                expected.update(
++                    jsonutils.loads(row.result)['evidence']['resource_ids']
++                )
++        valid = (
++            all(row.status in TERMINAL for row in children) and
++            set(result.evidence['terminal_child_ids']) ==
++            {row.id for row in children} and
++            set(result.evidence['resource_ids']) == expected
++        )
+     elif result.status == 'failed_no_effect':
+         valid = all(row.status == 'failed_no_effect' for row in children)
+     if not valid:
+@@ -548,6 +623,8 @@ def finish_parent(context, instance, checkpoint, operation, parent, value):
+         if parent.result != encoded:
+             journal._conflict()
+         return
++    if result.status == 'succeeded':
++        record_resources(context, checkpoint, operation, parent, result)
+     parent.status, parent.result = result.status, encoded
+     parent.version += 1
+     operation.version += 1
+@@ -603,3 +680,151 @@ def settlement_resources(context, checkpoint, manifest):
+         journal._conflict('identity_changed')
+     return [dict(id=r.id, checksum=r.checksum, bytes=r.actual_bytes)
+             for r in shared]
++
++
++def record_resources(context, checkpoint, operation, parent, result):
++    evidence = result.to_primitive()['evidence']
++    phase = parent.phase
++    disks = journal._disks(context, checkpoint.uuid)
++    if phase in (
++        'disk_snapshot',
++        'disk_revert',
++        'disk_snapshot_delete',
++        'cleanup_disk_snapshots',
++    ):
++        c._require(
++            set(evidence['volume_ids']) == {d.volume_id for d in disks}
++        )
++        if phase in ('disk_revert', 'disk_snapshot_delete'):
++            c._require(
++                {
++                    (s['volume_id'], s['snapshot_id'])
++                    for s in evidence['snapshots']
++                } ==
++                {(d.volume_id, d.snapshot_id) for d in disks}
++            )
++        if phase == 'disk_snapshot':
++            used = (
++                context.session.query(m.InstanceCheckpointDisk.snapshot_id)
++                .join(
++                    m.InstanceCheckpoint,
++                    m.InstanceCheckpointDisk.checkpoint_id ==
++                    m.InstanceCheckpoint.uuid,
++                )
++                .filter(
++                    m.InstanceCheckpoint.uuid != checkpoint.uuid,
++                    m.InstanceCheckpoint.status != 'deleted',
++                )
++                .all()
++            )
++            c._require(
++                not {s['snapshot_id'] for s in evidence['snapshots']} &
++                {row.snapshot_id for row in used}
++            )
++        if phase != 'disk_revert':
++            journal._record_resources(context, checkpoint, parent, result)
++    elif phase == 'artifact_publish_shared':
++        for primitive in evidence['artifacts']:
++            ref = v2.ArtifactRef.from_primitive(primitive)
++            row = next(
++                r
++                for r in _reservations(context, checkpoint.uuid)
++                if r.id == ref.id
++            )
++            c._require(
++                row.writer_state == 'closed' and row.location == 'shared'
++            )
++            context.session.add(
++                m.InstanceCheckpointArtifact(
++                    uuid=ref.id,
++                    checkpoint_id=checkpoint.uuid,
++                    kind=ref.kind,
++                    logical_id=ref.logical_id,
++                    expected_upper_bound=row.upper_bound,
++                    actual_bytes=ref.bytes,
++                    checksum=ref.checksum,
++                    state='available',
++                )
++            )
++    elif phase in ('artifact_delete', 'cleanup_artifacts'):
++        for artifact in journal._artifacts(context, checkpoint.uuid):
++            if artifact.uuid in evidence['deleted_artifact_ids']:
++                artifact.state = 'deleted'
++    elif phase in ('cinder_release', 'cleanup_cinder_release'):
++        reserved = next(
++            s
++            for s in journal._steps(context, operation.uuid)
++            if s.phase == 'cinder_reserve'
++        )
++        c._require(
++            evidence['operation_id'] ==
++            jsonutils.loads(reserved.result)['evidence']['operation_id']
++        )
++        c._require(
++            evidence['outcome'] ==
++            (
++                'failed_no_effect'
++                if phase.startswith('cleanup_')
++                else 'succeeded'
++            )
++        )
++
++
++def finalize(context, instance, guard, checkpoint, operation):
++    steps = {s.phase: s for s in journal._steps(context, operation.uuid)}
++    children = {
++        name: [journal._row(r) for r in _rows(context, step)]
++        for name, step in steps.items()
++    }
++    phases, cleaning = workflow.execution_plan(
++        operation.kind,
++        {name: step.status for name, step in steps.items()},
++        children,
++    )
++    if any(
++        p not in steps or steps[p].status != 'succeeded' for p in phases
++    ) or any(
++        r['status'] not in TERMINAL
++        for rows in children.values()
++        for r in rows
++    ):
++        journal._conflict('resources_remaining')
++    if operation.kind == 'revert':
++        budget = context.session.get(
++            m.InstanceCheckpointTemporaryBudget, operation.uuid
++        )
++        if budget is None or budget.state not in ('closed', 'cancelled'):
++            journal._conflict('resources_remaining')
++    closing = operation.kind == 'delete' or (
++        cleaning and operation.kind == 'create'
++    )
++    if closing:
++        if not resources_closed(context, checkpoint):
++            journal._conflict('resources_remaining')
++        for disk in journal._disks(context, checkpoint.uuid):
++            if cleaning and disk.snapshot_id is None:
++                disk.state = 'deleted'
++            if disk.state != 'deleted':
++                journal._conflict('resources_remaining')
++        checkpoint.terminal_operation_id = operation.uuid
++        operation.state = 'failed' if cleaning else 'running'
++        if not operation.quota_released:
++            context.session.flush()
++            return journal._row(operation)
++        checkpoint.status = 'deleted'
++        operation.state = 'released'
++        guard.checkpoint_count -= 1
++    else:
++        if operation.kind == 'create':
++            if checkpoint.artifact_usage_proof is None:
++                journal._conflict('resources_remaining')
++        checkpoint.status = 'available'
++        operation.state = 'released' if cleaning else 'succeeded'
++    checkpoint.active_operation_id = None
++    guard.operation_id = None
++    guard.token = None
++    guard.version += 1
++    operation.version += 1
++    instance.task_state = operation.previous_task_state
++    context.session.flush()
++    return journal._row(operation)
+diff --git a/nova/db/main/checkpoints.py b/nova/db/main/checkpoints.py
+index 21df9730b5dfdfd8bbe4031da6c2c5603ed83316..6d70e9b10aae48564a6adcbd4d5811dcad6ef47d 100644
+--- a/nova/db/main/checkpoints.py
++++ b/nova/db/main/checkpoints.py
+@@ -889,8 +889,11 @@ def finalize(context, operation_id, generation, outcome):
+         context, operation_id, generation
+     )
+     if operation.contract_version == 2:
+-        # V2 finalization requires its complete orchestrator and proofs.
+-        _conflict('resources_remaining')
++        from nova.db.main import checkpoint_effects as effects
++
++        return effects.finalize(
++            context, instance, guard, checkpoint, operation
++        )
+     steps = {step.phase: step for step in _steps(context, operation_id)}
+     phases, cleaning = workflow.execution_plan(
+         operation.kind, {name: step.status for name, step in steps.items()}
+@@ -1258,7 +1261,12 @@ def _scope_matches(context, guard, instance_uuid):
+         if (
+             operation.phase != scope.action or
+             step is None or
+-            step.status not in ('dispatching', 'pending', 'unknown')
++            step.status
++            not in (
++                ('dispatching', 'pending', 'unknown', 'ready')
++                if operation.contract_version == 2
++                else ('dispatching', 'pending', 'unknown')
++            )
+         ):
+             _conflict('guard_busy')
+     return scope
+diff --git a/nova/objects/checkpoint_effect.py b/nova/objects/checkpoint_effect.py
+index 4f4e730ac82dd102c2fe41de497be5093ff051e6..129d4823eb3ea751b5bb6f98e84162df90abddb8 100644
+--- a/nova/objects/checkpoint_effect.py
++++ b/nova/objects/checkpoint_effect.py
+@@ -20,6 +20,10 @@ from nova.objects import base
+ class CheckpointEffect(base.NovaObject):
+     VERSION = '1.0'
+ 
++    @base.remotable_classmethod
++    def cancel_prepared(cls, context, operation_id, generation):
++        db.cancel_prepared(context, operation_id, generation)
++
+     @base.remotable_classmethod
+     def prepare(cls, context, parent_step_id, action, resource_id, payload):
+         return db.prepare(
+diff --git a/nova/tests/fixtures/checkpoints.py b/nova/tests/fixtures/checkpoints.py
+index 2aeeecc1340c44ec0daef898072c10d8b9849655..0e1fe774541d2b35da191b9ea8f7a828a3e89305 100644
+--- a/nova/tests/fixtures/checkpoints.py
++++ b/nova/tests/fixtures/checkpoints.py
+@@ -18,6 +18,7 @@ from oslo_utils.fixture import uuidsentinel as uuids
+ from oslo_utils import uuidutils
+ import webob
+ 
++from nova.checkpoints import api as checkpoint_api
+ from nova.checkpoints import recovery
+ from nova.compute import manager as compute_manager
+ from nova.conductor import manager as conductor_manager
+@@ -35,9 +36,15 @@ from nova.tests.unit.checkpoints import test_cell_db
+ 
+ class CheckpointTestCase(test.TestCase):
+     NUMBER_OF_CELLS = 2
++    CHECKPOINT_CONTRACT_VERSION = 1
+ 
+     def setUp(self):
+         super().setUp()
++        self.patch(
++            checkpoint_api.API,
++            'contract_version',
++            self.CHECKPOINT_CONTRACT_VERSION,
++        )
+         self.flags(
+             enabled=True,
+             max_artifact_bytes_per_project=65536,
+@@ -107,13 +114,16 @@ class CheckpointTestCase(test.TestCase):
+                 project_id='project',
+             ).create()
+             manager = compute_manager.ComputeManager(host=host)
+-            manager.driver = fake_executor.FakeCheckpointDriver()
++            manager.driver = self.make_driver(index, manager)
+             self.managers.append(manager)
+             self.drivers.append(manager.driver)
+             self._serve('compute', host, [manager])
+         # Only authentication is simulated. Controller/API/DB/RPC are real.
+         self.app = fakes.wsgi_app_v21(fake_auth_context=self.ctx)
+ 
++    def make_driver(self, index, manager):
++        return fake_executor.FakeCheckpointDriver()
++
+     def _serve(self, topic, host, endpoints):
+         server = rpc.get_server(
+             messaging.Target(topic=topic, server=host),
+diff --git a/nova/tests/fixtures/checkpoints_v2.py b/nova/tests/fixtures/checkpoints_v2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..166e699ffcbdea41b5a96e0008726a5c29b729b6
+--- /dev/null
++++ b/nova/tests/fixtures/checkpoints_v2.py
+@@ -0,0 +1,525 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Real N2 components over explicitly simulated physical/service boundaries."""
++
++from collections import Counter
++import copy
++import os
++from pathlib import Path
++import tempfile
++import uuid
++
++from lxml import etree
++from oslo_serialization import jsonutils
++from oslo_utils.fixture import uuidsentinel as uuids
++from oslo_utils import uuidutils
++
++from nova.checkpoints import attachments
++from nova.checkpoints import contracts as c
++from nova import context
++from nova import objects
++from nova.tests.fixtures import checkpoints
++from nova.tests.unit.virt.libvirt.checkpoints.test_topology import XML
++from nova.virt.libvirt.checkpoints import executor
++from nova.virt.libvirt.checkpoints import profiles
++from nova.virt.libvirt.checkpoints import runtime
++from nova.virt.libvirt.checkpoints import staging
++from nova.virt.libvirt.checkpoints import store
++from nova.virt.libvirt.checkpoints import topology
++
++LIMIT = 1024 * 1024
++
++
++class Backend:
++    def __init__(self, instance, volume, port, mac):
++        self.instance, self.volume, self.port = instance, volume, port
++        self.uuid, self.state = instance.uuid, 1
++        self.calls = Counter()
++        self.fail = set()
++        self.xml = (
++            XML.replace(uuids.instance, instance.uuid)
++            .replace(uuids.volume, volume)
++            .replace('fa:16:3e:00:00:01', mac)
++        )
++        self.interface = etree.tostring(
++            topology.document(self.xml).find('devices/interface'),
++            encoding='unicode',
++        )
++        self.operations, self.requests, self.attachments = {}, {}, {}
++        self.disk_bytes = b'original-volume'
++        self.memory = b'original-memory'
++        self.snapshots = {}
++
++    def get_guest(self, instance):
++        if 'missing_domain' in self.fail:
++            raise RuntimeError('simulated absent domain')
++        assert instance.uuid == self.uuid
++        return self
++
++    def get_xml_desc(self, **kwargs):
++        return self.xml
++
++    def checkpoint_state(self):
++        return dict(state=self.state, managed_save=False, job=0)
++
++    def checkpoint_block_job(self, name):
++        return {}
++
++    def checkpoint_set_marker(self, marker):
++        root = topology.document(self.xml)
++        old = root.find('metadata')
++        if old is not None:
++            root.remove(old)
++        etree.SubElement(root, 'metadata').append(
++            etree.fromstring(marker.encode())
++        )
++        self.xml = etree.tostring(root, encoding='unicode')
++
++    def checkpoint_save(self, path, xml):
++        self.calls['save'] += 1
++        Path(path).write_bytes(
++            jsonutils.dump_as_bytes(
++                dict(xml=xml, memory=self.memory.hex())
++            )
++        )
++        self.xml, self.state = xml, 5
++        if 'save_reply' in self.fail:
++            raise RuntimeError('simulated native save reply loss')
++
++    def checkpoint_stop(self):
++        self.calls['stop'] += 1
++        self.state = 5
++
++    def checkpoint_saved_xml(self, path):
++        return jsonutils.loads(Path(path).read_bytes())['xml']
++
++    def checkpoint_restore(self, path, xml):
++        self.calls['restore'] += 1
++        self.memory = bytes.fromhex(
++            jsonutils.loads(Path(path).read_bytes())['memory']
++        )
++        self.xml, self.state = xml, 3
++        if 'restore_reply' in self.fail:
++            raise RuntimeError('simulated native restore reply loss')
++
++    def resume(self):
++        self.calls['unpause'] += 1
++        self.state = 1
++        if 'unpause_reply' in self.fail:
++            raise RuntimeError('simulated native unpause reply loss')
++
++    def show_port(self, ident):
++        assert ident == self.port
++        return dict(
++            port=dict(
++                id=ident,
++                device_id=self.uuid,
++                network_id=uuids.network,
++                mac_address=self.interface_mac,
++                project_id=self.instance.project_id,
++                status='ACTIVE',
++                **{
++                    'binding:host_id': self.instance.host,
++                    'binding:vnic_type': 'normal',
++                    'binding:vif_type': 'ovs',
++                },
++            )
++        )
++
++    @property
++    def interface_mac(self):
++        return (
++            etree.fromstring(self.interface.encode())
++            .find('mac')
++            .get('address')
++        )
++
++    def sources(self, ctx, instance, disk):
++        bdm = objects.BlockDeviceMapping.get_by_volume_and_instance(
++            ctx, disk['volume_id'], instance.uuid
++        )
++        connection = jsonutils.loads(bdm.connection_info)
++        path = connection.get('data', {}).get(
++            'device_path', '/dev/mapper/disk-original'
++        )
++        node = topology.document(XML).find('devices/disk')
++        node.find('serial').text = disk['serial']
++        node.find('source').set('dev', path)
++        node.find('target').set(
++            'dev', disk['device_name'].removeprefix('/dev/')
++        )
++        return etree.tostring(node, encoding='unicode')
++
++    def volumes(self, ctx, ids, purpose, operation_id):
++        return {
++            ident: dict(id=ident, multiattach=False, encrypted=False)
++            for ident in ids
++        }
++
++    def preflight_capabilities(self, ctx, ids):
++        return {ident: dict(supported=True) for ident in ids}
++
++    def capabilities(self, ctx, operation, ident):
++        assert ident in [
++            r['volume_id'] for r in self.operations[operation]['resources']
++        ]
++        return dict(supported=True)
++
++    def reserve(self, ctx, operation, checkpoint, instance, kind, ids):
++        assert ctx.auth_token, 'background cannot create a reserve'
++        self.calls['reserve'] += 1
++        if 'reserve_absent' in self.fail:
++            raise RuntimeError('simulated request did not reach Cinder')
++        if operation not in self.operations:
++            original = (
++                objects.InstanceCheckpointDiskList.get_by_checkpoint(
++                    ctx, checkpoint
++                )
++                if kind != 'create'
++                else None
++            )
++            resources = []
++            for ident in ids:
++                snapshot = (
++                    next(
++                        r.snapshot_id
++                        for r in original
++                        if r.volume_id == ident
++                    )
++                    if original
++                    else uuidutils.generate_uuid()
++                )
++                resources.append(
++                    dict(
++                        id=uuidutils.generate_uuid(),
++                        volume_id=ident,
++                        snapshot_id=snapshot,
++                        status='reserved',
++                    )
++                )
++            self.operations[operation] = dict(
++                id=uuidutils.generate_uuid(),
++                kind=kind,
++                generation=1,
++                instance_uuid=instance,
++                status='reserved',
++                resources=resources,
++                steps=[],
++                release_outcome=None,
++            )
++        if 'reserve_reply' in self.fail:
++            raise RuntimeError('simulated reserve reply loss')
++        return copy.deepcopy(self.operations[operation])
++
++    def get(self, ctx, operation):
++        return copy.deepcopy(self.operations[operation])
++
++    def action(self, ctx, operation, action, generation, **kwargs):
++        op = self.operations[operation]
++        self.calls[action] += 1
++        if action == 'release':
++            op.update(status='released', release_outcome=kwargs['outcome'])
++        else:
++            phase = (
++                'delete_snapshot'
++                if action == 'cleanup'
++                else {
++                    'create': 'snapshot',
++                    'revert': 'revert',
++                    'delete': 'delete_snapshot',
++                }[op['kind']]
++            )
++            if not any(s['phase'] == phase for s in op['steps']):
++                for index, resource in enumerate(op['resources']):
++                    self.calls[phase] += 1
++                    snapshot = resource['snapshot_id']
++                    if (
++                        phase == 'snapshot' and
++                        index == 1 and
++                        'partial_snapshot' in self.fail
++                    ):
++                        op['steps'].append(
++                            dict(
++                                id=uuidutils.generate_uuid(),
++                                resource_id=resource['id'],
++                                phase=phase,
++                                status='failed_no_effect',
++                            )
++                        )
++                        continue
++                    if (
++                        phase == 'revert' and
++                        index == 1 and
++                        'partial_revert' in self.fail
++                    ):
++                        op['steps'].append(
++                            dict(
++                                id=uuidutils.generate_uuid(),
++                                resource_id=resource['id'],
++                                phase=phase,
++                                status='failed_no_effect',
++                            )
++                        )
++                        continue
++                    if action == 'cleanup':
++                        original = next(
++                            (
++                                s
++                                for s in op['steps']
++                                if s['phase'] == 'snapshot' and
++                                s['resource_id'] == resource['id']
++                            ),
++                            None,
++                        )
++                        if (
++                            original is not None and
++                            original['status'] == 'failed_no_effect'
++                        ):
++                            resource['status'] = 'deleted'
++                            continue
++                        if 'cleanup_pending' in self.fail:
++                            op['steps'].append(
++                                dict(
++                                    id=uuidutils.generate_uuid(),
++                                    resource_id=resource['id'],
++                                    phase=phase,
++                                    status='pending',
++                                )
++                            )
++                            continue
++                    if phase == 'snapshot':
++                        self.snapshots[snapshot] = self.disk_bytes
++                        resource['status'] = 'available'
++                    elif phase == 'revert':
++                        self.disk_bytes = self.snapshots[snapshot]
++                    else:
++                        self.snapshots.pop(snapshot, None)
++                        resource['status'] = 'deleted'
++                    op['steps'].append(
++                        dict(
++                            id=uuidutils.generate_uuid(),
++                            resource_id=resource['id'],
++                            phase=phase,
++                            status='succeeded',
++                        )
++                    )
++            op['status'] = (
++                'succeeded'
++                if all(s['status'] == 'succeeded' for s in op['steps'])
++                else 'recovery_required'
++            )
++        return copy.deepcopy(op)
++
++    def submit_attachment(self, ctx, operation, payload):
++        self.calls['attachment_' + payload['action']] += 1
++        if payload['id'] not in self.requests:
++            ident = payload['attachment_id'] or uuidutils.generate_uuid()
++            self.requests[payload['id']] = dict(
++                payload, attachment_id=ident, status='succeeded'
++            )
++            self.attachments[ident] = dict(
++                id=ident,
++                volume_id=payload['volume_id'],
++                instance=self.uuid,
++                status='attaching',
++                connection_info=dict(
++                    driver_volume_type='iscsi',
++                    data=dict(volume_id=payload['volume_id']),
++                ),
++            )
++        return copy.deepcopy(self.requests[payload['id']])
++
++    def get_attachment_request(self, ctx, operation, ident):
++        return copy.deepcopy(self.requests[ident])
++
++    def get_attachment(self, ctx, operation, ident):
++        return copy.deepcopy(self.attachments[ident])
++
++
++class Driver:
++    def __init__(self, backend, virtapi):
++        self.backend, self.virtapi = backend, virtapi
++
++    def checkpoint_probe_v2(
++        self,
++        context,
++        instance,
++        manifest,
++        purpose,
++        checkpoint_id=None,
++        operation_id=None,
++    ):
++        return self.checkpoint_executor.probe(
++            context,
++            instance,
++            manifest,
++            purpose,
++            checkpoint_id,
++            operation_id,
++        ).to_primitive()
++
++    def checkpoint_execute_v2(self, context, instance, intent):
++        return self.checkpoint_executor.execute(context, instance, intent)
++
++    def checkpoint_query_v2(self, context, instance, intent):
++        return self.checkpoint_executor.query(context, instance, intent)
++
++    def get_volume_connector(self, instance):
++        return dict(host=instance.host)
++
++    def _checkpoint_disconnect_volume(
++        self, ctx, instance, binding, child, connection
++    ):
++        assert self.backend.state == 5
++        self.backend.calls['disconnect'] += 1
++
++    def _checkpoint_connect_volume(
++        self, ctx, instance, binding, child, connection
++    ):
++        assert self.backend.state == 5
++        self.backend.calls['connect'] += 1
++        connection['data']['device_path'] = (
++            '/dev/mapper/new-' + child.resource_id
++        )
++
++
++class CheckpointV2TestCase(checkpoints.CheckpointTestCase):
++    CHECKPOINT_CONTRACT_VERSION = 2
++
++    def setUp(self):
++        super().setUp()
++        self.ctx.auth_token = 'test-original-user'
++        self.flags(
++            max_artifact_bytes_per_project=64 * LIMIT, group='checkpoint'
++        )
++
++    def make_driver(self, index, manager):
++        self.flags(deployment_id=uuids.deployment, group='checkpoint')
++        temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(temporary.cleanup)
++        root = Path(temporary.name)
++        with context.target_cell(self.ctx, self.cells[index]) as ctx:
++            inst = objects.Instance.get_by_uuid(ctx, self.servers[index])
++            bdm = objects.BlockDeviceMapping.get_by_volume_and_instance(
++                ctx, self.volumes[index], inst.uuid
++            )
++            bdm.attachment_id = uuidutils.generate_uuid()
++            bdm.save()
++        backend = Backend(
++            inst,
++            self.volumes[index],
++            self.ports[index],
++            'fa:16:3e:00:00:%02d' % index,
++        )
++        driver = Driver(backend, manager.virtapi)
++        observed_runtime = dict(
++            kind='runtime',
++            kvm=True,
++            libvirt_version=11010000,
++            qemu_version=9002000,
++            architecture='x86_64',
++            machine='pc-q35-9.2',
++            path_access='same-pid-namespace-proc-fd',
++        )
++        runtime_profile = profiles.ProfileMatch(
++            uuids.runtime,
++            'runtime',
++            c.canonical_payload_hash(observed_runtime),
++            'a' * 64,
++            observed_runtime,
++            dict(
++                max_memory_bytes=1024**3,
++                save_bytes_limit=LIMIT,
++                restore_bytes_limit=LIMIT,
++            ),
++        )
++        inspector = topology.Topology(
++            backend,
++            profileset=profiles.ProfileSet((runtime_profile,)),
++            observer=lambda guest, xml: observed_runtime,
++            neutron_factory=lambda ctx: backend,
++            volume_reader=backend.volumes,
++            source_reader=backend.sources,
++            interface_reader=lambda ctx, instance, port: backend.interface,
++        )
++
++        def filesystem(kind):
++            path = root / kind
++            path.mkdir(mode=0o700)
++            dev = path.stat().st_dev
++            observed = dict(
++                kind=kind,
++                fstype='xfs' if kind == 'staging' else 'nfs4',
++                mount_id=index + 1,
++                device='%s:%s' % (os.major(dev), os.minor(dev)),
++                fsid=os.statvfs(path).f_fsid,
++                source='test-only',
++                store_uuid=getattr(uuids, kind + 'fs'),
++                encrypted_at_rest=True,
++            )
++            observed[
++                (
++                    'project_quota'
++                    if kind == 'staging'
++                    else 'encrypted_transport'
++                )
++            ] = True
++            profile = profiles.ProfileMatch(
++                getattr(uuids, kind),
++                kind,
++                c.canonical_payload_hash(observed),
++                'a' * 64,
++                observed,
++                dict(
++                    max_bytes=4 * LIMIT,
++                    metadata_bytes=262144,
++                    allocation_unit=4096,
++                    max_workspaces=128,
++                    project_id_min=100000,
++                    project_id_max=2147483647,
++                ),
++            )
++            return str(path), profile, lambda path: dict(observed)
++
++        path, profile, observer = filesystem('staging')
++        local = staging.StagingStore(
++            path,
++            profile,
++            observer=observer,
++            quota_helper=lambda root, workspace, project, limit: dict(
++                project_id=project, limit_bytes=limit, enforced=True
++            ),
++            quota_observer=lambda root, workspace, project: dict(
++                project_id=project, limit_bytes=LIMIT, enforced=True
++            ),
++        )
++        path, profile, observer = filesystem('store')
++        shared = store.ArtifactStore(
++            path, profile, staging=local, observer=observer
++        )
++        native = runtime.Runtime(backend, local, inspector)
++        attach = attachments.AttachmentCoordinator(
++            driver, local, native, client=backend
++        )
++        driver.checkpoint_executor = executor.LibvirtCheckpointExecutor(
++            driver,
++            native,
++            shared,
++            local,
++            backend,
++            attach,
++            executor_id=str(
++                uuid.uuid5(uuid.UUID(uuids.deployment), manager.host)
++            ),
++        )
++        return driver
+diff --git a/nova/tests/functional/test_checkpoint_executor.py b/nova/tests/functional/test_checkpoint_executor.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b4158999d13c45d29d7a4e07199a9a2e8fe81ae
+--- /dev/null
++++ b/nova/tests/functional/test_checkpoint_executor.py
+@@ -0,0 +1,505 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import os
++from pathlib import Path
++import tempfile
++from unittest import mock
++
++from lxml import etree
++from oslo_serialization import jsonutils
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import attachments
++from nova.checkpoints import compute_v2
++from nova.checkpoints import contracts_v2
++from nova.checkpoints import coordinator
++from nova import context
++from nova.db.main import api as db
++from nova.db.main import models
++from nova import objects
++from nova.tests.fixtures import checkpoints_v2
++from nova.virt.libvirt.checkpoints import executor
++from nova.virt.libvirt.checkpoints import topology
++from nova.volume import checkpoints as cinder
++
++
++class ExecutorV2FunctionalTest(checkpoints_v2.CheckpointV2TestCase):
++    def test_actual_executor_through_wsgi_and_serialized_rpc(self):
++        self.assertIsInstance(
++            self.drivers[0].checkpoint_executor,
++            executor.LibvirtCheckpointExecutor,
++        )
++        created = self.create('A')
++        self.assertEqual('succeeded', self.operation(created)['state'])
++
++    def test_two_independent_points_arbitrary_revert_and_delete(self):
++        backend = self.drivers[0].backend
++        a = self.create('A')
++        aid = a['checkpoint']['id']
++        backend.memory, backend.disk_bytes = b'B-memory', b'B-volume'
++        b = self.create('B')
++        bid = b['checkpoint']['id']
++        self.assertEqual('succeeded', self.operation(b)['state'])
++        for ident, memory, disk in (
++            (aid, b'original-memory', b'original-volume'),
++            (bid, b'B-memory', b'B-volume'),
++            (aid, b'original-memory', b'original-volume'),
++        ):
++            result = self.action(ident, 'revert')
++            self.assertEqual('succeeded', self.operation(result)['state'])
++            self.assertEqual(
++                (memory, disk, 1),
++                (backend.memory, backend.disk_bytes, backend.state),
++            )
++        for ident in (bid, aid):
++            result = self.action(ident, 'delete')
++            self.assertEqual('released', self.operation(result)['state'])
++        self.assertEqual(0, self.usage()['artifact_bytes'])
++        self.assertEqual({}, backend.snapshots)
++
++    def test_delete_does_not_require_a_working_domain(self):
++        a = self.create()
++        self.drivers[0].backend.fail.add('missing_domain')
++        result = self.action(a['checkpoint']['id'], 'delete')
++        self.assertEqual('released', self.operation(result)['state'])
++
++    def test_native_save_reply_loss_remains_guarded_and_charged(self):
++        backend = self.drivers[0].backend
++        backend.fail.add('save_reply')
++        a = self.create()
++        self.assertNotEqual('succeeded', self.operation(a)['state'])
++        before = dict(backend.calls)
++        self.ctx.auth_token = None
++        self.flags(enabled=False, group='checkpoint')
++        for unused in range(2):
++            self.recover()
++        self.assertEqual(before, dict(backend.calls))
++        self.assertEqual(5, backend.state)
++        self.assertGreater(self.usage()['artifact_bytes'], 0)
++        self.assertEqual(0, backend.calls['snapshot'])
++
++    def advance(self, result):
++
++        return coordinator.Coordinator().run(
++            self.ctx, self.servers[0], result['operation']['id'], 1
++        )
++
++    def rows(self, result):
++
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            return list(
++                objects.InstanceCheckpointStepList.get_by_operation(
++                    ctx, result['operation']['id']
++                )
++            )
++
++    def drive_until(self, result, predicate):
++        for unused in range(40):
++            if predicate():
++                return
++            self.advance(result)
++        self.fail(
++            'bounded coordinator did not reach expected journal state: %s'
++            % [(s.phase, s.status) for s in self.rows(result)]
++        )
++
++    def test_query_observes_lost_rpc_without_repeating_save(self):
++
++        self.patch(coordinator.Coordinator, 'max_transitions', 1)
++        driver = self.drivers[0]
++        original = driver.checkpoint_execute_v2
++
++        def lost(ctx, inst, intent):
++            result = original(ctx, inst, intent)
++            if (
++                intent['phase'] == 'runtime_save' and
++                result['status'] == 'succeeded'
++            ):
++                raise RuntimeError(
++                    'Nova RPC lost after durable child receipt'
++                )
++            return result
++
++        # The save is a continuation; this wraps the same finite executor hook.
++        self.patch(driver, 'checkpoint_execute_v2', lost)
++        created = self.create()
++        self.drive_until(
++            created, lambda: driver.backend.calls['save'] == 1
++        )
++        self.assertEqual(0, driver.backend.calls['snapshot'])
++        self.assertEqual(
++            'unknown',
++            next(
++                s for s in self.rows(created) if s.phase == 'runtime_save'
++            ).status,
++        )
++        self.advance(
++            created
++        )  # query aggregates durable save, no disk submit
++        self.assertEqual(1, driver.backend.calls['save'])
++        self.assertEqual(0, driver.backend.calls['snapshot'])
++        self.advance(created)
++        self.assertEqual(1, driver.backend.calls['snapshot'])
++        self.drive_until(
++            created,
++            lambda: self.operation(created)['state'] == 'succeeded',
++        )
++        self.assertEqual(1, driver.backend.calls['save'])
++
++    def test_stale_continuation_never_claims_the_next_child(self):
++
++        self.patch(coordinator.Coordinator, 'max_transitions', 1)
++        created = self.create()
++        self.drive_until(
++            created,
++            lambda: any(
++                s.phase == 'runtime_save' and s.status == 'ready'
++                for s in self.rows(created)
++            ),
++        )
++        parent = next(
++            s for s in self.rows(created) if s.phase == 'runtime_save'
++        )
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            continuation = objects.CheckpointEffect.continuation(
++                ctx, parent.uuid
++            )
++            inst = objects.Instance.get_by_uuid(ctx, self.servers[0])
++            engine = compute_v2.ComputeV2(self.drivers[0], inst.host)
++            self.assertRaises(
++                ValueError,
++                engine.continue_step,
++                ctx,
++                inst,
++                created['operation']['id'],
++                1,
++                parent.uuid,
++                continuation['journal_revision'] - 1,
++            )
++        self.assertEqual(0, self.drivers[0].backend.calls['save'])
++        self.advance(created)
++        self.assertEqual(1, self.drivers[0].backend.calls['save'])
++
++    def add_disk(self):
++
++        backend = self.drivers[0].backend
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            db.block_device_mapping_create(
++                ctx,
++                dict(
++                    uuid=uuids.extra_bdm,
++                    instance_uuid=self.servers[0],
++                    volume_id=uuids.extra_volume,
++                    source_type='volume',
++                    destination_type='volume',
++                    device_type='disk',
++                    device_name='/dev/vdb',
++                    boot_index=-1,
++                    attachment_id=uuids.extra_attachment,
++                    connection_info=jsonutils.dumps(
++                        dict(serial=uuids.extra_volume)
++                    ),
++                ),
++                legacy=False,
++            )
++        root = topology.document(backend.xml)
++        disk = etree.fromstring(etree.tostring(root.find('devices/disk')))
++        disk.find('serial').text = uuids.extra_volume
++        disk.find('target').set('dev', 'vdb')
++        disk.find('address').set('slot', '0x06')
++        root.find('devices').append(disk)
++        backend.xml = etree.tostring(root, encoding='unicode')
++
++    def test_partial_snapshot_cleanup_holds_charge_until_remote_deletion(
++        self,
++    ):
++        self.add_disk()
++        backend = self.drivers[0].backend
++        backend.fail.update(('partial_snapshot', 'cleanup_pending'))
++        created = self.create()
++        self.assertNotEqual('succeeded', self.operation(created)['state'])
++        self.assertGreater(self.usage()['artifact_bytes'], 0)
++        self.assertEqual(
++            1, backend.state
++        )  # original RAM restored before cleanup
++        op = backend.operations[created['operation']['id']]
++        self.assertEqual(1, len(backend.snapshots))
++        # An independent service completion; Nova's next pass only GETs it.
++        for step in op['steps']:
++            if step['phase'] == 'delete_snapshot':
++                step['status'] = 'succeeded'
++                resource = next(
++                    r
++                    for r in op['resources']
++                    if r['id'] == step['resource_id']
++                )
++                backend.snapshots.pop(resource['snapshot_id'], None)
++                resource['status'] = 'deleted'
++        self.advance(created)
++        self.assertEqual('released', self.operation(created)['state'])
++        self.assertEqual(0, self.usage()['artifact_bytes'])
++        self.assertEqual({}, backend.snapshots)
++        self.assertEqual(1, backend.calls['cleanup'])
++
++    def test_partial_revert_never_reconnects_or_unpauses(self):
++        self.add_disk()
++        created = self.create()
++        backend = self.drivers[0].backend
++        backend.fail.add('partial_revert')
++        before = dict(backend.calls)
++        result = self.action(created['checkpoint']['id'], 'revert')
++        for unused in range(2):
++            self.recover()
++        self.assertNotEqual('succeeded', self.operation(result)['state'])
++        self.assertEqual(5, backend.state)
++        self.assertEqual(0, backend.calls['connect'])
++        self.assertEqual(before['unpause'], backend.calls['unpause'])
++        self.assertGreater(self.usage()['artifact_bytes'], 0)
++
++    def test_existing_operations_work_with_creation_disabled(self):
++        created = self.create()
++        self.flags(enabled=False, group='checkpoint')
++        self.create('refused', expected=409)
++        result = self.action(created['checkpoint']['id'], 'revert')
++        self.assertEqual('succeeded', self.operation(result)['state'])
++        result = self.action(created['checkpoint']['id'], 'delete')
++        self.assertEqual('released', self.operation(result)['state'])
++
++    def test_interrupted_upload_is_compensated_only_after_writer_is_fenced(
++        self,
++    ):
++
++        driver = self.drivers[0]
++        with mock.patch.object(
++            driver.checkpoint_executor.store,
++            '_copy',
++            side_effect=OSError('simulated copy error'),
++        ):
++            created = self.create()
++        self.assertGreater(self.usage()['artifact_bytes'], 0)
++        self.assertEqual(5, driver.backend.state)
++        self.advance(
++            created
++        )  # pure query fences the closed synchronous copy
++        self.assertEqual('released', self.operation(created)['state'])
++        self.assertEqual(1, driver.backend.state)
++        self.assertEqual(0, self.usage()['artifact_bytes'])
++        self.assertEqual({}, driver.backend.snapshots)
++
++    def test_revert_download_failure_aborts_before_stop(self):
++
++        driver = self.drivers[0]
++        created = self.create()
++        retained = self.usage()['artifact_bytes']
++        with mock.patch.object(
++            driver.checkpoint_executor.store,
++            '_copy',
++            side_effect=OSError('simulated download error'),
++        ):
++            result = self.action(created['checkpoint']['id'], 'revert')
++        self.assertGreater(self.usage()['artifact_bytes'], retained)
++        self.advance(result)
++        self.assertEqual('released', self.operation(result)['state'])
++        self.assertEqual(retained, self.usage()['artifact_bytes'])
++        self.assertEqual(0, driver.backend.calls['stop'])
++        self.assertEqual(0, driver.backend.calls['disconnect'])
++        self.assertEqual(1, driver.backend.state)
++
++    def test_lost_accepted_reserve_continues_with_expired_user(self):
++        driver = self.drivers[0]
++        driver.backend.fail.add('reserve_reply')
++        created = self.create()
++        self.assertEqual(1, driver.backend.calls['reserve'])
++        self.ctx.auth_token = None
++        self.recover()
++        self.assertEqual('succeeded', self.operation(created)['state'])
++        self.assertEqual(1, driver.backend.calls['reserve'])
++
++    def test_absent_reserve_requires_exact_user_api_replay(self):
++
++        backend = self.drivers[0].backend
++        backend.fail.add('reserve_absent')
++        created = self.create(request_id=uuids.replay_request)
++        self.assertEqual(1, backend.calls['reserve'])
++        backend.fail.remove('reserve_absent')
++        self.recover()
++        self.assertEqual(1, backend.calls['reserve'])
++        self.assertNotEqual('succeeded', self.operation(created)['state'])
++        self.patch(cinder, 'CheckpointClient', lambda: backend)
++        replayed = self.create(request_id=uuids.replay_request)
++        self.assertEqual(
++            created['operation']['id'], replayed['operation']['id']
++        )
++        self.assertEqual('succeeded', self.operation(replayed)['state'])
++        self.assertEqual(2, backend.calls['reserve'])
++
++    def test_native_unpause_reply_loss_never_unpauses_again(self):
++        backend = self.drivers[0].backend
++        backend.fail.add('unpause_reply')
++        created = self.create()
++        before = dict(backend.calls)
++        self.recover()
++        self.assertEqual(before, dict(backend.calls))
++        self.assertNotEqual('succeeded', self.operation(created)['state'])
++        self.assertGreater(self.usage()['artifact_bytes'], 0)
++        self.assertEqual(1, backend.calls['unpause'])
++
++    def test_compute_startup_query_precedes_guarded_ordinary_autostart(
++        self,
++    ):
++
++        backend = self.drivers[0].backend
++        backend.fail.add('save_reply')
++        created = self.create()
++        manager = self.managers[0]
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            instance = objects.Instance.get_by_uuid(ctx, self.servers[0])
++            manager._query_checkpoint_recovery(ctx, instance)
++            # The ordinary startup body would need driver methods unavailable
++            # on this test backend. The persistent guard must skip it entirely.
++            manager._init_instance(ctx, instance)
++        self.assertEqual(1, backend.calls['save'])
++        self.assertEqual(0, backend.calls['unpause'])
++        self.assertNotEqual('succeeded', self.operation(created)['state'])
++
++    def test_origin_host_mismatch_and_down_cell_preserve_charge(self):
++
++        backend = self.drivers[0].backend
++        backend.fail.add('save_reply')
++        created = self.create()
++        charged = self.usage()['artifact_bytes']
++        before = dict(backend.calls)
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            # Simulate external placement drift below the ordinary guard.
++            @db.pick_context_manager_writer
++            def drift(ctx):
++                ctx.session.query(models.Instance).filter_by(
++                    uuid=self.servers[0]
++                ).one().host = 'foreign-host'
++
++            drift(ctx)
++        with mock.patch.object(
++            objects.Instance,
++            'get_by_uuid',
++            side_effect=RuntimeError('cell down'),
++        ):
++            self.recover()
++        self.assertEqual(charged, self.usage()['artifact_bytes'])
++
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            instance = objects.Instance.get_by_uuid(ctx, self.servers[0])
++            self.assertRaises(
++                ValueError,
++                compute_v2.ComputeV2(self.drivers[0], 'compute0').advance,
++                ctx,
++                instance,
++                created['operation']['id'],
++                1,
++            )
++        self.assertEqual(before, dict(backend.calls))
++
++    def configure_config_drive(self):
++
++        directory = tempfile.TemporaryDirectory()
++        self.addCleanup(directory.cleanup)
++        self.flags(instances_path=directory.name)
++        path = Path(directory.name) / self.servers[0] / 'disk.config'
++        path.parent.mkdir(mode=0o700)
++        path.write_bytes(b'original readonly cloud configuration')
++        os.chmod(path, 0o600)
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            db.instance_update(
++                ctx, self.servers[0], dict(config_drive='True')
++            )
++        backend = self.drivers[0].backend
++        root = topology.document(backend.xml)
++        node = etree.SubElement(
++            root.find('devices'), 'disk', type='file', device='cdrom'
++        )
++        etree.SubElement(node, 'driver', name='qemu', type='raw')
++        etree.SubElement(node, 'source', file=str(path))
++        etree.SubElement(node, 'target', dev='sda', bus='sata')
++        etree.SubElement(node, 'readonly')
++        backend.xml = etree.tostring(root, encoding='unicode')
++        return path
++
++    def test_config_drive_is_copied_but_original_readonly_source_is_preserved(
++        self,
++    ):
++        path = self.configure_config_drive()
++        before = path.read_bytes()
++        created = self.create()
++        self.assertEqual('succeeded', self.operation(created)['state'])
++        result = self.action(created['checkpoint']['id'], 'revert')
++        self.assertEqual('succeeded', self.operation(result)['state'])
++        self.assertEqual(before, path.read_bytes())
++        self.assertIn(str(path), self.drivers[0].backend.xml)
++        self.assertNotIn('/proc/', self.drivers[0].backend.xml)
++        deleted = self.action(created['checkpoint']['id'], 'delete')
++        self.assertEqual('released', self.operation(deleted)['state'])
++        self.assertEqual(before, path.read_bytes())
++
++    def test_cancelled_prepared_upload_cannot_write_after_refund(self):
++
++        self.configure_config_drive()
++        engine = self.drivers[0].checkpoint_executor
++        with mock.patch.object(
++            engine.store,
++            '_copy',
++            side_effect=OSError('first upload failed'),
++        ):
++            created = self.create()
++        parent = next(
++            s
++            for s in self.rows(created)
++            if s.phase == 'artifact_publish_shared'
++        )
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            rows = objects.CheckpointEffect.get_children(ctx, parent.uuid)
++            stale = attachments.intent(
++                next(r for r in rows if r['status'] == 'prepared')
++            )
++            reservations = (
++                objects.CheckpointArtifactReservation.get_by_checkpoint(
++                    ctx, created['checkpoint']['id']
++                )
++            )
++            source = engine._ref(
++                next(
++                    r
++                    for r in reservations
++                    if r['id'] == stale.payload['source_id']
++                )
++            )
++            binding = contracts_v2.Binding.from_primitive(
++                parent.payload['binding']
++            )
++        self.advance(created)
++        self.assertEqual('released', self.operation(created)['state'])
++        self.assertEqual(0, self.usage()['artifact_bytes'])
++        before = {
++            str(p): p.stat().st_mtime_ns
++            for p in Path(engine.store.root).rglob('*')
++        }
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            result = engine.store.publish(
++                ctx, binding, stale, source, checkpoints_v2.LIMIT
++            )
++        self.assertNotEqual('succeeded', result.status)
++        self.assertEqual(
++            before,
++            {
++                str(p): p.stat().st_mtime_ns
++                for p in Path(engine.store.root).rglob('*')
++            },
++        )
+diff --git a/nova/tests/unit/checkpoints/test_api.py b/nova/tests/unit/checkpoints/test_api.py
+index b537ea7278de24f292ea235922408ec4b55d3849..af2628ec14acd5ec397c1b22360367bde4362da7 100644
+--- a/nova/tests/unit/checkpoints/test_api.py
++++ b/nova/tests/unit/checkpoints/test_api.py
+@@ -74,6 +74,8 @@ class APIFixture(test.TestCase):
+             self.coordinator.probe(*a, **kw).to_primitive()
+         )
+         self.api = api.API(conductor_api=self.task_rpc, ledger=self.ledger)
++        # Keep this fixture exercising persisted N1 admission/driver contracts.
++        self.api.contract_version = 1
+ 
+     def create(self, request_id=uuids.request, **kw):
+         return self.api.create(
+diff --git a/nova/tests/unit/checkpoints/test_execution_v2.py b/nova/tests/unit/checkpoints/test_execution_v2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f10e33977105ffa4a48211b55dce847bfffdacf
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/test_execution_v2.py
+@@ -0,0 +1,150 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from types import SimpleNamespace
++from unittest import mock
++
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import workflow_v2 as workflow
++from nova import test
++from nova.virt.libvirt.checkpoints import executor
++from nova.virt.libvirt import driver
++
++
++class ExecutionV2Test(test.NoDBTestCase):
++    def test_no_positive_profile_cannot_probe_or_execute_native_effect(
++        self,
++    ):
++        self.flags(deployment_id='', profile_file='', group='checkpoint')
++        backend = driver.LibvirtDriver.__new__(driver.LibvirtDriver)
++        backend._host = mock.Mock()
++        value = backend.checkpoint_probe_v2(None, None, {}, 'create')
++        self.assertFalse(value['supported'])
++        self.assertEqual(
++            'unknown',
++            backend.checkpoint_execute_v2(None, None, {})['status'],
++        )
++        self.assertEqual(
++            'unknown',
++            backend.checkpoint_query_v2(None, None, {})['status'],
++        )
++        self.assertEqual([], backend._host.mock_calls)
++
++    def test_unknown_sibling_prevents_compensation(self):
++        statuses = dict(runtime_save='failed_with_effects')
++        children = dict(
++            runtime_save=[dict(action='save', status='unknown')]
++        )
++        self.assertEqual(
++            (workflow.CREATE, False),
++            workflow.execution_plan('create', statuses, children),
++        )
++
++    def test_partial_revert_remains_guarded(self):
++        self.assertEqual(
++            (workflow.REVERT, False),
++            workflow.execution_plan(
++                'revert',
++                dict(
++                    runtime_stop='succeeded',
++                    disk_revert='failed_with_effects',
++                ),
++                dict(
++                    runtime_stop=[dict(action='stop', status='succeeded')],
++                    disk_revert=[
++                        dict(
++                            action='submit_disk_operation',
++                            status='failed_with_effects',
++                        )
++                    ],
++                ),
++            ),
++        )
++
++    def test_pre_stop_abort_only_closes_local_staging_and_grant(self):
++        self.assertEqual(
++            (('staging_cleanup', 'cleanup_cinder_release'), True),
++            workflow.execution_plan(
++                'revert',
++                dict(
++                    preflight='succeeded',
++                    cinder_reserve='succeeded',
++                    artifact_stage='failed_with_effects',
++                ),
++                dict(
++                    artifact_stage=[
++                        dict(
++                            action='download', status='failed_with_effects'
++                        )
++                    ]
++                ),
++            ),
++        )
++
++    def test_cinder_cleanup_accepts_cancelled_snapshot_without_delete_step(
++        self,
++    ):
++        client = mock.Mock()
++        client.get.return_value = dict(
++            id=uuids.cinder,
++            status='recovery_required',
++            resources=[
++                dict(
++                    id=uuids.resource,
++                    volume_id=uuids.volume,
++                    snapshot_id=uuids.snapshot,
++                    status='deleted',
++                )
++            ],
++            steps=[
++                dict(
++                    resource_id=uuids.resource,
++                    phase='snapshot',
++                    status='failed_no_effect',
++                )
++            ],
++        )
++        engine = executor.LibvirtCheckpointExecutor(
++            None,
++            None,
++            None,
++            None,
++            client,
++            None,
++            executor_id=uuids.executor,
++        )
++        child = SimpleNamespace(
++            action='submit_disk_operation', id=uuids.child
++        )
++        operation = SimpleNamespace(
++            uuid=uuids.operation,
++            admission=dict(
++                device_manifest=dict(disks=[dict(volume_id=uuids.volume)])
++            ),
++        )
++        result = engine._cinder(
++            None, None, child, 'cleanup_disk_snapshots', operation, True
++        )
++        self.assertEqual('succeeded', result.status)
++        client.action.assert_not_called()
++        client.get.return_value['steps'][0]['status'] = 'unknown'
++        self.assertRaises(
++            ValueError,
++            engine._cinder,
++            None,
++            None,
++            child,
++            'cleanup_disk_snapshots',
++            operation,
++            True,
++        )
+diff --git a/nova/tests/unit/checkpoints/test_rpc.py b/nova/tests/unit/checkpoints/test_rpc.py
+index 076879a8c815eaadbb8f84fabef9987c7465a39b..7a86cac8b88bffae7da9f89477e3023dc63a0abc 100644
+--- a/nova/tests/unit/checkpoints/test_rpc.py
++++ b/nova/tests/unit/checkpoints/test_rpc.py
+@@ -101,3 +101,38 @@ class CheckpointRPCTest(test.NoDBTestCase):
+         api.client.prepare.return_value.call.assert_called_once_with(
+             self.ctx, 'checkpoint_probe', instance_uuid=uuids.instance
+         )
++
++    def test_continue_requires_v66_and_only_carries_durable_reference(
++        self,
++    ):
++        api = compute_rpcapi.ComputeAPI()
++        client = mock.Mock()
++        client.can_send_version.return_value = False
++        with mock.patch.object(api.router, 'client', return_value=client):
++            self.assertRaises(
++                exception.CheckpointNotSupported,
++                api.checkpoint_continue,
++                self.ctx,
++                self.instance,
++                uuids.operation,
++                1,
++                uuids.step,
++                5,
++            )
++            client.prepare.assert_not_called()
++            client.can_send_version.return_value = True
++            api.checkpoint_continue(
++                self.ctx, self.instance, uuids.operation, 1, uuids.step, 5
++            )
++        client.prepare.assert_called_once_with(
++            server='compute', version='6.6'
++        )
++        client.prepare.return_value.call.assert_called_once_with(
++            self.ctx,
++            'checkpoint_continue',
++            instance=self.instance,
++            operation_id=uuids.operation,
++            generation=1,
++            step_id=uuids.step,
++            journal_revision=5,
++        )
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index b07fc0d003aa6553641d30371e611344f11d1c11..363eece5e7072e9dd59cf735d3696761262c216d 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1079,7 +1079,7 @@ class TestRegistry(test.NoDBTestCase):
+ object_data = {
+     'CheckpointQuotaTicketList': '1.0-9eef9c15e15020a0109f01c50e13d512',
+     'CheckpointArtifactReservation': '1.0-7a94e95482357b5fdc12f71a13ef2db9',
+-    'CheckpointEffect': '1.0-13cf039b4ec72f2f3ed688650759d4bb',
++    'CheckpointEffect': '1.0-6852f13515826db5ec3019550c9b8dee',
+     'CheckpointTemporaryTicket': '1.0-675a7eb2102718702736bbda431c1c5e',
+     'CheckpointQuotaTicket': '1.0-123c9a95dc1d0bcfc8aa604d0b84f236',
+     'InstanceCheckpoint': '1.1-ea9a09e3cc68cbe3aa8030418eef7950',
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/test_runtime.py b/nova/tests/unit/virt/libvirt/checkpoints/test_runtime.py
+index 918b864829e342025f66d960ffd700d57d305e68..4bfdc4b460eaad10dd9ac45d0655f01db4878031 100644
+--- a/nova/tests/unit/virt/libvirt/checkpoints/test_runtime.py
++++ b/nova/tests/unit/virt/libvirt/checkpoints/test_runtime.py
+@@ -55,6 +55,7 @@ class RuntimeBase(fixtures.StoreTestBase):
+         self.inspector.restore_xml.side_effect = (
+             topology.Topology.restore_xml
+         )
++        self.inspector.current_xml.side_effect = lambda *args: self.xml
+         self.runtime = runtime.Runtime(
+             self.host, self.staging, self.inspector
+         )
+@@ -176,6 +177,23 @@ class SaveRuntimeTest(RuntimeBase):
+             )
+         self.guest.checkpoint_save.assert_not_called()
+ 
++    def test_identity_change_during_save_prevents_completion_receipt(self):
++        self.inspector.inspect.side_effect = [
++            self.snapshot,
++            ValueError('changed port'),
++        ]
++        child = self.new_save()
++        result = self.runtime.save(
++            self.ctx, self.instance, child, self.workspace, self.snapshot
++        )
++        self.assertEqual('unknown', result.status)
++        self.assertEqual(
++            'unknown',
++            self.runtime.query(self.ctx, self.instance, child).status,
++        )
++        self.assertEqual(1, self.guest.checkpoint_save.call_count)
++        self.guest.resume.assert_not_called()
++
+ 
+ class RuntimeTest(RuntimeBase):
+     def test_stop_has_completion_receipt_and_never_detaches(self):
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/test_topology.py b/nova/tests/unit/virt/libvirt/checkpoints/test_topology.py
+index 5c11515516224f2f61c0e384880303f71e546237..93d6e278941035a2d009ec33509e4207cc585f84 100644
+--- a/nova/tests/unit/virt/libvirt/checkpoints/test_topology.py
++++ b/nova/tests/unit/virt/libvirt/checkpoints/test_topology.py
+@@ -405,3 +405,29 @@ class TopologyTest(test.NoDBTestCase):
+             ),
+             binding,
+         )
++
++    @mock.patch.object(objects.InstanceCheckpoint, 'get_by_uuid')
++    def test_inactive_host_paths_are_rebuilt_from_bdm_and_vif_only(
++        self, get
++    ):
++        get.return_value = SimpleNamespace(
++            active_operation_id=uuids.operation
++        )
++        binding = self.binding()
++        self.guest.checkpoint_state.return_value['state'] = 5
++        self.expected_disk = self.expected_disk.replace(
++            'disk-original', 'disk-new'
++        )
++        self.expected_interface = self.expected_interface.replace(
++            'br-current', 'br-new'
++        )
++        updated = self.inspector.current_xml(
++            self.ctx, self.instance, self.manifest, binding
++        )
++        self.assertIn('disk-new', updated)
++        self.assertIn('br-new', updated)
++        self.assertEqual(
++            topology.guest_identity(XML), topology.guest_identity(updated)
++        )
++        self.guest.checkpoint_state.return_value['state'] = 3
++        self.assertRaises(ValueError, self.inspect, 'recover', binding)
+diff --git a/nova/virt/libvirt/checkpoints/executor.py b/nova/virt/libvirt/checkpoints/executor.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..910477af60bca5ea45d295d410166c966d2f9896
+--- /dev/null
++++ b/nova/virt/libvirt/checkpoints/executor.py
+@@ -0,0 +1,601 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Qualified component composition, with one child dispatch per invocation."""
++
++import os
++import uuid
++
++from nova.checkpoints import attachments as attachment_api
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova import conf
++from nova import objects
++from nova.virt.libvirt.checkpoints import files
++from nova.virt.libvirt.checkpoints import journal
++
++
++def unknown(reason='recovery_required'):
++    return v2.EffectResult('unknown', {}, reason)
++
++
++class LibvirtCheckpointExecutor:
++    def __init__(
++        self,
++        driver,
++        runtime,
++        store,
++        staging,
++        cinder,
++        attachments,
++        executor_id=None,
++    ):
++        self.driver, self.runtime, self.store = driver, runtime, store
++        self.staging, self.cinder, self.attachments = (
++            staging,
++            cinder,
++            attachments,
++        )
++        self.executor_id = executor_id or str(
++            uuid.uuid5(
++                uuid.UUID(conf.CONF.checkpoint.deployment_id),
++                'libvirt-checkpoint:' + conf.CONF.host,
++            )
++        )
++
++    def probe(
++        self,
++        context,
++        instance,
++        manifest,
++        purpose,
++        checkpoint_id=None,
++        operation_id=None,
++    ):
++        try:
++            c._require(
++                self.store.probe()['supported'] and
++                self.staging.probe()['supported']
++            )
++            checkpoint = (
++                objects.InstanceCheckpoint.get_by_uuid(
++                    context, checkpoint_id
++                )
++                if checkpoint_id
++                else None
++            )
++            binding = (
++                v2.Binding.from_primitive(checkpoint.binding)
++                if checkpoint
++                else None
++            )
++            if binding:
++                c._require(
++                    binding.executor_id == self.executor_id and
++                    binding.store_profile_id == self.store.profile.id and
++                    binding.staging_profile_id ==
++                    self.staging.profile.id and
++                    binding.db_fingerprint ==
++                    c.device_fingerprint(manifest)
++                )
++            ids = tuple(d['volume_id'] for d in manifest['disks'])
++            if operation_id is None:
++                self.cinder.preflight_capabilities(context, ids)
++            else:
++                for ident in ids:
++                    self.cinder.capabilities(context, operation_id, ident)
++            if purpose == 'delete':
++                c._require(binding is not None)
++                original = objects.InstanceCheckpointOperation.get_by_uuid(
++                    context, checkpoint.create_operation_id
++                ).admission
++                observed = {
++                    key: original[key]
++                    for key in (
++                        'runtime_fingerprint',
++                        'runtime_profile_id',
++                        'save_bytes_limit',
++                        'restore_bytes_limit',
++                    )
++                }
++            else:
++                observed = self.runtime.topology.inspect(
++                    context,
++                    instance,
++                    manifest,
++                    'recover' if operation_id else purpose,
++                    binding,
++                )
++            count = 1 + bool(manifest['config_drive'])
++            maximum = observed['save_bytes_limit']
++            self.store.fs.budget(maximum)
++            self.staging.fs.budget(maximum)
++            return v2.ProbeV2(
++                True,
++                (),
++                self.executor_id,
++                c.PROFILE,
++                c.device_fingerprint(manifest),
++                manifest,
++                2 * count * maximum,
++                observed['runtime_fingerprint'],
++                observed['runtime_profile_id'],
++                self.store.profile.id,
++                self.staging.profile.id,
++                maximum,
++                observed['restore_bytes_limit'],
++            )
++        except Exception:
++            return v2.unsupported('profile_unverified')
++
++    @staticmethod
++    def _ref(row):
++        c._require(row['writer_state'] == 'closed')
++        return v2.ArtifactRef(
++            row['id'],
++            row['kind'],
++            row['logical_id'],
++            row['actual_bytes'],
++            row['checksum'],
++            row['location'],
++        )
++
++    def _workspace(self, binding, child):
++        return self.staging._entry(binding, child.operation_id)
++
++    def _cinder(self, context, binding, child, phase, operation, query):
++        if child.action == 'reserve' and not query:
++            value = self.cinder.reserve(
++                context,
++                operation.uuid,
++                operation.checkpoint_id,
++                operation.instance_uuid,
++                operation.kind,
++                tuple(
++                    d['volume_id']
++                    for d in operation.admission['device_manifest'][
++                        'disks'
++                    ]
++                ),
++            )
++        elif child.action == 'submit_disk_operation' and not query:
++            value = self.cinder.action(
++                context,
++                operation.uuid,
++                (
++                    'cleanup'
++                    if phase == 'cleanup_disk_snapshots'
++                    else 'execute'
++                ),
++                1,
++            )
++        elif child.action == 'release' and not query:
++            value = self.cinder.action(
++                context,
++                operation.uuid,
++                'release',
++                1,
++                outcome=(
++                    'abort'
++                    if phase == 'cleanup_cinder_release'
++                    else 'commit'
++                ),
++            )
++        else:
++            value = self.cinder.get(context, operation.uuid)
++        ids = sorted(
++            d['volume_id']
++            for d in operation.admission['device_manifest']['disks']
++        )
++        c._require(
++            sorted(r['volume_id'] for r in value['resources']) == ids
++        )
++        if child.action == 'reserve':
++            c._require(value['status'] != 'released')
++            return v2.EffectResult(
++                'succeeded',
++                dict(
++                    operation_id=value['id'],
++                    generation=1,
++                    volume_ids=ids,
++                    state='reserved',
++                ),
++                None,
++            )
++        if child.action == 'release':
++            expected = (
++                'abort' if phase == 'cleanup_cinder_release' else 'commit'
++            )
++            if value['status'] != 'released':
++                return v2.EffectResult('pending', {}, None)
++            c._require(value['release_outcome'] == expected)
++            return v2.EffectResult(
++                'succeeded',
++                dict(
++                    operation_id=value['id'],
++                    generation=1,
++                    state='released',
++                    outcome=(
++                        'failed_no_effect'
++                        if expected == 'abort'
++                        else 'succeeded'
++                    ),
++                ),
++                None,
++            )
++        target = {
++            'disk_snapshot': 'snapshot',
++            'disk_revert': 'revert',
++            'disk_snapshot_delete': 'delete_snapshot',
++            'cleanup_disk_snapshots': 'delete_snapshot',
++        }[phase]
++        steps = [s for s in value['steps'] if s['phase'] == target]
++        if phase == 'cleanup_disk_snapshots':
++            # C1.1 closes a snapshot that never dispatched by cancelling its
++            # original step and quota. Such a resource needs no delete RPC.
++            for resource in value['resources']:
++                if not any(
++                    s['resource_id'] == resource['id'] for s in steps
++                ):
++                    original = [
++                        s
++                        for s in value['steps']
++                        if s['resource_id'] == resource['id'] and
++                        s['phase'] == 'snapshot'
++                    ]
++                    c._require(
++                        resource['status'] == 'deleted' and
++                        len(original) == 1 and
++                        original[0]['status'] == 'failed_no_effect'
++                    )
++                    steps.append(
++                        dict(
++                            resource_id=resource['id'], status='succeeded'
++                        )
++                    )
++        c._require(
++            len(steps) == len(ids) and
++            {s['resource_id'] for s in steps} ==
++            {r['id'] for r in value['resources']}
++        )
++        if all(s['status'] == 'succeeded' for s in steps):
++            status = {
++                'snapshot': 'available',
++                'revert': 'reverted',
++                'delete_snapshot': 'deleted',
++            }[target]
++            if target != 'revert':
++                c._require(
++                    all(r['status'] == status for r in value['resources'])
++                )
++            return v2.EffectResult(
++                'succeeded',
++                dict(
++                    phase=phase,
++                    volume_ids=ids,
++                    snapshots=[
++                        dict(
++                            volume_id=r['volume_id'],
++                            snapshot_id=r['snapshot_id'],
++                            status=status,
++                        )
++                        for r in value['resources']
++                    ],
++                ),
++                None,
++            )
++        if all(
++            s['status'] in ('succeeded', 'failed_no_effect') for s in steps
++        ):
++            return v2.EffectResult(
++                'failed_with_effects',
++                dict(
++                    resource_ids=ids,
++                    terminal_child_ids=[child.id],
++                    late_effect_impossible=True,
++                ),
++                'resources_remaining',
++            )
++        if any(s['status'] == 'unknown' for s in steps):
++            return unknown()
++        return v2.EffectResult('pending', {}, None)
++
++    def _config(self, context, instance, binding, child):
++        # The original readonly config drive remains the restore source. This
++        # encrypted immutable copy records the point's bytes and is never a
++        # writable guest disk or a replacement instance-directory file.
++        from nova.virt.libvirt.checkpoints import topology
++
++        manifest = objects.InstanceCheckpointOperation.device_manifest(
++            context, instance.uuid
++        )
++        observed = self.runtime.topology.inspect(
++            context, instance, manifest, 'recover', binding
++        )
++        path = os.path.join(
++            conf.CONF.instances_path, instance.uuid, 'disk.config'
++        )
++        with topology.config_reader(path) as source:
++            with self.staging.writer(context, binding, child) as writer:
++                import hashlib
++
++                digest, total = hashlib.sha256(), 0
++                while True:
++                    block = os.read(source, 1024 * 1024)
++                    if not block:
++                        break
++                    total += len(block)
++                    c._require(
++                        total <=
++                        writer.row['upper_bound'] - writer.metadata
++                    )
++                    self.staging.fs.check()
++                    files.write_all(writer.fd, block)
++                    digest.update(block)
++                c._require(
++                    digest.hexdigest() ==
++                    observed['runtime_manifest']['config_sha256']
++                )
++                artifact = writer.finish()
++        return v2.EffectResult(
++            'succeeded', dict(artifact=artifact.to_primitive()), None
++        )
++
++    def _effect(self, context, instance, binding, parent, child, query):
++        operation = objects.InstanceCheckpointOperation.get_by_uuid(
++            context, child.operation_id
++        )
++        action = child.action
++        if action == 'inspect':
++            manifest = objects.InstanceCheckpointOperation.device_manifest(
++                context, instance.uuid
++            )
++            observed = self.runtime.topology.inspect(
++                context, instance, manifest, operation.kind, binding
++            )
++            c._require(
++                observed['runtime_fingerprint'] ==
++                binding.runtime_fingerprint
++            )
++            return v2.EffectResult(
++                'succeeded',
++                dict(
++                    fingerprint=binding.db_fingerprint,
++                    host=binding.host,
++                    node=binding.node,
++                ),
++                None,
++            )
++        if action in ('reserve', 'submit_disk_operation', 'release'):
++            return self._cinder(
++                context, binding, child, parent.phase, operation, query
++            )
++        if action == 'reserve_staging':
++            if not query:
++                limit = operation.admission[
++                    (
++                        'save_bytes_limit'
++                        if operation.kind == 'create'
++                        else 'restore_bytes_limit'
++                    )
++                ]
++                self.staging.reserve(context, binding, child, limit)
++            return self.staging.observe(context, binding, child)
++        if action == 'release_staging':
++            return (
++                self.staging.observe if query else self.staging.cleanup
++            )(context, binding, child)
++        if action == 'copy_config':
++            return (
++                self.staging.observe_copy(context, binding, child)
++                if query
++                else self._config(context, instance, binding, child)
++            )
++        if action in journal.RUNTIME_ACTIONS:
++            if query:
++                return self.runtime.query(context, instance, child)
++            observed = dict(
++                runtime_fingerprint=binding.runtime_fingerprint
++            )
++            if action == 'save':
++                return self.runtime.save(
++                    context,
++                    instance,
++                    child,
++                    self._workspace(binding, child),
++                    observed,
++                )
++            if action == 'stop':
++                return self.runtime.stop(
++                    context, instance, child, observed
++                )
++            if action == 'unpause':
++                return self.runtime.unpause(
++                    context, instance, child, binding
++                )
++            rows = journal.reservations(context, binding)
++            artifact = self._ref(
++                next(
++                    r
++                    for r in rows
++                    if r['operation_id'] == operation.uuid and
++                    r['kind'] == 'ram' and
++                    r['location'] == 'staging' and
++                    r['writer_state'] == 'closed'
++                )
++            )
++            xml = self.runtime.host.get_guest(instance).get_xml_desc(
++                dump_sensitive=True
++            )
++            return self.runtime.restore_paused(
++                context,
++                instance,
++                child,
++                artifact,
++                self._workspace(binding, child),
++                xml,
++            )
++        if query:
++            return self.store.query(context, binding, child)
++        if action in ('publish', 'download'):
++            source = self._ref(
++                journal.reservation(
++                    context, binding, child.payload['source_id']
++                )
++            )
++            if action == 'publish':
++                row = journal.reservation(
++                    context, binding, child.resource_id
++                )
++                return self.store.publish(
++                    context, binding, child, source, row['upper_bound']
++                )
++            return self.store.download(
++                context,
++                binding,
++                child,
++                source,
++                self._workspace(binding, child),
++            )
++        if action == 'delete':
++            row = journal.reservation(context, binding, child.resource_id)
++            refs = (self._ref(row),) if row['checksum'] else ()
++            return self.store.delete(context, binding, child, refs)
++        return unknown('executor_unsupported')
++
++    @staticmethod
++    def _aggregate(parent, rows):
++        if not all(r['status'] == 'succeeded' for r in rows):
++            return None
++        proofs = [r['result']['evidence'] for r in rows]
++        phase = parent.phase
++        if phase in (
++            'runtime_save',
++            'artifact_publish_shared',
++            'artifact_stage',
++        ):
++            refs = [a for p in proofs for a in p.get('artifacts', [])]
++            refs += [p['artifact'] for p in proofs if 'artifact' in p]
++            evidence = dict(artifacts=refs)
++            if phase == 'runtime_save':
++                evidence['writes_stopped'] = True
++        elif phase in (
++            'staging_cleanup',
++            'artifact_delete',
++            'cleanup_artifacts',
++        ):
++            ids = [
++                r['resource_id'] for r in rows if r['action'] == 'delete'
++            ]
++            evidence = dict(artifact_ids=ids, deleted_artifact_ids=ids)
++            if phase == 'staging_cleanup':
++                evidence['late_effect_impossible'] = True
++        else:
++            c._require(bool(proofs))
++            evidence = dict(proofs[-1])
++            evidence.pop('phase', None)
++        return v2.EffectResult('succeeded', evidence, None)
++
++    def _run(self, context, instance, primitive, query):
++        try:
++            intent = v2.StepIntentV2.from_primitive(primitive)
++            parent = objects.InstanceCheckpointStep.get_by_uuid(
++                context, intent.id
++            )
++            binding = v2.Binding.from_primitive(intent.payload['binding'])
++            c._require(
++                parent.payload_hash == intent.payload_hash and
++                binding.executor_id == self.executor_id
++            )
++            if parent.phase in ('volume_disconnect', 'volume_reconnect'):
++                method = (
++                    self.attachments.query
++                    if query
++                    else getattr(
++                        self.attachments,
++                        (
++                            'disconnect'
++                            if parent.phase == 'volume_disconnect'
++                            else 'reconnect'
++                        ),
++                    )
++                )
++                return method(context, instance, binding, parent.uuid)
++            rows = objects.CheckpointEffect.get_children(
++                context, parent.uuid
++            )
++            result = self._aggregate(parent, rows)
++            if result is not None:
++                return result
++            row = next(r for r in rows if r['status'] != 'succeeded')
++            if row['status'] == 'prepared':
++                if query:
++                    return v2.EffectResult(
++                        'ready',
++                        objects.CheckpointEffect.continuation(
++                            context, parent.uuid
++                        ),
++                        None,
++                    )
++                row = objects.CheckpointEffect.claim(
++                    context,
++                    row['id'],
++                    1,
++                    self.executor_id,
++                    getattr(
++                        context,
++                        '_checkpoint_continuation_revision',
++                        row['revision'],
++                    ),
++                )
++                if row is None:
++                    return unknown()
++            else:
++                query = True
++            child = attachment_api.intent(row)
++            try:
++                result = self._effect(
++                    context, instance, binding, parent, child, query
++                )
++            except Exception:
++                result = (
++                    v2.EffectResult(
++                        'failed_no_effect',
++                        dict(no_effect=True, late_effect_impossible=True),
++                        'identity_changed',
++                    )
++                    if child.action == 'inspect'
++                    else unknown()
++                )
++            objects.CheckpointEffect.observe(
++                context, child.id, 1, result.to_primitive()
++            )
++            rows = objects.CheckpointEffect.get_children(
++                context, parent.uuid
++            )
++            if result.status == 'succeeded':
++                return self._aggregate(parent, rows) or v2.EffectResult(
++                    'ready',
++                    objects.CheckpointEffect.continuation(
++                        context, parent.uuid
++                    ),
++                    None,
++                )
++            return result
++        except Exception:
++            return unknown()
++
++    def execute(self, context, instance, intent):
++        return self._run(context, instance, intent, False).to_primitive()
++
++    def query(self, context, instance, intent):
++        return self._run(context, instance, intent, True).to_primitive()
+diff --git a/nova/virt/libvirt/checkpoints/factory.py b/nova/virt/libvirt/checkpoints/factory.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..65d2d2ecc2a9e41e2b23a27f144f7824292ed23c
+--- /dev/null
++++ b/nova/virt/libvirt/checkpoints/factory.py
+@@ -0,0 +1,98 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Production composition; no positive defaults or test-profile fallback."""
++
++from oslo_serialization import jsonutils
++
++from nova.checkpoints import attachments
++from nova.checkpoints import contracts as c
++from nova import conf
++from nova import objects
++import nova.privsep.checkpoint
++from nova.virt.libvirt import blockinfo
++from nova.virt.libvirt.checkpoints import executor
++from nova.virt.libvirt.checkpoints import profiles
++from nova.virt.libvirt.checkpoints import runtime
++from nova.virt.libvirt.checkpoints import staging
++from nova.virt.libvirt.checkpoints import store
++from nova.virt.libvirt.checkpoints import topology
++from nova.volume import checkpoints as cinder
++
++
++def build(driver):
++    # Re-read the root-controlled allowlist on every entry, including recovery.
++    # Revoking a component cannot leave a cached permission to start writes.
++    config = conf.CONF.checkpoint
++    c._uuid(config.deployment_id)
++    c._require(conf.CONF.libvirt.virt_type == 'kvm')
++    records = profiles.load(config.profile_file)
++    shared_profile = records.match(
++        nova.privsep.checkpoint.inspect_mount(config.store_root)
++    )
++    local_profile = records.match(
++        nova.privsep.checkpoint.inspect_staging(config.staging_root)
++    )
++    c._require(shared_profile is not None and local_profile is not None)
++    local = staging.StagingStore(config.staging_root, local_profile)
++    shared = store.ArtifactStore(
++        config.store_root, shared_profile, staging=local
++    )
++
++    def disk_source(context, instance, disk):
++        bdm = objects.BlockDeviceMapping.get_by_volume_and_instance(
++            context, disk['volume_id'], instance.uuid
++        )
++        c._require(
++            bdm.uuid == disk['uuid'] and
++            bdm.device_name == disk['device_name']
++        )
++        connection = jsonutils.loads(bdm.connection_info)
++        c._require(
++            connection.get('serial') == disk['serial'] and
++            not connection.get('multiattach')
++        )
++        info = dict(
++            type='disk',
++            dev=bdm.device_name.removeprefix('/dev/'),
++            bus=bdm.disk_bus or
++            blockinfo.get_disk_bus_for_device_type(
++                instance, 'kvm', instance.image_meta, 'disk'
++            ),
++        )
++        # The existing volume driver resolves sources, auth and native LUKS
++        # secret references from protected BDM data; no attachment mutation.
++        return driver._get_volume_config(
++            instance, connection, info
++        ).to_xml()
++
++    def interface_source(context, instance, port):
++        network = instance.get_network_info()
++        vif = next(v for v in network if v['id'] == port['uuid'])
++        return driver.vif_driver.get_config(
++            instance, vif, instance.image_meta, instance.flavor, 'kvm'
++        ).to_xml()
++
++    inspector = topology.Topology(
++        driver._host,
++        profileset=records,
++        source_reader=disk_source,
++        interface_reader=interface_source,
++    )
++    native = runtime.Runtime(driver._host, local, inspector)
++    client = cinder.CheckpointClient()
++    attachment = attachments.AttachmentCoordinator(
++        driver, local, native, client=client
++    )
++    return executor.LibvirtCheckpointExecutor(
++        driver, native, shared, local, client, attachment
++    )
+diff --git a/nova/virt/libvirt/checkpoints/runtime.py b/nova/virt/libvirt/checkpoints/runtime.py
+index 091f399e45eae310b85bc1ce4f7708e34f633b3a..e1fe7c90c9b239b86396c12ea3430b68cf2f3967 100644
+--- a/nova/virt/libvirt/checkpoints/runtime.py
++++ b/nova/virt/libvirt/checkpoints/runtime.py
+@@ -117,6 +117,7 @@ class Runtime:
+                     )
+                     guest.checkpoint_save(writer.pinned_path, xml)
+                     self._state(instance, binding, child, 5)
++                    self._revalidate(context, instance, binding)
+                     artifact = writer.finish()
+                 result = v2.EffectResult(
+                     'succeeded',
+@@ -184,6 +185,14 @@ class Runtime:
+                 guest, current_xml = self._state(
+                     instance, binding, child, 5, marker=False
+                 )
++                manifest = (
++                    objects.InstanceCheckpointOperation.device_manifest(
++                        context, instance.uuid
++                    )
++                )
++                current_xml = self.topology.current_xml(
++                    context, instance, manifest, binding
++                )
+                 c._require(
+                     xmltools.guest_identity(xml) ==
+                     xmltools.guest_identity(current_xml)
+diff --git a/nova/virt/libvirt/checkpoints/topology.py b/nova/virt/libvirt/checkpoints/topology.py
+index 7a9ed0a0c2590018576ed6c4ab01a250801b1bfe..128b73577374b995e0a0eee899e1169e7d8d6bae 100644
+--- a/nova/virt/libvirt/checkpoints/topology.py
++++ b/nova/virt/libvirt/checkpoints/topology.py
+@@ -12,6 +12,7 @@
+ 
+ """Closed BIOS/KVM topology, current service-authorized ports and profiles."""
+ 
++import contextlib
+ import copy
+ import hashlib
+ import os
+@@ -191,8 +192,9 @@ def _bytes(node):
+     return int(node.text) * factors[unit]
+ 
+ 
+-def _read_config(path):
+-    """Read the original config drive without following links."""
++@contextlib.contextmanager
++def config_reader(path):
++    """Open the original config drive without following links."""
+     parts = Path(path).parts
+     c._require(os.path.isabs(path) and '..' not in parts)
+     fd = os.open('/', files.OPEN_DIR)
+@@ -205,14 +207,20 @@ def _read_config(path):
+             parts[-1], os.O_RDONLY | files.OPEN_FILE, dir_fd=fd
+         )
+         try:
+-            observed = files.fingerprint(source, 0)
+-            return observed['checksum'], observed['bytes']
++            files.regular(source)
++            yield source
+         finally:
+             os.close(source)
+     finally:
+         os.close(fd)
+ 
+ 
++def _read_config(path):
++    with config_reader(path) as source:
++        observed = files.fingerprint(source, 0)
++        return observed['checksum'], observed['bytes']
++
++
+ class Topology:
+     def __init__(
+         self,
+@@ -345,6 +353,8 @@ class Topology:
+                 'filterref',
+                 'bandwidth',
+             ):
++                if inactive:
++                    continue
+                 c._require(
+                     [serialized(n) for n in interface.findall(name)] ==
+                     [serialized(n) for n in expected.findall(name)]
+@@ -500,12 +510,15 @@ class Topology:
+                 self.source_reader(context, instance, disk) +
+                 '</devices></domain>'
+             ).find('devices/disk')
+-            c._require(
+-                expected is not None and
+-                serialized(node.find('source')) ==
+-                serialized(expected.find('source'))
+-            )
++            c._require(expected is not None)
++            if state['state'] != 5:
++                c._require(
++                    serialized(node.find('source')) ==
++                    serialized(expected.find('source'))
++                )
+             for name in ('auth', 'encryption'):
++                if state['state'] == 5 and name == 'auth':
++                    continue
+                 c._require(
+                     [
+                         serialized(item)
+@@ -594,6 +607,62 @@ class Topology:
+                 'Checkpoint runtime identity unverified'
+             ) from None
+ 
++    def current_xml(self, context, instance, manifest, binding):
++        """Build only current host fields from protected BDM/VIF adapters."""
++        observed = self.inspect(
++            context, instance, manifest, 'recover', binding
++        )
++        xml = self.host.get_guest(instance).get_xml_desc(
++            dump_sensitive=True
++        )
++        c._require(
++            guest_identity(xml) ==
++            observed['runtime_manifest']['xml_sha256']
++        )
++        root = document(xml)
++        for disk in manifest['disks']:
++            node = next(
++                n
++                for n in root.findall('./devices/disk')
++                if n.findtext('serial') == disk['serial']
++            )
++            expected = document(
++                '<domain><devices>' +
++                self.source_reader(context, instance, disk) +
++                '</devices></domain>'
++            ).find('devices/disk')
++            for name in ('source', 'auth'):
++                for old in node.findall(name):
++                    node.remove(old)
++                for new in expected.findall(name):
++                    node.append(copy.deepcopy(new))
++        for port in manifest['ports']:
++            node = next(
++                n
++                for n in root.findall('./devices/interface')
++                if n.find('mac').get('address').lower() ==
++                port['mac'].lower()
++            )
++            expected = document(
++                '<domain><devices>' +
++                self.interface_reader(context, instance, port) +
++                '</devices></domain>'
++            ).find('devices/interface')
++            for name in (
++                'source',
++                'target',
++                'virtualport',
++                'filterref',
++                'bandwidth',
++            ):
++                for old in node.findall(name):
++                    node.remove(old)
++                for new in expected.findall(name):
++                    node.append(copy.deepcopy(new))
++        value = etree.tostring(root, encoding='unicode')
++        c._require(guest_identity(value) == guest_identity(xml))
++        return value
++
+     @staticmethod
+     def restore_xml(saved_xml, current, binding):
+         saved, actual = document(saved_xml), document(current['xml'])
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 25d3053e6a1f027547c76181c3b8abca54b31bd8..696585fa138643b7ee25ad445439f72e78b1a928 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -2115,6 +2115,58 @@ class LibvirtDriver(driver.ComputeDriver):
+                               "volume connection", instance=instance)
+                 vol_driver.disconnect_volume(connection_info, instance)
+ 
++    def checkpoint_probe_v2(
++        self,
++        context,
++        instance,
++        manifest,
++        purpose,
++        checkpoint_id=None,
++        operation_id=None,
++    ):
++        from nova.checkpoints import contracts_v2
++        from nova.virt.libvirt.checkpoints import factory
++
++        try:
++            return (
++                factory.build(self)
++                .probe(
++                    context,
++                    instance,
++                    manifest,
++                    purpose,
++                    checkpoint_id,
++                    operation_id,
++                )
++                .to_primitive()
++            )
++        except Exception:
++            return contracts_v2.unsupported(
++                'profile_unverified'
++            ).to_primitive()
++
++    def checkpoint_execute_v2(self, context, instance, intent):
++        from nova.checkpoints import contracts_v2
++        from nova.virt.libvirt.checkpoints import factory
++
++        try:
++            return factory.build(self).execute(context, instance, intent)
++        except Exception:
++            return contracts_v2.EffectResult(
++                'unknown', {}, 'executor_unavailable'
++            ).to_primitive()
++
++    def checkpoint_query_v2(self, context, instance, intent):
++        from nova.checkpoints import contracts_v2
++        from nova.virt.libvirt.checkpoints import factory
++
++        try:
++            return factory.build(self).query(context, instance, intent)
++        except Exception:
++            return contracts_v2.EffectResult(
++                'unknown', {}, 'executor_unavailable'
++            ).to_primitive()
++
+     def _checkpoint_volume_guard(self, context, instance, binding, child,
+                                  connection_info, action):
+         from nova.checkpoints import contracts as checkpoint_contracts
+@@ -3962,8 +4014,10 @@ class LibvirtDriver(driver.ComputeDriver):
+                 break
+         else:
+             LOG.debug('Domain XML: %s', xml, instance=instance)
+-            msg = (_("Disk with id '%s' not found attached to instance.")
+-                   % volume_id)
++            msg = (
++                _("Disk with id '%s' not found attached to instance.")
++                % volume_id
++            )
+             raise exception.InternalError(msg)
+ 
+         LOG.debug("found device at %s", my_dev, instance=instance)
+@@ -9184,12 +9238,16 @@ class LibvirtDriver(driver.ComputeDriver):
+                 LOG.warning(
+                     "mdev-capable device name %(name)s can't be guessed from "
+                     "the ProviderTree roots %(roots)s",
+-                    {'name': rp_name,
+-                     'roots': ', '.join([root.name for root in roots])})
++                    {
++                        'name': rp_name,
++                        'roots': ', '.join([root.name for root in roots]),
++                    },
++                )
+                 # We f... have no idea what was the parent device
+                 # If we can't find devices having available VGPUs, just raise
+                 raise exception.ComputeResourcesUnavailable(
+-                    reason='mdev-capable resource is not available')
++                    reason='mdev-capable resource is not available'
++                )
+ 
+         supported_types = self.supported_vgpu_types
+         # Which mediated devices are created but not assigned to a guest ?

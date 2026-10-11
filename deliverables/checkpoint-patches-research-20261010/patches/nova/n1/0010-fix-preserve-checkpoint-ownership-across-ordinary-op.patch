@@ -1,0 +1,2222 @@
+From f6ead340524374ea9d287068124c0add89137c6f Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 13:29:53 +0300
+Subject: [PATCH 10/10] fix: preserve checkpoint ownership across ordinary
+ operation races
+
+---
+ doc/source/admin/instance-checkpoints.rst     |  22 +-
+ nova/api/openstack/wsgi.py                    |   5 +
+ nova/checkpoints/contracts.py                 |   2 +-
+ nova/checkpoints/guards.py                    |  63 ++-
+ nova/compute/api.py                           | 205 ++++-----
+ nova/compute/manager.py                       |  54 ++-
+ nova/db/api/checkpoints.py                    |  42 ++
+ nova/db/main/checkpoints.py                   | 253 ++++++++++-
+ .../4a8c2d7e9101_add_instance_checkpoints.py  |   2 +
+ nova/db/main/models.py                        |   2 +
+ nova/objects/checkpoint.py                    |  27 ++
+ nova/objects/instance_mapping.py              |  14 +-
+ nova/test.py                                  |   3 +
+ .../functional/db/test_checkpoint_quota.py    |  53 +++
+ .../functional/test_checkpoint_review.py      | 394 ++++++++++++++++++
+ nova/tests/unit/checkpoints/test_cell_db.py   |  38 +-
+ nova/tests/unit/checkpoints/test_guards.py    |  37 +-
+ nova/tests/unit/checkpoints/test_quota.py     |  12 +
+ nova/tests/unit/objects/test_objects.py       |   2 +-
+ 19 files changed, 1058 insertions(+), 172 deletions(-)
+ create mode 100644 nova/tests/functional/test_checkpoint_review.py
+
+diff --git a/doc/source/admin/instance-checkpoints.rst b/doc/source/admin/instance-checkpoints.rst
+index 4ac0922..01ff250 100644
+--- a/doc/source/admin/instance-checkpoints.rst
++++ b/doc/source/admin/instance-checkpoints.rst
+@@ -31,9 +31,9 @@ readiness evidence. Previously admitted work remains protected when disabled.
+        resize/confirm/revert, live migration/abort/force-complete,
+        evacuate, shelve/offload/unshelve
+      - Quota, placement, storage/network preparation or task dispatch
+-     - Ordinary claim before method body and validation callbacks. Live
++     - Pure API validators run before acquiring the ordinary claim. Live
+        checkpoints reject topology changes. Existing pending task states remain
+-       additional admission barriers.
++       additional admission barriers. The claim still precedes mutation/I/O.
+    * - Compute API start/stop/reboot, pause/unpause, suspend/resume,
+        image snapshot/backup, crash dump, lock/unlock, network-info injection
+      - State update, Glance image creation or compute RPC
+@@ -72,6 +72,17 @@ readiness evidence. Previously admitted work remains protected when disabled.
+      - Thread-pool submission, then migration driver
+      - Explicit handoff to ``_do_live_migration`` before submission; the worker
+        adopts before effects. Submission failure retains the queued claim.
++   * - Live-migration abort/force-complete
++     - Existing migration control RPC and driver call
++     - A separate durable control token is bound to the primary owner,
++       migration UUID and source endpoint. It pins the primary until both
++       workers finish; unknown control outcomes retain both claims. Successful
++       cancellation of a queued Future closes ownership only after cleanup.
++   * - API DB InstanceMapping changes and deletion, including bulk deletion
++     - Cell routing or mapping deletion
++     - Ticket reservation and mapping mutation lock the same mapping row.
++       Held/confirmed tickets prevent moves or deletion until cell cancellation
++       or resource-deletion proof permits refund. No cell call holds this lock.
+    * - Cell DB Instance/BDM/VIF/ShareMapping/InstanceExtra/info-cache writers
+      - SQL mutation
+      - Same writer transaction locks Instance first. Matching durable scope is
+@@ -90,7 +101,9 @@ cell record, token, action and generation to match. Checkpoint writes additional
+ require a matching claimed phase; only runtime state or reconnection bookkeeping
+ is writable, never the protected device identity.
+ 
+-Ordinary failures after acquisition retain the claim for investigation. N1
++Ordinary failures after acquisition retain the claim for investigation. Pure
++validation rejections do not acquire an owner. Checkpoint conflicts on ordinary
++HTTP APIs return 409, including old microversions. N1
+ provides no automatic unlock or ordinary-worker takeover. Cross-cell workflows
+ retain their native pending/resize states and API mapping protocol in addition
+ to local claims; a copied Instance row is not a transferable checkpoint owner.
+@@ -155,7 +168,8 @@ before quota readiness. Request UUID reuse is scoped to project and server;
+ the actor, action and canonical payload must also match. Authorization is
+ checked again on every replay.
+ 
+-Cancellation writes a durable cell tombstone before refunding the ticket.
++Cancellation writes a durable cell tombstone before refunding the ticket,
++including when the Instance has already been deleted or purged.
+ Late admission of that operation is then fenced. Delete and completed create
+ cleanup release usage only after a durable cell proof that all owned resources
+ are gone. A timeout, missing reply, down cell or one ``operation not found``
+diff --git a/nova/api/openstack/wsgi.py b/nova/api/openstack/wsgi.py
+index 00cd369..a531af0 100644
+--- a/nova/api/openstack/wsgi.py
++++ b/nova/api/openstack/wsgi.py
+@@ -742,6 +742,11 @@ def expected_errors(
+                         t_errors = errors
+                     if exc.code in t_errors:
+                         raise
++                elif isinstance(exc, exception.CheckpointConflict):
++                    # Ordinary server APIs predate checkpoints. This closed
++                    # conflict is expected on every mutating microversion.
++                    raise webob.exc.HTTPConflict(
++                        explanation=exc.format_message())
+                 elif isinstance(exc, exception.Forbidden):
+                     # Note(cyeoh): Special case to handle
+                     # Forbidden exceptions so every
+diff --git a/nova/checkpoints/contracts.py b/nova/checkpoints/contracts.py
+index 5e96cdb..f2ade77 100644
+--- a/nova/checkpoints/contracts.py
++++ b/nova/checkpoints/contracts.py
+@@ -361,7 +361,7 @@ class Scope(_Contract):
+         _uuid(self.instance_uuid)
+         _uuid(self.owner_uuid)
+         _integer(self.generation, minimum=1, maximum=1)
+-        _require(self.kind in ('checkpoint', 'ordinary'))
++        _require(self.kind in ('checkpoint', 'ordinary', 'control'))
+         _string(self.action)
+         _digest(self.token)
+ 
+diff --git a/nova/checkpoints/guards.py b/nova/checkpoints/guards.py
+index fd55d9d..aa8a1e9 100644
+--- a/nova/checkpoints/guards.py
++++ b/nova/checkpoints/guards.py
+@@ -39,7 +39,7 @@ def scope(context, value):
+ 
+ 
+ @contextlib.contextmanager
+-def worker(context, instance_uuid, action, target=None):
++def worker(context, instance_uuid, action, target=None, migration_id=None):
+     """Acquire before I/O. Exceptions retain ownership until investigated.
+ 
+     Local nesting is reentrant. The local marker is not serialized:
+@@ -47,6 +47,12 @@ def worker(context, instance_uuid, action, target=None):
+     OVO persistence needs only the durable scope, not that local marker.
+     """
+     existing = getattr(context, 'checkpoint_scope', None)
++    if (
++        existing and
++        existing['kind'] == 'control' and
++        (existing['action'] != action)
++    ):
++        raise exception.CheckpointConflict(reason='guard_busy')
+     if existing and (
+         existing['action'] in contracts.ORDINARY_NON_TOPOLOGY and
+         action not in contracts.ORDINARY_NON_TOPOLOGY
+@@ -72,6 +78,10 @@ def worker(context, instance_uuid, action, target=None):
+         value = objects.InstanceCheckpointGuard.adopt(
+             context, existing, target
+         )
++    elif migration_id is not None:
++        value = objects.InstanceCheckpointGuard.acquire_control(
++            context, instance_uuid, action, migration_id
++        )
+     else:
+         value = objects.InstanceCheckpointGuard.acquire(
+             context, instance_uuid, action
+@@ -89,6 +99,41 @@ def worker(context, instance_uuid, action, target=None):
+             objects.InstanceCheckpointGuard.release(ctx, value)
+ 
+ 
++@contextlib.contextmanager
++def migration_control(context, instance, action, migration_id):
++    """Control an existing migration after the API's pure validation."""
++    with worker(
++        context, instance.uuid, action, migration_id=migration_id
++    ) as owned:
++        with _bound_objects(instance, owned):
++            yield owned
++
++
++def control_active(context, migration_id=None):
++    value = getattr(context, 'checkpoint_scope', None)
++    if value is None or value['kind'] != 'control':
++        return True
++    return objects.InstanceCheckpointGuard.control_active(
++        context, value, migration_id
++    )
++
++
++def bind_migration(context, migration_uuid):
++    value = getattr(context, 'checkpoint_scope', None)
++    if value is not None:
++        objects.InstanceCheckpointGuard.bind_migration(
++            context, value, migration_uuid
++        )
++
++
++def cancel_queued_migration(context, migration_id):
++    value = getattr(context, 'checkpoint_scope', None)
++    if value is not None and value['kind'] == 'control':
++        objects.InstanceCheckpointGuard.cancel_queued_migration(
++            context, value, migration_id
++        )
++
++
+ def handoff(context, target):
+     if not getattr(context, 'checkpoint_scope', None):
+         return context
+@@ -231,10 +276,20 @@ class RPCClient:
+             guard = objects.InstanceCheckpointGuard.get_by_instance_uuid(
+                 context, value['instance_uuid']
+             )
++            state = (
++                (guard.ordinary_control or {})
++                if (guard is not None and value['kind'] == 'control')
++                else (
++                    dict(
++                        token=guard.ordinary_token, state=guard.ordinary_state
++                    )
++                    if guard
++                    else {}
++                )
++            )
+             if (
+-                guard is None or
+-                guard.ordinary_token != value['token'] or
+-                guard.ordinary_state != 'running'
++                state.get('token') != value['token'] or
++                state.get('state') != 'running'
+             ):
+                 context._checkpoint_handed_off = True
+         return result
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 8ab4622..467292b 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -2736,12 +2736,12 @@ class API:
+         self._update_queued_for_deletion(context, instance.uuid, True)
+ 
+     # NOTE(maoy): we allow delete to be called no matter what vm_state says.
+-    @guards.entrypoint(
+-        'soft_delete',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=None, task_state=None,
+                           must_have_launched=True)
++    @guards.entrypoint(
++        'soft_delete',
++        service='api', instance_arg=1)
+     def soft_delete(self, context, instance):
+         """Terminate an instance."""
+         LOG.debug('Going to try to soft delete instance',
+@@ -2755,22 +2755,22 @@ class API:
+         self._delete(context, instance, 'delete', self._do_delete,
+                      task_state=task_states.DELETING)
+ 
+-    @guards.entrypoint(
+-        'delete',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=None, task_state=None,
+                           must_have_launched=False)
++    @guards.entrypoint(
++        'delete',
++        service='api', instance_arg=1)
+     def delete(self, context, instance):
+         """Terminate an instance."""
+         LOG.debug("Going to try to terminate instance", instance=instance)
+         self._delete_instance(context, instance)
+ 
++    @check_instance_lock
++    @check_instance_state(vm_state=[vm_states.SOFT_DELETED])
+     @guards.entrypoint(
+         'restore',
+         service='api', instance_arg=1)
+-    @check_instance_lock
+-    @check_instance_state(vm_state=[vm_states.SOFT_DELETED])
+     def restore(self, context, instance):
+         """Restore a previously deleted (but not reclaimed) instance."""
+         # Check quotas
+@@ -2800,12 +2800,12 @@ class API:
+             instance.save(expected_task_state=[None])
+         self._update_queued_for_deletion(context, instance.uuid, False)
+ 
+-    @guards.entrypoint(
+-        'force_delete',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(task_state=None,
+                           must_have_launched=False)
++    @guards.entrypoint(
++        'force_delete',
++        service='api', instance_arg=1)
+     def force_delete(self, context, instance):
+         """Force delete an instance in any vm_state/task_state."""
+         self._delete(context, instance, 'force_delete', self._do_delete,
+@@ -2823,22 +2823,22 @@ class API:
+         self.compute_rpcapi.stop_instance(context, instance, do_cast=do_cast,
+                                           clean_shutdown=clean_shutdown)
+ 
+-    @guards.entrypoint(
+-        'stop',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_host()
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.ERROR])
++    @guards.entrypoint(
++        'stop',
++        service='api', instance_arg=1)
+     def stop(self, context, instance, do_cast=True, clean_shutdown=True):
+         """Stop an instance."""
+         self.force_stop(context, instance, do_cast, clean_shutdown)
+ 
+-    @guards.entrypoint(
+-        'start',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_host()
+     @check_instance_state(vm_state=[vm_states.STOPPED])
++    @guards.entrypoint(
++        'start',
++        service='api', instance_arg=1)
+     def start(self, context, instance):
+         """Start an instance."""
+         LOG.debug("Going to try to start instance", instance=instance)
+@@ -2849,12 +2849,12 @@ class API:
+         self._record_action_start(context, instance, instance_actions.START)
+         self.compute_rpcapi.start_instance(context, instance)
+ 
+-    @guards.entrypoint(
+-        'trigger_crash_dump',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_host()
+     @check_instance_state(vm_state=vm_states.ALLOW_TRIGGER_CRASH_DUMP)
++    @guards.entrypoint(
++        'trigger_crash_dump',
++        service='api', instance_arg=1)
+     def trigger_crash_dump(self, context, instance):
+         """Trigger crash dump in an instance."""
+         LOG.debug("Try to trigger crash dump", instance=instance)
+@@ -3366,11 +3366,11 @@ class API:
+ 
+     # NOTE(melwitt): We don't check instance lock for backup because lock is
+     #                intended to prevent accidental change/delete of instances
++    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
++                                    vm_states.PAUSED, vm_states.SUSPENDED])
+     @guards.entrypoint(
+         'backup',
+         service='api', instance_arg=1)
+-    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
+-                                    vm_states.PAUSED, vm_states.SUSPENDED])
+     def backup(self, context, instance, name, backup_type, rotation,
+                extra_properties=None):
+         """Backup the given instance
+@@ -3410,11 +3410,11 @@ class API:
+ 
+     # NOTE(melwitt): We don't check instance lock for snapshot because lock is
+     #                intended to prevent accidental change/delete of instances
++    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
++                                    vm_states.PAUSED, vm_states.SUSPENDED])
+     @guards.entrypoint(
+         'snapshot',
+         service='api', instance_arg=1)
+-    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
+-                                    vm_states.PAUSED, vm_states.SUSPENDED])
+     def snapshot(self, context, instance, name, extra_properties=None):
+         """Snapshot the given instance.
+ 
+@@ -3470,11 +3470,11 @@ class API:
+ 
+     # NOTE(melwitt): We don't check instance lock for snapshot because lock is
+     #                intended to prevent accidental change/delete of instances
++    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
++                                    vm_states.PAUSED, vm_states.SUSPENDED])
+     @guards.entrypoint(
+         'snapshot',
+         service='api', instance_arg=1)
+-    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
+-                                    vm_states.PAUSED, vm_states.SUSPENDED])
+     def snapshot_volume_backed(self, context, instance, name,
+                                extra_properties=None):
+         """Snapshot the given volume-backed instance.
+@@ -3614,10 +3614,10 @@ class API:
+ 
+         return self.image_api.create(context, image_meta)
+ 
++    @check_instance_lock
+     @guards.entrypoint(
+         'reboot',
+         service='api', instance_arg=1)
+-    @check_instance_lock
+     def reboot(self, context, instance, reboot_type):
+         """Reboot the given instance."""
+         if reboot_type == 'SOFT':
+@@ -3656,9 +3656,6 @@ class API:
+             if img_arch:
+                 fields_obj.Architecture.canonicalize(img_arch)
+ 
+-    @guards.entrypoint(
+-        'rebuild',
+-        service='api', instance_arg=1)
+     @block_shares_not_supported()
+     @reject_vtpm_instances(instance_actions.REBUILD)
+     @block_accelerators(until_service=SUPPORT_ACCELERATOR_SERVICE_FOR_REBUILD)
+@@ -3666,6 +3663,9 @@ class API:
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
+                                     vm_states.ERROR])
++    @guards.entrypoint(
++        'rebuild',
++        service='api', instance_arg=1)
+     def rebuild(self, context, instance, image_href, admin_password,
+                 files_to_inject=None, reimage_boot_volume=False, **kwargs):
+         """Rebuild the given instance with the provided attributes."""
+@@ -3981,11 +3981,11 @@ class API:
+                                                  used=useds,
+                                                  allowed=total_alloweds)
+ 
++    @check_instance_lock
++    @check_instance_state(vm_state=[vm_states.RESIZED])
+     @guards.entrypoint(
+         'revert_resize',
+         service='api', instance_arg=1)
+-    @check_instance_lock
+-    @check_instance_state(vm_state=[vm_states.RESIZED])
+     def revert_resize(self, context, instance):
+         """Reverts a resize or cold migration, deleting the 'new' instance in
+         the process.
+@@ -4095,11 +4095,11 @@ class API:
+         return objects.Service.get_by_compute_host(
+             context, migration.source_compute)
+ 
++    @check_instance_lock
++    @check_instance_state(vm_state=[vm_states.RESIZED])
+     @guards.entrypoint(
+         'confirm_resize',
+         service='api', instance_arg=1)
+-    @check_instance_lock
+-    @check_instance_state(vm_state=[vm_states.RESIZED])
+     def confirm_resize(self, context, instance, migration=None):
+         """Confirms a migration/resize and deletes the 'old' instance.
+ 
+@@ -4237,9 +4237,6 @@ class API:
+ 
+         return node
+ 
+-    @guards.entrypoint(
+-        'resize',
+-        service='api', instance_arg=1)
+     @block_shares_not_supported()
+     # TODO(stephenfin): This logic would be so much easier to grok if we
+     # finally split resize and cold migration into separate code paths
+@@ -4249,6 +4246,9 @@ class API:
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED])
+     @check_instance_host(check_is_up=True)
++    @guards.entrypoint(
++        'resize',
++        service='api', instance_arg=1)
+     def resize(self, context, instance, flavor_id=None, clean_shutdown=True,
+                host_name=None, auto_disk_config=None):
+         """Resize (ie, migrate) a running instance.
+@@ -4493,9 +4493,6 @@ class API:
+             allow_same_host = CONF.allow_resize_to_same_host
+         return allow_same_host
+ 
+-    @guards.entrypoint(
+-        'shelve',
+-        service='api', instance_arg=1)
+     @block_shares_not_supported()
+     @block_port_accelerators()
+     @reject_vtpm_instances(instance_actions.SHELVE)
+@@ -4503,6 +4500,9 @@ class API:
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
+                                     vm_states.PAUSED, vm_states.SUSPENDED])
++    @guards.entrypoint(
++        'shelve',
++        service='api', instance_arg=1)
+     def shelve(self, context, instance, clean_shutdown=True):
+         """Shelve an instance.
+ 
+@@ -4539,12 +4539,12 @@ class API:
+                 context, instance=instance, clean_shutdown=clean_shutdown,
+                 accel_uuids=accel_uuids)
+ 
+-    @guards.entrypoint(
+-        'shelve_offload',
+-        service='api', instance_arg=1)
+     @block_port_accelerators()
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.SHELVED])
++    @guards.entrypoint(
++        'shelve_offload',
++        service='api', instance_arg=1)
+     def shelve_offload(self, context, instance, clean_shutdown=True):
+         """Remove a shelved instance from the hypervisor."""
+         instance.task_state = task_states.SHELVING_OFFLOADING
+@@ -4662,13 +4662,13 @@ class API:
+             context, context.project_id, instance.flavor, request_spec.is_bfv,
+             0, 0, delta_updates={'servers': 0})
+ 
+-    @guards.entrypoint(
+-        'unshelve',
+-        service='api', instance_arg=1)
+     @block_extended_resource_request
+     @check_instance_lock
+     @check_instance_state(
+             vm_state=[vm_states.SHELVED, vm_states.SHELVED_OFFLOADED])
++    @guards.entrypoint(
++        'unshelve',
++        service='api', instance_arg=1)
+     def unshelve(
+             self, context, instance, new_az=_sentinel, host=None):
+         """Restore a shelved instance.
+@@ -4787,11 +4787,11 @@ class API:
+         self.compute_rpcapi.remove_fixed_ip_from_instance(context,
+                 instance=instance, address=address)
+ 
++    @check_instance_lock
++    @check_instance_state(vm_state=[vm_states.ACTIVE])
+     @guards.entrypoint(
+         'pause',
+         service='api', instance_arg=1)
+-    @check_instance_lock
+-    @check_instance_state(vm_state=[vm_states.ACTIVE])
+     def pause(self, context, instance):
+         """Pause the given instance."""
+         instance.task_state = task_states.PAUSING
+@@ -4799,11 +4799,11 @@ class API:
+         self._record_action_start(context, instance, instance_actions.PAUSE)
+         self.compute_rpcapi.pause_instance(context, instance)
+ 
++    @check_instance_lock
++    @check_instance_state(vm_state=[vm_states.PAUSED])
+     @guards.entrypoint(
+         'unpause',
+         service='api', instance_arg=1)
+-    @check_instance_lock
+-    @check_instance_state(vm_state=[vm_states.PAUSED])
+     def unpause(self, context, instance):
+         """Unpause the given instance."""
+         instance.task_state = task_states.UNPAUSING
+@@ -4822,9 +4822,6 @@ class API:
+         return self.compute_rpcapi.get_instance_diagnostics(context,
+                                                             instance=instance)
+ 
+-    @guards.entrypoint(
+-        'suspend',
+-        service='api', instance_arg=1)
+     @block_shares_not_supported()
+     @block_port_accelerators()
+     @reject_vdpa_instances(
+@@ -4834,6 +4831,9 @@ class API:
+     @reject_sev_instances(instance_actions.SUSPEND)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE])
++    @guards.entrypoint(
++        'suspend',
++        service='api', instance_arg=1)
+     def suspend(self, context, instance):
+         """Suspend the given instance."""
+         instance.task_state = task_states.SUSPENDING
+@@ -4841,14 +4841,14 @@ class API:
+         self._record_action_start(context, instance, instance_actions.SUSPEND)
+         self.compute_rpcapi.suspend_instance(context, instance)
+ 
+-    @guards.entrypoint(
+-        'resume',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @reject_vdpa_instances(
+         instance_actions.RESUME, until=MIN_COMPUTE_VDPA_HOTPLUG_LIVE_MIGRATION
+     )
+     @check_instance_state(vm_state=[vm_states.SUSPENDED])
++    @guards.entrypoint(
++        'resume',
++        service='api', instance_arg=1)
+     def resume(self, context, instance):
+         """Resume the given instance."""
+         instance.task_state = task_states.RESUMING
+@@ -4856,13 +4856,13 @@ class API:
+         self._record_action_start(context, instance, instance_actions.RESUME)
+         self.compute_rpcapi.resume_instance(context, instance)
+ 
+-    @guards.entrypoint(
+-        'rescue',
+-        service='api', instance_arg=1)
+     @reject_vtpm_instances(instance_actions.RESCUE)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
+                                     vm_states.ERROR])
++    @guards.entrypoint(
++        'rescue',
++        service='api', instance_arg=1)
+     def rescue(self, context, instance, rescue_password=None,
+                rescue_image_ref=None, clean_shutdown=True,
+                allow_bfv_rescue=False):
+@@ -4925,11 +4925,11 @@ class API:
+             rescue_password=rescue_password, rescue_image_ref=rescue_image_ref,
+             clean_shutdown=clean_shutdown)
+ 
++    @check_instance_lock
++    @check_instance_state(vm_state=[vm_states.RESCUED])
+     @guards.entrypoint(
+         'unrescue',
+         service='api', instance_arg=1)
+-    @check_instance_lock
+-    @check_instance_state(vm_state=[vm_states.RESCUED])
+     def unrescue(self, context, instance):
+         """Unrescue the given instance."""
+         instance.task_state = task_states.UNRESCUING
+@@ -4939,11 +4939,11 @@ class API:
+ 
+         self.compute_rpcapi.unrescue_instance(context, instance=instance)
+ 
++    @check_instance_lock
++    @check_instance_state(vm_state=[vm_states.ACTIVE])
+     @guards.entrypoint(
+         'set_admin_password',
+         service='api', instance_arg=1)
+-    @check_instance_lock
+-    @check_instance_state(vm_state=[vm_states.ACTIVE])
+     def set_admin_password(self, context, instance, password):
+         """Set the root/admin password for the given instance.
+ 
+@@ -5063,10 +5063,10 @@ class API:
+             action=fields_obj.NotificationAction.UNLOCK,
+             source=fields_obj.NotificationSource.API)
+ 
++    @check_instance_lock
+     @guards.entrypoint(
+         'inject_network_info',
+         service='api', instance_arg=1)
+-    @check_instance_lock
+     def inject_network_info(self, context, instance):
+         """Inject network info for the instance."""
+         self.compute_rpcapi.inject_network_info(context, instance=instance)
+@@ -5285,14 +5285,14 @@ class API:
+ 
+         return volume_bdm.device_name
+ 
+-    @guards.entrypoint(
+-        'attach_volume',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
+                                     vm_states.STOPPED, vm_states.RESIZED,
+                                     vm_states.SOFT_DELETED, vm_states.SHELVED,
+                                     vm_states.SHELVED_OFFLOADED])
++    @guards.entrypoint(
++        'attach_volume',
++        service='api', instance_arg=1)
+     def attach_volume(self, context, instance, volume_id, device=None,
+                       disk_bus=None, device_type=None, tag=None,
+                       supports_multiattach=False,
+@@ -5389,14 +5389,14 @@ class API:
+         self.compute_rpcapi.detach_volume(context, instance=instance,
+                 volume_id=volume['id'], attachment_id=attachment_id)
+ 
+-    @guards.entrypoint(
+-        'detach_volume',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
+                                     vm_states.STOPPED, vm_states.RESIZED,
+                                     vm_states.SOFT_DELETED, vm_states.SHELVED,
+                                     vm_states.SHELVED_OFFLOADED])
++    @guards.entrypoint(
++        'detach_volume',
++        service='api', instance_arg=1)
+     def detach_volume(self, context, instance, volume):
+         """Detach a volume from an instance."""
+         if instance.vm_state == vm_states.SHELVED_OFFLOADED:
+@@ -5447,12 +5447,12 @@ class API:
+ 
+         return count
+ 
+-    @guards.entrypoint(
+-        'swap_volume',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
+                                     vm_states.RESIZED])
++    @guards.entrypoint(
++        'swap_volume',
++        service='api', instance_arg=1)
+     def swap_volume(self, context, instance, old_volume, new_volume):
+         """Swap volume attached to an instance."""
+         # The caller likely got the instance from volume['attachments']
+@@ -5559,9 +5559,6 @@ class API:
+                     raise exception.AttachInterfaceWithQoSPolicyNotSupported(
+                         instance_uuid=instance.uuid)
+ 
+-    @guards.entrypoint(
+-        'attach_interface',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @reject_vdpa_instances(
+         instance_actions.ATTACH_INTERFACE, until=MIN_COMPUTE_VDPA_ATTACH_DETACH
+@@ -5571,6 +5568,9 @@ class API:
+             vm_states.ACTIVE, vm_states.PAUSED, vm_states.STOPPED
+         ], task_state=[None]
+     )
++    @guards.entrypoint(
++        'attach_interface',
++        service='api', instance_arg=1)
+     def attach_interface(self, context, instance, network_id, port_id,
+                          requested_ip, tag=None):
+         """Use hotplug to add an network adapter to an instance."""
+@@ -5600,9 +5600,6 @@ class API:
+             instance=instance, network_id=network_id, port_id=port_id,
+             requested_ip=requested_ip, tag=tag)
+ 
+-    @guards.entrypoint(
+-        'detach_interface',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @reject_vdpa_instances(
+         instance_actions.DETACH_INTERFACE, until=MIN_COMPUTE_VDPA_ATTACH_DETACH
+@@ -5612,6 +5609,9 @@ class API:
+             vm_states.ACTIVE, vm_states.PAUSED, vm_states.STOPPED
+         ], task_state=[None]
+     )
++    @guards.entrypoint(
++        'detach_interface',
++        service='api', instance_arg=1)
+     def detach_interface(self, context, instance, port_id):
+         """Detach an network adapter from an instance."""
+         for vif in instance.get_network_info():
+@@ -5663,9 +5663,6 @@ class API:
+ 
+         return _metadata
+ 
+-    @guards.entrypoint(
+-        'live_migrate',
+-        service='api', instance_arg=1)
+     @block_shares_not_supported()
+     @block_extended_resource_request
+     @block_port_accelerators()
+@@ -5678,6 +5675,9 @@ class API:
+     @reject_sev_instances(instance_actions.LIVE_MIGRATION)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED])
++    @guards.entrypoint(
++        'live_migrate',
++        service='api', instance_arg=1)
+     def live_migrate(self, context, instance, block_migration,
+                      disk_over_commit, host_name, force=None, async_=False):
+         """Migrate a server lively to a new host."""
+@@ -5730,9 +5730,6 @@ class API:
+                                                           instance,
+                                                           messaging_timeout)
+ 
+-    @guards.entrypoint(
+-        'live_migrate_force_complete',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE],
+                           task_state=[task_states.MIGRATING])
+@@ -5758,15 +5755,16 @@ class API:
+                                                   state=migration.status,
+                                                   method='force complete')
+ 
+-        self._record_action_start(
+-            context, instance, instance_actions.LIVE_MIGRATION_FORCE_COMPLETE)
++        with guards.migration_control(
++                context, instance, 'live_migrate_force_complete',
++                migration.id) as context:
++            self._record_action_start(
++                context, instance,
++                instance_actions.LIVE_MIGRATION_FORCE_COMPLETE)
+ 
+-        self.compute_rpcapi.live_migration_force_complete(
+-            context, instance, migration)
++            self.compute_rpcapi.live_migration_force_complete(
++                context, instance, migration)
+ 
+-    @guards.entrypoint(
+-        'live_migrate_abort',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(task_state=[task_states.MIGRATING])
+     def live_migrate_abort(self, context, instance, migration_id,
+@@ -5804,15 +5802,15 @@ class API:
+                     instance_uuid=instance.uuid,
+                     state=migration.status,
+                     method='abort live migration')
+-        self._record_action_start(context, instance,
+-                                  instance_actions.LIVE_MIGRATION_CANCEL)
++        with guards.migration_control(
++                context, instance, 'live_migrate_abort',
++                migration.id) as context:
++            self._record_action_start(context, instance,
++                                      instance_actions.LIVE_MIGRATION_CANCEL)
+ 
+-        self.compute_rpcapi.live_migration_abort(context,
+-                instance, migration.id)
++            self.compute_rpcapi.live_migration_abort(context,
++                    instance, migration.id)
+ 
+-    @guards.entrypoint(
+-        'evacuate',
+-        service='api', instance_arg=1)
+     @block_shares_not_supported()
+     @block_extended_resource_request
+     @block_port_accelerators()
+@@ -5820,6 +5818,9 @@ class API:
+     @block_accelerators(until_service=SUPPORT_ACCELERATOR_SERVICE_FOR_REBUILD)
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
+                                     vm_states.ERROR], task_state=None)
++    @guards.entrypoint(
++        'evacuate',
++        service='api', instance_arg=1)
+     def evacuate(self, context, instance, host, on_shared_storage,
+                  admin_password=None, force=None, target_state=None):
+         """Running evacuate to target host.
+@@ -6209,14 +6210,14 @@ class API:
+         self.compute_rpcapi.deny_share(
+             context, instance, share_mapping)
+ 
+-    @guards.entrypoint(
+-        'add_runtime_ssh_key',
+-        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(
+         vm_state=[vm_states.ACTIVE],
+         task_state=[None],
+     )
++    @guards.entrypoint(
++        'add_runtime_ssh_key',
++        service='api', instance_arg=1)
+     def add_runtime_ssh_key(self, context, instance, public_key):
+         """Persist an additional SSH public key for an instance.
+ 
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index ddb4e39..d4fdc20 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -3552,12 +3552,12 @@ class ComputeManager(manager.Manager):
+             self.host, action=fields.NotificationAction.POWER_ON,
+             phase=fields.NotificationPhase.END)
+ 
+-    @guards.entrypoint(
+-        'trigger_crash_dump',
+-        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(NotImplementedError,
+                                    exception.TriggerCrashDumpNotSupported,
+                                    exception.InstanceNotRunning)
++    @guards.entrypoint(
++        'trigger_crash_dump',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -3842,11 +3842,11 @@ class ComputeManager(manager.Manager):
+             context, instance, self.host,
+             phase=fields.NotificationPhase.ERROR, exception=error, bdms=bdms)
+ 
++    @messaging.expected_exceptions(exception.PreserveEphemeralNotSupported,
++                                   exception.BuildAbortException)
+     @guards.entrypoint(
+         'rebuild',
+         service='compute', instance_arg=1)
+-    @messaging.expected_exceptions(exception.PreserveEphemeralNotSupported,
+-                                   exception.BuildAbortException)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -4672,10 +4672,10 @@ class ComputeManager(manager.Manager):
+             instance.save()
+             LOG.warning("Image not found during snapshot", instance=instance)
+ 
++    @messaging.expected_exceptions(NotImplementedError)
+     @guards.entrypoint(
+-        'volume_snapshot_create',
++        'snapshot',
+         service='compute', instance_arg=1)
+-    @messaging.expected_exceptions(NotImplementedError)
+     @wrap_exception()
+     def volume_snapshot_create(self, context, instance, volume_id,
+                                create_info):
+@@ -4687,10 +4687,10 @@ class ComputeManager(manager.Manager):
+             LOG.debug('Instance disappeared during volume snapshot create',
+                       instance=instance)
+ 
++    @messaging.expected_exceptions(NotImplementedError)
+     @guards.entrypoint(
+         'volume_snapshot_delete',
+         service='compute', instance_arg=1)
+-    @messaging.expected_exceptions(NotImplementedError)
+     @wrap_exception()
+     def volume_snapshot_delete(self, context, instance, volume_id,
+                                snapshot_id, delete_info):
+@@ -4702,10 +4702,10 @@ class ComputeManager(manager.Manager):
+             LOG.debug('Instance disappeared during volume snapshot delete',
+                       instance=instance)
+ 
++    @messaging.expected_exceptions(NotImplementedError)
+     @guards.entrypoint(
+         'allow_share',
+         service='compute', instance_arg=1)
+-    @messaging.expected_exceptions(NotImplementedError)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -4853,10 +4853,10 @@ class ComputeManager(manager.Manager):
+ 
+         _allow_share(context, instance, share_mapping)
+ 
++    @messaging.expected_exceptions(NotImplementedError)
+     @guards.entrypoint(
+         'deny_share',
+         service='compute', instance_arg=1)
+-    @messaging.expected_exceptions(NotImplementedError)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -6464,10 +6464,10 @@ class ComputeManager(manager.Manager):
+                 raise exc.with_traceback(exc_info[2])
+             raise exc
+ 
++    @messaging.expected_exceptions(exception.MigrationPreCheckError)
+     @guards.entrypoint(
+         'prep_snapshot_based_resize_at_dest',
+         service='compute', instance_arg=1)
+-    @messaging.expected_exceptions(exception.MigrationPreCheckError)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -6538,10 +6538,10 @@ class ComputeManager(manager.Manager):
+         # ResourceTracker.resize_claim() sets instance.migration_context.
+         return instance.migration_context
+ 
++    @messaging.expected_exceptions(exception.InstancePowerOffFailure)
+     @guards.entrypoint(
+         'prep_snapshot_based_resize_at_source',
+         service='compute', instance_arg=1)
+-    @messaging.expected_exceptions(exception.InstancePowerOffFailure)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -8913,9 +8913,6 @@ class ComputeManager(manager.Manager):
+ 
+     # TODO(mriedem): There are likely race failures which can result in
+     # NotFound and QuotaError exceptions getting traced as well.
+-    @guards.entrypoint(
+-        'attach_interface',
+-        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(
+         # Do not log a traceback for user errors. We use Invalid generically
+         # since this method can raise lots of different exceptions:
+@@ -8929,6 +8926,9 @@ class ComputeManager(manager.Manager):
+         # NetworksWithQoSPolicyNotSupported
+         # InterfaceAttachResourceAllocationFailed
+         exception.Invalid)
++    @guards.entrypoint(
++        'attach_interface',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -9842,6 +9842,7 @@ class ComputeManager(manager.Manager):
+         :param migrate_data: implementation specific params
+ 
+         """
++        guards.bind_migration(context, migration.uuid)
+         self._set_migration_status(migration, 'queued')
+         # NOTE(Kevin_Zheng): Submit the live_migration job to the pool and
+         # put the returned Future object into dict mapped with migration.uuid
+@@ -9867,7 +9868,7 @@ class ComputeManager(manager.Manager):
+                 migration_uuid=migration.uuid, instance_uuid=instance.uuid)
+ 
+     @guards.entrypoint(
+-        'live_migration_force_complete',
++        'live_migrate_force_complete',
+         service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+@@ -9879,6 +9880,9 @@ class ComputeManager(manager.Manager):
+         :param instance: The instance that is being migrated
+         """
+ 
++        if not guards.control_active(context):
++            return
++
+         self._notify_about_instance_usage(
+             context, instance, 'live.migration.force.complete.start')
+         compute_utils.notify_about_instance_action(
+@@ -9902,7 +9906,7 @@ class ComputeManager(manager.Manager):
+             phase=fields.NotificationPhase.END)
+ 
+     @guards.entrypoint(
+-        'live_migration_abort',
++        'live_migrate_abort',
+         service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+@@ -9915,6 +9919,9 @@ class ComputeManager(manager.Manager):
+         :param migration_id: ID of in-progress live migration
+ 
+         """
++        if not guards.control_active(context, migration_id):
++            return
++
+         self._notify_about_instance_usage(
+             context, instance, 'live.migration.abort.start')
+         compute_utils.notify_about_instance_action(
+@@ -9978,6 +9985,7 @@ class ComputeManager(manager.Manager):
+                 instance.task_state = None
+                 instance.save(expected_task_state=[task_states.MIGRATING])
+                 self._set_migration_status(migration, 'cancelled')
++                guards.cancel_queued_migration(context, migration.id)
+         except KeyError:
+             migration = objects.Migration.get_by_id(context, migration_id)
+             if migration.status != 'running':
+@@ -12180,13 +12188,13 @@ class ComputeManager(manager.Manager):
+                         migration.id,
+                         instance=instance)
+ 
+-    @guards.entrypoint(
+-        'quiesce',
+-        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(exception.InstanceQuiesceNotSupported,
+                                    exception.QemuGuestAgentNotEnabled,
+                                    exception.NovaException,
+                                    NotImplementedError)
++    @guards.entrypoint(
++        'quiesce',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     def quiesce_instance(self, context, instance):
+         """Quiesce an instance on this host."""
+@@ -12207,13 +12215,13 @@ class ComputeManager(manager.Manager):
+                 timer = loopingcall.FixedIntervalLoopingCall(_wait_snapshot)
+                 timer.start(interval=0.5).wait()
+ 
+-    @guards.entrypoint(
+-        'unquiesce',
+-        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(exception.InstanceQuiesceNotSupported,
+                                    exception.QemuGuestAgentNotEnabled,
+                                    exception.NovaException,
+                                    NotImplementedError)
++    @guards.entrypoint(
++        'unquiesce',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     def unquiesce_instance(self, context, instance, mapping=None):
+         """Unquiesce an instance on this host.
+diff --git a/nova/db/api/checkpoints.py b/nova/db/api/checkpoints.py
+index 8cd0c06..63846c0 100644
+--- a/nova/db/api/checkpoints.py
++++ b/nova/db/api/checkpoints.py
+@@ -132,6 +132,36 @@ def _charge(usage, count, byte_count):
+     usage.version += 1
+ 
+ 
++def lock_instance_mapping(context, instance_uuid):
++    """Join an API writer; serialize mapping changes with ticket creation."""
++    query = context.session.query(m.InstanceMapping).filter_by(
++        instance_uuid=instance_uuid
++    )
++    query.update(
++        {m.InstanceMapping.updated_at: m.InstanceMapping.updated_at},
++        synchronize_session=False,
++    )
++    return query.with_for_update().populate_existing().first()
++
++
++def guard_mapping_mutation(context, mapping, updates=None):
++    """The mapping row must already be locked in this same API transaction."""
++    if mapping is None:
++        return
++    if updates is not None and all(
++        key not in updates or updates[key] == getattr(mapping, key)
++        for key in ('cell_id', 'project_id', 'instance_uuid')
++    ):
++        return
++    if (
++        context.session.query(m.CheckpointQuotaTicket)
++        .filter_by(instance_uuid=mapping.instance_uuid)
++        .filter(m.CheckpointQuotaTicket.state != 'released')
++        .first()
++    ):
++        raise exception.CheckpointConflict(reason='identity_changed')
++
++
+ @require_context
+ @_reader
+ def get(context, ticket_id):
+@@ -179,6 +209,18 @@ def reserve(context, admission):
+         if ticket.payload_hash != a.key.payload_hash:
+             _conflict()
+         return _row(ticket)
++    mapping = lock_instance_mapping(context, a.key.instance_uuid)
++    cell = (
++        context.session.get(m.CellMapping, mapping.cell_id)
++        if mapping is not None and mapping.cell_id is not None
++        else None
++    )
++    if (
++        cell is None or
++        cell.uuid != a.cell_uuid or
++        mapping.project_id != a.key.project_id
++    ):
++        raise exception.CheckpointConflict(reason='identity_changed')
+     _charge(
+         usage,
+         usage.checkpoint_count + 1,
+diff --git a/nova/db/main/checkpoints.py b/nova/db/main/checkpoints.py
+index 8f05b1f..36affa7 100644
+--- a/nova/db/main/checkpoints.py
++++ b/nova/db/main/checkpoints.py
+@@ -45,6 +45,7 @@ _JSON_COLUMNS = frozenset(
+         'payload',
+         'result',
+         'artifact_usage_proof',
++        'ordinary_control',
+     )
+ )
+ 
+@@ -75,10 +76,12 @@ def _authorize(context, project_id):
+         raise exception.NotFound()
+ 
+ 
+-def _instance(context, instance_uuid, lock=False, authorize=True):
+-    query = context.session.query(m.Instance).filter_by(
+-        uuid=instance_uuid, deleted=0
+-    )
++def _instance(
++    context, instance_uuid, lock=False, authorize=True, include_deleted=False
++):
++    query = context.session.query(m.Instance).filter_by(uuid=instance_uuid)
++    if not include_deleted:
++        query = query.filter_by(deleted=0)
+     if lock:
+         # Explicit updated_at assignment prevents the no-op fence from changing
+         # a user-visible timestamp. SQLite SELECT FOR UPDATE alone is no fence.
+@@ -352,6 +355,7 @@ def admit(context, admission, ticket_id):
+         not context.is_admin and context.user_id != a.key.actor_user_id
+     ):
+         raise exception.NotFound()
++    guard = _guard(context, instance.uuid)
+     if context.session.get(
+         m.InstanceCheckpointAdmissionTombstone, a.operation_id
+     ):
+@@ -361,7 +365,6 @@ def admit(context, admission, ticket_id):
+         return _row(existing)
+     if context.session.get(m.InstanceCheckpointOperation, a.operation_id):
+         _conflict()
+-    guard = _guard(context, instance.uuid)
+     if guard.operation_id or guard.ordinary_claim_uuid:
+         _conflict('guard_busy')
+     if instance.task_state is not None or (
+@@ -474,9 +477,22 @@ def admit(context, admission, ticket_id):
+ @db.pick_context_manager_writer
+ def cancel_admission(context, admission):
+     a = admission
+-    instance = _instance(context, a.key.instance_uuid, lock=True)
+-    if instance.project_id != a.key.project_id or a.key.kind != 'create':
++    _authorize(context, a.key.project_id)
++    if a.key.kind != 'create' or (
++        not context.is_admin and context.user_id != a.key.actor_user_id
++    ):
+         raise exception.NotFound()
++    try:
++        instance = _instance(
++            context, a.key.instance_uuid, lock=True, include_deleted=True
++        )
++        if instance.project_id != a.key.project_id:
++            raise exception.NotFound()
++    except exception.InstanceNotFound:
++        # Absence alone is never refund evidence. Lock the same durable guard
++        # used by admit, then persist a tombstone that fences any late admit.
++        pass
++    _guard(context, a.key.instance_uuid)
+     existing = context.session.get(
+         m.InstanceCheckpointOperation, a.operation_id
+     )
+@@ -519,7 +535,7 @@ def cancel_admission(context, admission):
+             m.InstanceCheckpointAdmissionTombstone(
+                 operation_id=a.operation_id,
+                 cell_uuid=a.cell_uuid,
+-                instance_uuid=instance.uuid,
++                instance_uuid=a.key.instance_uuid,
+                 project_id=a.key.project_id,
+                 actor_user_id=a.key.actor_user_id,
+                 request_id=a.key.request_id,
+@@ -1181,7 +1197,11 @@ def _scope_matches(context, guard, instance_uuid):
+         _conflict('guard_busy')
+     if scope.instance_uuid != instance_uuid or guard is None:
+         _conflict('guard_busy')
+-    if scope.kind == 'ordinary':
++    if scope.kind == 'control':
++        control = _validate_control(guard, scope)
++        if control['state'] != 'running':
++            _conflict('guard_busy')
++    elif scope.kind == 'ordinary':
+         if (
+             scope.owner_uuid != guard.ordinary_claim_uuid or
+             scope.token != guard.ordinary_token or
+@@ -1249,7 +1269,12 @@ def guard_mutation(context, instance_uuid, action, values=None):
+             context, instance_uuid, lock=True, authorize=False
+         )
+     except exception.InstanceNotFound:
+-        if context.session.get(m.InstanceCheckpointGuard, instance_uuid):
++        guard = context.session.get(m.InstanceCheckpointGuard, instance_uuid)
++        if guard and (
++            guard.operation_id or
++            guard.ordinary_claim_uuid or
++            guard.checkpoint_count
++        ):
+             _conflict('guard_busy')
+         return
+     guard = context.session.get(m.InstanceCheckpointGuard, instance_uuid)
+@@ -1322,6 +1347,8 @@ def guard_mutation(context, instance_uuid, action, values=None):
+     elif action == 'extra':
+         if not set(values) - {'updated_at'}:
+             return
++    if scope is not None and scope.kind == 'control' and topology:
++        _conflict('identity_changed')
+     if guard.operation_id:
+         if scope is None or scope.kind != 'checkpoint' or topology:
+             _conflict('guard_busy')
+@@ -1433,15 +1460,34 @@ def guard_release(context, scope):
+     except exception.InstanceNotFound:
+         pass
+     guard = _guard(context, scope.instance_uuid)
++    if scope.kind == 'control':
++        control = _validate_control(guard, scope)
++        if control['state'] != 'running':
++            _conflict('guard_busy')
++        guard.ordinary_control = None
++        if guard.ordinary_state == 'completed':
++            _clear_ordinary(guard)
++        guard.version += 1
++        return
+     _validate_ordinary(guard, scope)
+     if guard.ordinary_state != 'running':
+         _conflict('guard_busy')
++    if guard.ordinary_control:
++        # An in-flight control pins this owner even if the main worker ends.
++        guard.ordinary_state = 'completed'
++    else:
++        _clear_ordinary(guard)
++    guard.version += 1
++
++
++def _clear_ordinary(guard):
+     guard.ordinary_claim_uuid = None
+     guard.ordinary_token = None
+     guard.ordinary_action = None
+     guard.ordinary_state = None
+     guard.ordinary_target = None
+-    guard.version += 1
++    guard.ordinary_migration_uuid = None
++    guard.ordinary_control = None
+ 
+ 
+ def _validate_ordinary(guard, scope):
+@@ -1459,6 +1505,16 @@ def _validate_ordinary(guard, scope):
+ def guard_handoff(context, scope, target):
+     _instance(context, scope.instance_uuid, lock=True)
+     guard = _guard(context, scope.instance_uuid)
++    if scope.kind == 'control':
++        control = _validate_control(guard, scope)
++        method = scope.action.replace('live_migrate_', 'live_migration_')
++        expected = 'compute:%s:%s' % (method, control['source_compute'])
++        if control['state'] != 'running' or target != expected:
++            _conflict('guard_busy')
++        control.update(state='queued', target=target)
++        guard.ordinary_control = _encode(control)
++        guard.version += 1
++        return scope
+     _validate_ordinary(guard, scope)
+     if (
+         guard.ordinary_state != 'running' or
+@@ -1478,6 +1534,23 @@ def guard_handoff(context, scope, target):
+ def guard_adopt(context, scope, target):
+     _instance(context, scope.instance_uuid, lock=True)
+     guard = _guard(context, scope.instance_uuid)
++    if scope.kind == 'control':
++        control = _validate_control(guard, scope)
++        if control['state'] != 'queued' or control['target'] != target:
++            _conflict('guard_busy')
++        control.update(
++            state='running', target=None, token=secrets.token_hex(32)
++        )
++        guard.ordinary_control = _encode(control)
++        guard.version += 1
++        return c.Scope(
++            scope.instance_uuid,
++            'control',
++            scope.owner_uuid,
++            1,
++            scope.action,
++            control['token'],
++        )
+     _validate_ordinary(guard, scope)
+     if guard.ordinary_state != 'queued' or guard.ordinary_target != target:
+         _conflict('guard_busy')
+@@ -1496,6 +1569,164 @@ def guard_adopt(context, scope, target):
+     )
+ 
+ 
++def _validate_control(guard, scope):
++    control = jsonutils.loads(guard.ordinary_control or '{}')
++    if (
++        scope.kind != 'control' or
++        guard.operation_id or
++        not guard.ordinary_claim_uuid or
++        guard.ordinary_action != 'live_migrate' or
++        scope.owner_uuid != control.get('uuid') or
++        scope.token != control.get('token') or
++        scope.action != control.get('action') or
++        guard.ordinary_migration_uuid != control.get('migration_uuid')
++    ):
++        _conflict('guard_busy')
++    return control
++
++
++@require_context
++@db.pick_context_manager_writer
++def guard_bind_migration(context, scope, migration_uuid):
++    instance = _instance(context, scope.instance_uuid, lock=True)
++    guard = _guard(context, scope.instance_uuid)
++    _validate_ordinary(guard, scope)
++    migration = (
++        context.session.query(m.Migration)
++        .filter_by(uuid=migration_uuid, instance_uuid=instance.uuid, deleted=0)
++        .first()
++    )
++    if (
++        guard.ordinary_state != 'running' or
++        guard.ordinary_action not in ('live_migrate', 'live_migration') or
++        migration is None or
++        migration.migration_type != 'live-migration' or
++        migration.source_compute != instance.host or
++        guard.ordinary_migration_uuid not in (None, migration_uuid)
++    ):
++        _conflict('guard_busy')
++    guard.ordinary_migration_uuid = migration_uuid
++    guard.version += 1
++
++
++@require_context
++@db.pick_context_manager_writer
++def guard_acquire_control(context, instance_uuid, action, migration_id):
++    instance = _instance(context, instance_uuid, lock=True)
++    guard = context.session.get(m.InstanceCheckpointGuard, instance_uuid)
++    if not CONF.checkpoint.enabled and (
++        guard is None or
++        not (
++            guard.operation_id or
++            guard.ordinary_claim_uuid or
++            guard.checkpoint_count
++        )
++    ):
++        return None
++    allowed = {
++        'live_migrate_abort': ('running', 'queued', 'preparing'),
++        'live_migrate_force_complete': ('running',),
++    }
++    migration = (
++        context.session.query(m.Migration)
++        .filter_by(id=migration_id, instance_uuid=instance_uuid, deleted=0)
++        .first()
++    )
++    if (
++        action not in allowed or
++        guard is None or
++        guard.operation_id or
++        guard.checkpoint_count or
++        not guard.ordinary_claim_uuid or
++        guard.ordinary_action != 'live_migrate' or
++        guard.ordinary_state not in ('queued', 'running') or
++        guard.ordinary_control or
++        migration is None or
++        guard.ordinary_migration_uuid != migration.uuid or
++        migration.status not in allowed[action] or
++        migration.source_compute != instance.host
++    ):
++        _conflict('guard_busy')
++    control = dict(
++        uuid=uuidutils.generate_uuid(),
++        token=secrets.token_hex(32),
++        action=action,
++        state='running',
++        target=None,
++        migration_uuid=migration.uuid,
++        migration_id=migration.id,
++        source_compute=migration.source_compute,
++    )
++    guard.ordinary_control = _encode(control)
++    guard.version += 1
++    return c.Scope(
++        instance_uuid, 'control', control['uuid'], 1, action, control['token']
++    )
++
++
++@require_context
++@db.pick_context_manager_reader
++def guard_control_active(context, scope, migration_id=None):
++    instance = _instance(context, scope.instance_uuid)
++    guard = context.session.get(m.InstanceCheckpointGuard, scope.instance_uuid)
++    _scope_matches(context, guard, scope.instance_uuid)
++    control = _validate_control(guard, scope)
++    if migration_id is not None and migration_id != control['migration_id']:
++        _conflict('identity_changed')
++    migration = (
++        context.session.query(m.Migration)
++        .filter_by(
++            uuid=control['migration_uuid'],
++            instance_uuid=scope.instance_uuid,
++            deleted=0,
++        )
++        .first()
++    )
++    allowed = (
++        ('running',)
++        if scope.action == 'live_migrate_force_complete'
++        else ('queued', 'preparing', 'running')
++    )
++    return (
++        guard.ordinary_state != 'completed' and
++        migration is not None and
++        migration.status in allowed and
++        instance.host == control['source_compute']
++    )
++
++
++@require_context
++@db.pick_context_manager_writer
++def guard_cancel_queued_migration(context, scope, migration_id):
++    _instance(context, scope.instance_uuid, lock=True)
++    guard = _guard(context, scope.instance_uuid)
++    control = _validate_control(guard, scope)
++    migration = (
++        context.session.query(m.Migration)
++        .filter_by(
++            uuid=control['migration_uuid'],
++            instance_uuid=scope.instance_uuid,
++            deleted=0,
++        )
++        .first()
++    )
++    if (
++        scope.action != 'live_migrate_abort' or
++        control['state'] != 'running' or
++        migration_id != control['migration_id'] or
++        migration is None or
++        migration.status != 'cancelled' or
++        guard.ordinary_state != 'queued' or
++        guard.ordinary_target !=
++        'compute:_do_live_migration:%s' % control['source_compute']
++    ):
++        _conflict('guard_busy')
++    # The cancelled Future cannot adopt. Cleanup succeeded, but keep the
++    # primary pinned until the control worker also finishes successfully.
++    guard.ordinary_state = 'completed'
++    guard.version += 1
++
++
+ @require_context
+ @db.pick_context_manager_reader
+ def operations_recovery_page(context, marker=None, limit=100):
+diff --git a/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py b/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py
+index 4b8e974..48ad915 100644
+--- a/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py
++++ b/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py
+@@ -185,6 +185,8 @@ def upgrade():
+         sa.Column('ordinary_action', sa.String(64), nullable=True),
+         sa.Column('ordinary_state', sa.String(32), nullable=True),
+         sa.Column('ordinary_target', sa.String(255), nullable=True),
++        sa.Column('ordinary_migration_uuid', sa.String(36), nullable=True),
++        sa.Column('ordinary_control', sa.Text, nullable=True),
+         sa.Column('version', sa.Integer, nullable=False),
+         sa.Column('created_at', sa.DateTime),
+         sa.Column('updated_at', sa.DateTime),
+diff --git a/nova/db/main/models.py b/nova/db/main/models.py
+index 92fa42b..909b9a3 100644
+--- a/nova/db/main/models.py
++++ b/nova/db/main/models.py
+@@ -1378,6 +1378,8 @@ class InstanceCheckpointGuard(BASE, NovaBase):
+     ordinary_action = sa.Column(sa.String(64), nullable=True)
+     ordinary_state = sa.Column(sa.String(32), nullable=True)
+     ordinary_target = sa.Column(sa.String(255), nullable=True)
++    ordinary_migration_uuid = sa.Column(sa.String(36), nullable=True)
++    ordinary_control = sa.Column(sa.Text, nullable=True)
+     version = sa.Column(sa.Integer, nullable=False)
+ 
+ 
+diff --git a/nova/objects/checkpoint.py b/nova/objects/checkpoint.py
+index d502dea..a659a3b 100644
+--- a/nova/objects/checkpoint.py
++++ b/nova/objects/checkpoint.py
+@@ -284,6 +284,8 @@ class InstanceCheckpointGuard(_Projection):
+         'ordinary_action': fields.StringField(nullable=True),
+         'ordinary_state': fields.StringField(nullable=True),
+         'ordinary_target': fields.StringField(nullable=True),
++        'ordinary_migration_uuid': fields.UUIDField(nullable=True),
++        'ordinary_control': CheckpointJSONField(nullable=True),
+         'version': fields.IntegerField(),
+     }
+ 
+@@ -300,6 +302,31 @@ class InstanceCheckpointGuard(_Projection):
+         scope = db.guard_acquire(context, instance_uuid, action)
+         return scope.to_primitive() if scope is not None else None
+ 
++    @base.remotable_classmethod
++    def bind_migration(cls, context, scope, migration_uuid):
++        db.guard_bind_migration(
++            context, contracts.Scope.from_primitive(scope), migration_uuid
++        )
++
++    @base.remotable_classmethod
++    def acquire_control(cls, context, instance_uuid, action, migration_id):
++        scope = db.guard_acquire_control(
++            context, instance_uuid, action, migration_id
++        )
++        return scope.to_primitive() if scope is not None else None
++
++    @base.remotable_classmethod
++    def control_active(cls, context, scope, migration_id=None):
++        return db.guard_control_active(
++            context, contracts.Scope.from_primitive(scope), migration_id
++        )
++
++    @base.remotable_classmethod
++    def cancel_queued_migration(cls, context, scope, migration_id):
++        db.guard_cancel_queued_migration(
++            context, contracts.Scope.from_primitive(scope), migration_id
++        )
++
+     @base.remotable_classmethod
+     def release(cls, context, scope):
+         db.guard_release(context, contracts.Scope.from_primitive(scope))
+diff --git a/nova/objects/instance_mapping.py b/nova/objects/instance_mapping.py
+index 3b5f331..9f74968 100644
+--- a/nova/objects/instance_mapping.py
++++ b/nova/objects/instance_mapping.py
+@@ -21,6 +21,7 @@ from sqlalchemy.sql import func
+ 
+ from nova import context as nova_context
+ from nova.db.api import api as api_db_api
++from nova.db.api import checkpoints as checkpoint_db
+ from nova.db.api import models as api_models
+ from nova import exception
+ from nova.i18n import _
+@@ -141,12 +142,11 @@ class InstanceMapping(base.NovaTimestampObject, base.NovaObject):
+     @staticmethod
+     @api_db_api.context_manager.writer
+     def _save_in_db(context, instance_uuid, updates):
+-        db_mapping = context.session.query(
+-                api_models.InstanceMapping).filter_by(
+-                        instance_uuid=instance_uuid).first()
++        db_mapping = checkpoint_db.lock_instance_mapping(
++            context, instance_uuid)
+         if not db_mapping:
+             raise exception.InstanceMappingNotFound(uuid=instance_uuid)
+-
++        checkpoint_db.guard_mapping_mutation(context, db_mapping, updates)
+         db_mapping.update(updates)
+         # NOTE: This is done because a later access will trigger a lazy load
+         # outside of the db session so it will fail. We don't lazy load
+@@ -176,6 +176,8 @@ class InstanceMapping(base.NovaTimestampObject, base.NovaObject):
+     @staticmethod
+     @api_db_api.context_manager.writer
+     def _destroy_in_db(context, instance_uuid):
++        mapping = checkpoint_db.lock_instance_mapping(context, instance_uuid)
++        checkpoint_db.guard_mapping_mutation(context, mapping)
+         result = context.session.query(api_models.InstanceMapping).filter_by(
+                 instance_uuid=instance_uuid).delete()
+         if not result:
+@@ -353,6 +355,10 @@ class InstanceMappingList(base.ObjectListBase, base.NovaObject):
+     @staticmethod
+     @api_db_api.context_manager.writer
+     def _destroy_bulk_in_db(context, instance_uuids):
++        for instance_uuid in sorted(set(instance_uuids)):
++            mapping = checkpoint_db.lock_instance_mapping(
++                context, instance_uuid)
++            checkpoint_db.guard_mapping_mutation(context, mapping)
+         return context.session.query(api_models.InstanceMapping).filter(
+                 api_models.InstanceMapping.instance_uuid.in_(instance_uuids)).\
+                 delete(synchronize_session=False)
+diff --git a/nova/test.py b/nova/test.py
+index 920106b..c9e72ff 100644
+--- a/nova/test.py
++++ b/nova/test.py
+@@ -848,6 +848,9 @@ class NoDBTestCase(TestCase):
+             self.useFixture(fixtures.MockPatch(
+                 'nova.objects.InstanceCheckpointGuard.acquire',
+                 return_value=None))
++            self.useFixture(fixtures.MockPatch(
++                'nova.objects.InstanceCheckpointGuard.acquire_control',
++                return_value=None))
+             self.useFixture(fixtures.MockPatch(
+                 'nova.objects.InstanceCheckpointGuard.check',
+                 return_value=None))
+diff --git a/nova/tests/functional/db/test_checkpoint_quota.py b/nova/tests/functional/db/test_checkpoint_quota.py
+index c6af34b..64fcb61 100644
+--- a/nova/tests/functional/db/test_checkpoint_quota.py
++++ b/nova/tests/functional/db/test_checkpoint_quota.py
+@@ -24,6 +24,7 @@ from nova.db.api import api as api_db
+ from nova.db.api import checkpoints as quota_db
+ from nova.db import migration
+ from nova import exception
++from nova import objects
+ from nova import test
+ from nova.tests.unit.checkpoints import test_cell_db
+ 
+@@ -73,6 +74,12 @@ class QuotaRaceMixin:
+                     checkpoint_id=getattr(uuids, 'checkpoint%d' % index),
+                 )
+                 self.candidates.append(replace(candidate, cell_uuid=cell.uuid))
++            objects.InstanceMapping(
++                self.ctx,
++                instance_uuid=instance_uuid,
++                cell_mapping=cell,
++                project_id='project',
++            ).create()
+ 
+     def test_two_cells_share_one_project_limit(self):
+         barrier = threading.Barrier(2)
+@@ -102,6 +109,52 @@ class QuotaRaceMixin:
+         self.assertEqual(1, usage['checkpoint_count'])
+         self.assertEqual(4096, usage['artifact_bytes'])
+ 
++    def test_mapping_change_and_reserve_have_one_winner(self):
++        candidate = self.candidates[0]
++        barrier = threading.Barrier(2)
++        outcomes = []
++
++        def run(kind):
++            ctx = context.RequestContext('actor', 'project')
++            barrier.wait(timeout=10)
++            try:
++                if kind == 'reserve':
++                    quota.QuotaLedger().reserve(ctx, candidate)
++                else:
++                    mapping = objects.InstanceMapping.get_by_instance_uuid(
++                        ctx, candidate.key.instance_uuid
++                    )
++                    mapping.cell_mapping = self.cell_mappings['cell2']
++                    mapping.save()
++                outcomes.append(kind)
++            except exception.CheckpointConflict:
++                outcomes.append('denied')
++
++        threads = [
++            threading.Thread(target=run, args=(kind,))
++            for kind in ('reserve', 'move')
++        ]
++        for worker in threads:
++            worker.start()
++        for worker in threads:
++            worker.join(timeout=20)
++            self.assertFalse(worker.is_alive())
++        self.assertEqual(2, len(outcomes))
++        self.assertEqual(1, outcomes.count('denied'))
++        mapping = objects.InstanceMapping.get_by_instance_uuid(
++            self.ctx, candidate.key.instance_uuid
++        )
++        usage = quota_db.get_usage(self.ctx, 'project')
++        self.assertEqual(
++            1 if 'reserve' in outcomes else 0, usage['checkpoint_count']
++        )
++        self.assertEqual(
++            self.cell_mappings[
++                'cell1' if 'reserve' in outcomes else 'cell2'
++            ].uuid,
++            mapping.cell_mapping.uuid,
++        )
++
+ 
+ class QuotaMySQLRace(
+     QuotaRaceMixin, test_fixtures.OpportunisticDBTestMixin, test.NoDBTestCase
+diff --git a/nova/tests/functional/test_checkpoint_review.py b/nova/tests/functional/test_checkpoint_review.py
+new file mode 100644
+index 0000000..aa359d7
+--- /dev/null
++++ b/nova/tests/functional/test_checkpoint_review.py
+@@ -0,0 +1,394 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from unittest import mock
++
++import ddt
++from oslo_utils.fixture import uuidsentinel as uuids
++from oslo_utils import timeutils
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import guards
++from nova.checkpoints import quota
++from nova.compute import api as compute_api
++from nova.compute import task_states
++from nova import context
++from nova.db.main import api as db_api
++from nova.db.main import checkpoints as db
++from nova import exception
++from nova import objects
++from nova.tests.fixtures import checkpoints
++
++
++@ddt.ddt
++class CheckpointReviewTest(checkpoints.CheckpointTestCase):
++    def setUp(self):
++        super().setUp()
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            db_api.instance_update(
++                ctx, self.servers[0], {'launched_at': timeutils.utcnow()}
++            )
++
++    def test_rejected_start_does_not_retain_owner(self):
++        self.request(
++            'POST', 'action', {'os-start': None}, version='2.1', expected=409
++        )
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            guard = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++                ctx, self.servers[0]
++            )
++            if guard is not None:
++                self.assertIsNone(guard.ordinary_claim_uuid)
++        self.create()
++
++    def test_volume_snapshot_crosses_rpc_with_available_checkpoint(self):
++        self.create()
++        with mock.patch.object(
++            self.drivers[0], 'volume_snapshot_create', create=True
++        ) as effect:
++            with context.target_cell(self.ctx, self.cells[0]) as ctx:
++                compute_api.API().volume_snapshot_create(
++                    ctx, self.volumes[0], {'id': uuids.snapshot}
++                )
++                guard = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++                    ctx, self.servers[0]
++                )
++                self.assertIsNone(guard.ordinary_claim_uuid)
++                self.assertEqual(1, guard.checkpoint_count)
++        effect.assert_called_once()
++
++    def test_deleted_instance_cancellation_refunds_only_with_tombstone(self):
++        reserve = quota.QuotaLedger.reserve
++        tickets = []
++
++        def delete_after_reserve(ledger, ctx, admission):
++            ticket = reserve(ledger, ctx, admission)
++            tickets.append(ticket)
++            with context.target_cell(ctx, self.cells[0]) as cell_ctx:
++                db_api.instance_destroy(cell_ctx, self.servers[0])
++            return ticket
++
++        with mock.patch.object(
++            quota.QuotaLedger, 'reserve', delete_after_reserve
++        ):
++            self.create(expected=404)
++        ticket = quota.QuotaLedger().get(self.ctx, tickets[0].id)
++        self.assertEqual('released', ticket.state)
++        self.assertEqual(0, self.usage()['checkpoint_count'])
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            proof = db.close_proof(ctx, ticket.operation_id)
++            self.assertEqual('admission_cancelled', proof.kind)
++            self.assertEqual([], db.steps_get(ctx, ticket.operation_id))
++        self.assertEqual([], self.drivers[0].executed)
++
++    def test_inactive_history_allows_deleted_cleanup_save(self):
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            owner = db.guard_acquire(ctx, self.servers[0], 'delete')
++            db.guard_release(ctx, owner)
++            db_api.instance_destroy(ctx, self.servers[0])
++            ctx.read_deleted = 'yes'
++            instance = objects.Instance.get_by_uuid(
++                ctx, self.servers[0], expected_attrs=['system_metadata']
++            )
++            with mock.patch.object(
++                self.drivers[0],
++                'delete_instance_files',
++                create=True,
++                return_value=True,
++            ) as effect:
++                self.managers[0]._cleanup_deleted_instance_files(ctx, instance)
++            effect.assert_called_once()
++            instance = objects.Instance.get_by_uuid(
++                ctx, self.servers[0], expected_attrs=['system_metadata']
++            )
++            self.assertTrue(instance.cleaned)
++            self.assertEqual('1', instance.system_metadata['clean_attempts'])
++
++    @ddt.data(
++        {'os-stop': None},
++        {'lock': None},
++        {'unlock': None},
++        {'os-resetState': {'state': 'active'}},
++    )
++    def test_legacy_http_reports_checkpoint_conflict(self, action):
++        self.drivers[0].lose_reply.add('runtime_save')
++        self.create()
++        self.ctx.is_admin = True
++        self.ctx.roles = ['admin', 'member', 'reader']
++        self.request('POST', 'action', action, version='2.1', expected=409)
++
++    def test_mapping_changed_after_probe_rejects_stale_admission(self):
++        reserve = quota.QuotaLedger.reserve
++
++        def move_after_probe(ledger, ctx, admission):
++            mapping = objects.InstanceMapping.get_by_instance_uuid(
++                ctx, self.servers[0]
++            )
++            mapping.cell_mapping = self.cells[1]
++            mapping.save()
++            return reserve(ledger, ctx, admission)
++
++        with mock.patch.object(quota.QuotaLedger, 'reserve', move_after_probe):
++            self.create(expected=409)
++        self.assertEqual(0, self.usage()['checkpoint_count'])
++        self.assertEqual([], self.drivers[0].executed)
++
++    def test_held_ticket_fences_mapping_until_durable_cancel(self):
++        with mock.patch.object(
++            objects.InstanceCheckpointOperation,
++            'admit',
++            side_effect=TimeoutError(),
++        ):
++            self.create(expected=503)
++        mapping = objects.InstanceMapping.get_by_instance_uuid(
++            self.ctx, self.servers[0]
++        )
++        mapping.cell_mapping = self.cells[1]
++        self.assertRaises(exception.CheckpointConflict, mapping.save)
++        self.assertRaises(exception.CheckpointConflict, mapping.destroy)
++        self.assertRaises(
++            exception.CheckpointConflict,
++            objects.InstanceMappingList.destroy_bulk,
++            self.ctx,
++            [mapping.instance_uuid],
++        )
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++        report = quota.QuotaLedger().reconcile(self.ctx)
++        self.assertEqual(0, report['failed'])
++        self.assertEqual(0, self.usage()['checkpoint_count'])
++        mapping.save()
++        self.assertEqual(self.cells[1].uuid, mapping.cell_mapping.uuid)
++
++    def _queued_migration(self, ctx, running=False):
++        primary = db.guard_acquire(ctx, self.servers[0], 'live_migrate')
++        with guards.scope(ctx, primary) as owned:
++            instance = objects.Instance.get_by_uuid(owned, self.servers[0])
++            instance.task_state = task_states.MIGRATING
++            instance.save()
++            migration = objects.Migration(
++                owned,
++                instance_uuid=instance.uuid,
++                source_compute='compute0',
++                dest_compute='compute1',
++                migration_type='live-migration',
++                status='preparing',
++            )
++            migration.create()
++            compute_api.API()._record_action_start(
++                owned, instance, 'live-migration'
++            )
++            future = mock.Mock()
++            future.cancel.return_value = True
++            with mock.patch.object(
++                self.managers[0]._live_migration_executor,
++                'submit',
++                return_value=future,
++            ) as submit:
++                compute_api.API().compute_rpcapi.live_migration(
++                    owned, instance, 'compute1', False, 'compute0', migration
++                )
++            queued_ctx = submit.call_args.args[1]
++        if running:
++            primary = objects.InstanceCheckpointGuard.adopt(
++                ctx,
++                queued_ctx.checkpoint_scope,
++                'compute:_do_live_migration:compute0',
++            )
++            migration.status = 'running'
++            migration.save()
++            self.managers[0]._waiting_live_migrations.pop(instance.uuid)
++        return objects.Instance.get_by_uuid(ctx, instance.uuid), migration
++
++    @ddt.data('abort', 'force_complete')
++    def test_running_migration_control_preserves_primary(self, action):
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            instance, migration = self._queued_migration(ctx, running=True)
++            before = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++                ctx, instance.uuid
++            )
++            with mock.patch.object(
++                self.drivers[0], 'live_migration_' + action, create=True
++            ) as effect, mock.patch.object(
++                self.managers[0], '_notify_about_instance_usage'
++            ), mock.patch(
++                'nova.compute.utils.notify_about_instance_action'
++            ):
++                getattr(compute_api.API(), 'live_migrate_' + action)(
++                    ctx, instance, migration.id
++                )
++            effect.assert_called_once()
++            after = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++                ctx, instance.uuid
++            )
++            self.assertEqual(before.ordinary_token, after.ordinary_token)
++            self.assertEqual('running', after.ordinary_state)
++            self.assertRaises(
++                exception.CheckpointConflict,
++                db.guard_acquire,
++                ctx,
++                instance.uuid,
++                'stop',
++            )
++
++    def test_queued_abort_closes_claim_after_cleanup(self):
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            instance, migration = self._queued_migration(ctx)
++            with mock.patch.object(
++                self.managers[0], '_revert_allocation'
++            ), mock.patch.object(
++                self.managers[0].network_api, 'setup_networks_on_host'
++            ), mock.patch.object(
++                self.managers[0], '_notify_about_instance_usage'
++            ), mock.patch(
++                'nova.compute.utils.notify_about_instance_action'
++            ):
++                compute_api.API().live_migrate_abort(
++                    ctx, instance, migration.id, support_abort_in_queue=True
++                )
++            after = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++                ctx, instance.uuid
++            )
++            self.assertIsNone(after.ordinary_claim_uuid)
++            instance.refresh()
++            self.assertIsNone(instance.task_state)
++            migration = objects.Migration.get_by_id(ctx, migration.id)
++            self.assertEqual('cancelled', migration.status)
++        self.create()
++
++    def test_unknown_control_outcome_keeps_both_claims(self):
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            instance, migration = self._queued_migration(ctx, running=True)
++            with mock.patch.object(
++                self.drivers[0],
++                'live_migration_abort',
++                create=True,
++                side_effect=RuntimeError(),
++            ), mock.patch.object(
++                self.managers[0], '_notify_about_instance_usage'
++            ), mock.patch(
++                'nova.compute.utils.notify_about_instance_action'
++            ):
++                self.assertRaises(
++                    RuntimeError,
++                    compute_api.API().live_migrate_abort,
++                    ctx,
++                    instance,
++                    migration.id,
++                )
++            after = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++                ctx, instance.uuid
++            )
++            self.assertIsNotNone(after.ordinary_claim_uuid)
++            self.assertIsNotNone(after.ordinary_control)
++            self.assertRaises(
++                exception.CheckpointConflict,
++                db.guard_acquire,
++                ctx,
++                instance.uuid,
++                'stop',
++            )
++
++    def test_control_for_another_migration_cannot_borrow_owner(self):
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            instance, migration = self._queued_migration(ctx, running=True)
++            other = objects.Migration(
++                ctx,
++                instance_uuid=instance.uuid,
++                source_compute='compute0',
++                dest_compute='compute1',
++                migration_type='live-migration',
++                status='running',
++            )
++            other.create()
++            self.assertRaises(
++                exception.CheckpointConflict,
++                compute_api.API().live_migrate_abort,
++                ctx,
++                instance,
++                other.id,
++            )
++            after = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++                ctx, instance.uuid
++            )
++            self.assertIsNone(after.ordinary_control)
++
++    def test_control_delivered_after_primary_completion_has_no_effect(self):
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            instance, migration = self._queued_migration(ctx, running=True)
++            before = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++                ctx, instance.uuid
++            )
++            primary = c.Scope(
++                instance.uuid,
++                'ordinary',
++                before.ordinary_claim_uuid,
++                1,
++                before.ordinary_action,
++                before.ordinary_token,
++            )
++            control = db.guard_acquire_control(
++                ctx, instance.uuid, 'live_migrate_force_complete', migration.id
++            )
++            db.guard_handoff(
++                ctx, control, 'compute:live_migration_force_complete:compute0'
++            )
++            db.guard_release(ctx, primary)
++            ctx.checkpoint_scope = control.to_primitive()
++            with mock.patch.object(
++                self.drivers[0], 'live_migration_force_complete', create=True
++            ) as effect:
++                self.managers[0].live_migration_force_complete(ctx, instance)
++            effect.assert_not_called()
++            after = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++                ctx, instance.uuid
++            )
++            self.assertIsNone(after.ordinary_claim_uuid)
++
++    def test_control_pins_owner_when_primary_finishes_during_driver_call(self):
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            instance, migration = self._queued_migration(ctx, running=True)
++            before = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++                ctx, instance.uuid
++            )
++            primary = c.Scope(
++                instance.uuid,
++                'ordinary',
++                before.ordinary_claim_uuid,
++                1,
++                before.ordinary_action,
++                before.ordinary_token,
++            )
++
++            def finish_while_controlling(instance):
++                db.guard_release(ctx, primary)
++                self.assertRaises(
++                    exception.CheckpointConflict,
++                    db.guard_acquire,
++                    ctx,
++                    instance.uuid,
++                    'stop',
++                )
++
++            with mock.patch.object(
++                self.drivers[0],
++                'live_migration_force_complete',
++                create=True,
++                side_effect=finish_while_controlling,
++            ), mock.patch.object(
++                self.managers[0], '_notify_about_instance_usage'
++            ), mock.patch(
++                'nova.compute.utils.notify_about_instance_action'
++            ):
++                compute_api.API().live_migrate_force_complete(
++                    ctx, instance, migration.id
++                )
++            after = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++                ctx, instance.uuid
++            )
++            self.assertIsNone(after.ordinary_claim_uuid)
+diff --git a/nova/tests/unit/checkpoints/test_cell_db.py b/nova/tests/unit/checkpoints/test_cell_db.py
+index 45c64fe..733bfc9 100644
+--- a/nova/tests/unit/checkpoints/test_cell_db.py
++++ b/nova/tests/unit/checkpoints/test_cell_db.py
+@@ -26,23 +26,22 @@ from nova.compute import vm_states
+ from nova import context
+ from nova.db.main import api as db
+ from nova.db.main import checkpoints
++from nova.db.main import models
+ from nova.db import migration
+ from nova import exception
++from nova import objects
+ from nova import test
+ 
+ 
+-def make_instance(ctx, instance_uuid=uuids.instance, bdm_uuid=uuids.bdm,
+-                  volume_uuid=uuids.volume):
+-    flavor = {
+-        'nova_object.data': dict(
+-            memory_mb=1024,
+-            vcpus=1,
+-            root_gb=0,
+-            ephemeral_gb=0,
+-            swap=0,
+-            extra_specs={},
+-        )
+-    }
++def make_instance(
++    ctx,
++    instance_uuid=uuids.instance,
++    bdm_uuid=uuids.bdm,
++    volume_uuid=uuids.volume,
++):
++    flavor = objects.Flavor(
++        memory_mb=1024, vcpus=1, root_gb=0, ephemeral_gb=0,
++        swap=0, extra_specs={}).obj_to_primitive()
+     db.instance_create(
+         ctx,
+         dict(
+@@ -255,6 +254,21 @@ class CellDBTest(test.TestCase):
+         self.assertRaises(exception.CheckpointConflict, self.admit)
+         self.assertEqual([], checkpoints.steps_get(self.ctx, uuids.operation))
+ 
++    def test_cancel_without_instance_persists_refund_evidence(self):
++        with db.get_context_manager(self.ctx).writer.using(self.ctx):
++            self.ctx.session.query(models.Instance).filter_by(
++                uuid=uuids.instance
++            ).delete(synchronize_session=False)
++        proof = checkpoints.cancel_admission(self.ctx, self.admission)
++        self.assertEqual('admission_cancelled', proof.kind)
++        self.assertEqual(
++            proof, checkpoints.close_proof(self.ctx, uuids.operation)
++        )
++        self.assertEqual(
++            proof, checkpoints.cancel_admission(self.ctx, self.admission)
++        )
++        self.assertEqual([], checkpoints.steps_get(self.ctx, uuids.operation))
++
+     def test_cancel_create_when_other_kind_owns_request(self):
+         self.complete_steps(self.admission)
+         checkpoints.finalize(self.ctx, uuids.operation, 1, 'succeeded')
+diff --git a/nova/tests/unit/checkpoints/test_guards.py b/nova/tests/unit/checkpoints/test_guards.py
+index 6e3e410..a145e25 100644
+--- a/nova/tests/unit/checkpoints/test_guards.py
++++ b/nova/tests/unit/checkpoints/test_guards.py
+@@ -449,7 +449,7 @@ class GuardOwnershipTest(GuardMutationTest):
+             self.assertRaises(exception.CheckpointConflict, self.admit)
+         self.admit()
+ 
+-    def test_api_guard_precedes_validation_and_external_io(self):
++    def test_api_rejects_protected_mutations_before_effects(self):
+         from nova.compute import api
+         from nova import objects
+ 
+@@ -465,15 +465,32 @@ class GuardOwnershipTest(GuardMutationTest):
+             ('resize', ()),
+             ('shelve', ()),
+         )
+-        for method, args in cases:
+-            with self.subTest(method=method):
+-                self.assertRaises(
+-                    exception.CheckpointConflict,
+-                    getattr(compute, method),
+-                    self.ctx,
+-                    instance,
+-                    *args
+-                )
++        compute.network_api = mock.Mock()
++        extended = compute.network_api.instance_has_extended_resource_request
++        extended.return_value = False
++        compute.compute_rpcapi = mock.Mock()
++        compute.volume_api = mock.Mock()
++        with mock.patch.object(
++            api, 'instance_has_share', return_value=False
++        ), mock.patch.object(instance, 'get_network_info', return_value=[]):
++            for method, args in cases:
++                with self.subTest(method=method):
++                    error = self.assertRaises(
++                        exception.NovaException,
++                        getattr(compute, method),
++                        self.ctx,
++                        instance,
++                        *args
++                    )
++                    self.assertIsInstance(
++                        error,
++                        (
++                            exception.CheckpointConflict,
++                            exception.InstanceInvalidState,
++                        ),
++                    )
++        self.assertEqual([], compute.compute_rpcapi.mock_calls)
++        self.assertEqual([], compute.volume_api.mock_calls)
+ 
+     def test_worker_guard_precedes_driver(self):
+         from nova.compute import manager
+diff --git a/nova/tests/unit/checkpoints/test_quota.py b/nova/tests/unit/checkpoints/test_quota.py
+index 0f8c854..2afb6c0 100644
+--- a/nova/tests/unit/checkpoints/test_quota.py
++++ b/nova/tests/unit/checkpoints/test_quota.py
+@@ -40,6 +40,12 @@ class QuotaTest(test.TestCase):
+         self.ctx = context.RequestContext('actor', 'project')
+         self.ledger = quota.QuotaLedger()
+         self.cell = self.cell_mappings['cell1']
++        objects.InstanceMapping(
++            self.ctx,
++            instance_uuid=uuids.instance,
++            cell_mapping=self.cell,
++            project_id='project',
++        ).create()
+         with context.target_cell(self.ctx, self.cell) as ctx:
+             test_cell_db.make_instance(ctx)
+             self.admission = replace(
+@@ -86,6 +92,12 @@ class QuotaTest(test.TestCase):
+         self.flags(max_checkpoints_per_project=1, group='checkpoint')
+         first = self.ledger.reserve(self.ctx, self.admission)
+         second_cell = self.cell_mappings['cell2']
++        objects.InstanceMapping(
++            self.ctx,
++            instance_uuid=uuids.instance2,
++            cell_mapping=second_cell,
++            project_id='project',
++        ).create()
+         with context.target_cell(self.ctx, second_cell) as ctx:
+             test_cell_db.make_instance(
+                 ctx, uuids.instance2, uuids.bdm2, uuids.volume2
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index efe6588..4567d90 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1084,7 +1084,7 @@ object_data = {
+     'InstanceCheckpointArtifactList': '1.0-980a2e851b91058a2b688bee649202ef',
+     'InstanceCheckpointDisk': '1.0-32b4b8527364c69b5b047d3534dc2f26',
+     'InstanceCheckpointDiskList': '1.0-980a2e851b91058a2b688bee649202ef',
+-    'InstanceCheckpointGuard': '1.0-22f31584562ef5abe04060939ddd4914',
++    'InstanceCheckpointGuard': '1.0-5e31c03abf15dacea7608da5f153c4d8',
+     'InstanceCheckpointList': '1.0-df8bec672e55a3a45b40eaded98ec218',
+     'InstanceCheckpointOperation': '1.0-6c6013918c1bbadc5b1a96574e975d11',
+     'InstanceCheckpointOperationList': '1.0-833a632736c862175708703dba0e8e9e',

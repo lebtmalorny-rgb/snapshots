@@ -1,0 +1,686 @@
+From d065a55cbe5cb8cd59489752846a41145d72bd27 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 17:54:39 +0300
+Subject: [PATCH 7/7] fix: preserve checkpoint abort protection and
+ continuation policies
+
+---
+ api-ref/source/checkpoint-continuation.inc    | 10 ++-
+ cinder/checkpoints/continuation.py            | 20 +++++-
+ cinder/checkpoints/continuation_api.py        | 12 ++--
+ cinder/checkpoints/continuation_manager.py    | 18 ++---
+ cinder/db/api.py                              | 18 ++---
+ cinder/db/sqlalchemy/api.py                   | 18 ++---
+ .../db/sqlalchemy/checkpoint_continuation.py  | 38 ++++++-----
+ cinder/db/sqlalchemy/checkpoints.py           |  2 +-
+ .../api/v3/test_checkpoint_continuation.py    | 66 ++++++++++++++++++-
+ .../test_continuation_contracts.py            |  3 +-
+ .../checkpoints/test_continuation_manager.py  | 40 +++++++++++
+ cinder/volume/rpcapi.py                       | 33 +++++-----
+ doc/source/admin/checkpoint-continuation.rst  | 11 +++-
+ 13 files changed, 221 insertions(+), 68 deletions(-)
+
+diff --git a/api-ref/source/checkpoint-continuation.inc b/api-ref/source/checkpoint-continuation.inc
+index dcb0280..db0f95d 100644
+--- a/api-ref/source/checkpoint-continuation.inc
++++ b/api-ref/source/checkpoint-continuation.inc
+@@ -44,9 +44,13 @@ do not bypass the check. A missing or foreign operation returns 404.
+ 
+ All service paths optionally accept ``/v3/{service_project_id}/``. The project
+ must be the authenticated service project; it cannot select a tenant owner.
++The read and continue policy rules are independent: every GET requires
++``checkpoint:continuation_read`` and every mutation requires
++``checkpoint:continue``, in addition to mandatory identity and grant checks.
+ There is no service collection/list route. GET returns 200 with the same safe
+ ``checkpoint_operation`` view and continuation binding, including released
+-tombstones. A revoked grant cannot be read or continued.
++tombstones. Their operation identity/generation/release state is immutable;
++the nested resources reflect the current shared C1 resource journal. A revoked grant cannot be read or continued.
+ 
+ Continue an operation
+ ~~~~~~~~~~~~~~~~~~~~~
+@@ -100,7 +104,9 @@ returns its stored result. Changed payload or a second UUID for the same
+ action returns 409. Delete is restricted to original attachments before disk
+ revert; reconnect is allowed after every disk step succeeds. Complete requires
+ a successful update. The legacy attachment-header bypass is forbidden for a
+-delegated operation. Release rejects unfinished attachment requests.
++delegated operation. Release rejects unfinished attachment requests. Abort also rejects a
++successful original-attachment delete even before disk steps are dispatched;
++no compensating reconnect is assumed.
+ 
+ Read an attachment request
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~
+diff --git a/cinder/checkpoints/continuation.py b/cinder/checkpoints/continuation.py
+index 9447435..9b0d416 100644
+--- a/cinder/checkpoints/continuation.py
++++ b/cinder/checkpoints/continuation.py
+@@ -32,9 +32,23 @@ def require_executor(context) -> str:
+             'service' not in context.roles or subject not in
+             config.CONF.checkpoint.nova_service_user_ids):
+         raise exception.CheckpointServiceForbidden()
+-    context.authorize(policies.CONTINUE_POLICY,
+-                      target={'project_id': context.project_id,
+-                              'user_id': subject})
++    return subject
++
++
++READ_ACTIONS = ('read', 'capabilities', 'attachment_read')
++WRITE_ACTIONS = ('execute', 'reconcile', 'cleanup', 'release', 'attachment')
++
++
++def require_policy(context, action) -> str:
++    subject = require_executor(context)
++    if action in READ_ACTIONS:
++        name = policies.CONTINUATION_READ_POLICY
++    elif action in WRITE_ACTIONS:
++        name = policies.CONTINUE_POLICY
++    else:
++        raise exception.InvalidInput(reason='invalid_continuation_action')
++    context.authorize(name, target={'project_id': context.project_id,
++                                    'user_id': subject})
+     return subject
+ 
+ 
+diff --git a/cinder/checkpoints/continuation_api.py b/cinder/checkpoints/continuation_api.py
+index 7d00819..e77d490 100644
+--- a/cinder/checkpoints/continuation_api.py
++++ b/cinder/checkpoints/continuation_api.py
+@@ -37,7 +37,11 @@ class ContinuationAPI:
+         self.rpc = rpc if rpc is not None else rpcapi.VolumeAPI()
+ 
+     def get(self, context, nova_operation_id):
+-        row = db.checkpoint_continuation_get(context, _id(nova_operation_id))
++        return self._view(context, nova_operation_id, 'read')
++
++    def _view(self, context, nova_operation_id, action):
++        row = db.checkpoint_continuation_get(
++            context, _id(nova_operation_id), action)
+         return views.ViewBuilder.continuation(row['operation'], row)
+ 
+     def _volumes(self, context, scope, action):
+@@ -58,7 +62,7 @@ class ContinuationAPI:
+             db.checkpoint_continuation_transition(
+                 context, nova_operation_id, generation, name, outcome)
+             if name == 'release':
+-                return self.get(context, nova_operation_id)
++                return self._view(context, nova_operation_id, name)
+         volumes = self._volumes(context, scope, name)
+         for volume in volumes:
+             self.rpc.assert_checkpoint_continuation_ready(context, volume)
+@@ -68,7 +72,7 @@ class ContinuationAPI:
+                   self.rpc.execute_checkpoint_continuation)
+         for host in hosts:
+             method(context, nova_operation_id, generation, host)
+-        return self.get(context, nova_operation_id)
++        return self._view(context, nova_operation_id, name)
+ 
+     def capabilities(self, context, nova_operation_id, volume_id):
+         scope = continuation.authorize(context, _id(nova_operation_id), 1,
+@@ -122,6 +126,6 @@ class ContinuationAPI:
+ 
+     def get_attachment(self, context, nova_operation_id, attachment_id):
+         scope = continuation.authorize(context, _id(nova_operation_id), 1,
+-                                       'attachment')
++                                       'attachment_read')
+         return attachment_intents.AttachmentIntents().get_attachment(
+             context, scope, _id(attachment_id))
+diff --git a/cinder/checkpoints/continuation_manager.py b/cinder/checkpoints/continuation_manager.py
+index 31b4f59..e911c29 100644
+--- a/cinder/checkpoints/continuation_manager.py
++++ b/cinder/checkpoints/continuation_manager.py
+@@ -35,10 +35,11 @@ class ContinuationManager:
+         return continuation.authorize(context, nova_operation_id, generation,
+                                       action)
+ 
+-    def _volume(self, context, scope, volume_id, data=None):
++    def _volume(self, context, scope, volume_id, data=None,
++                action='capabilities'):
+         if data is None:
+             data = db.checkpoint_continuation_resources(
+-                context, scope.to_primitive())
++                context, scope.to_primitive(), action)
+         row = data['volumes'].get(volume_id)
+         if row is None:
+             raise exception.CheckpointOperationNotFound()
+@@ -86,9 +87,9 @@ class ContinuationManager:
+         action = 'reconcile' if query else 'execute'
+         scope = self._scope(context, nova_operation_id, generation, action)
+         operation = db.checkpoint_continuation_get(
+-            context, nova_operation_id)['operation']
++            context, nova_operation_id, action)['operation']
+         data = db.checkpoint_continuation_resources(
+-            context, scope.to_primitive())
++            context, scope.to_primitive(), action)
+         resources = {r['id']: r for r in operation['resources']}
+         for step in operation['steps']:
+             statuses = ('dispatching', 'pending', 'unknown') if query else (
+@@ -159,17 +160,18 @@ class ContinuationManager:
+                             'attachment')
+         result = envelopes.AttachmentResult.from_primitive(
+             db.checkpoint_attachment_intent_get(
+-                context, scope.to_primitive(), child_id))
+-        volume = self._volume(context, scope, result.volume_id)
++                context, scope.to_primitive(), child_id, 'attachment'))
++        volume = self._volume(context, scope, result.volume_id,
++                              action='attachment')
+         if result.status != 'prepared':
+             return
+         operation = db.checkpoint_continuation_get(
+-            context, nova_operation_id)['operation']
++            context, nova_operation_id, 'attachment')['operation']
+         resource = next(r for r in operation['resources']
+                         if r['volume_id'] == volume.id)
+         self._preflight(context, scope, volume, resource)
+         attachment = db.checkpoint_continuation_attachment(
+-            context, scope.to_primitive(), result.attachment_id)
++            context, scope.to_primitive(), result.attachment_id, 'attachment')
+         intent = db.checkpoint_attachment_intent_claim(
+             context, child_id, self.owner.host)
+         if intent is None:
+diff --git a/cinder/db/api.py b/cinder/db/api.py
+index 003071a..02f43a4 100644
+--- a/cinder/db/api.py
++++ b/cinder/db/api.py
+@@ -1997,8 +1997,8 @@ def checkpoint_reserve(context, values, volume_ids):
+     return IMPL.checkpoint_reserve(context, values, volume_ids)
+ 
+ 
+-def checkpoint_continuation_get(context, nova_operation_id):
+-    return IMPL.checkpoint_continuation_get(context, nova_operation_id)
++def checkpoint_continuation_get(context, nova_operation_id, action='read'):
++    return IMPL.checkpoint_continuation_get(context, nova_operation_id, action)
+ 
+ 
+ def checkpoint_continuation_scope(context, nova_operation_id, generation,
+@@ -2027,8 +2027,9 @@ def checkpoint_attachment_intent_prepare(context, scope, request):
+     return IMPL.checkpoint_attachment_intent_prepare(context, scope, request)
+ 
+ 
+-def checkpoint_attachment_intent_get(context, scope, child_id):
+-    return IMPL.checkpoint_attachment_intent_get(context, scope, child_id)
++def checkpoint_attachment_intent_get(context, scope, child_id, action='read'):
++    return IMPL.checkpoint_attachment_intent_get(
++        context, scope, child_id, action)
+ 
+ 
+ def checkpoint_attachment_intent_claim(context, child_id, executor_id):
+@@ -2040,9 +2041,10 @@ def checkpoint_attachment_intent_finish(context, child_id, result):
+     return IMPL.checkpoint_attachment_intent_finish(context, child_id, result)
+ 
+ 
+-def checkpoint_continuation_attachment(context, scope, attachment_id):
++def checkpoint_continuation_attachment(context, scope, attachment_id,
++                                       action='attachment_read'):
+     return IMPL.checkpoint_continuation_attachment(
+-        context, scope, attachment_id)
++        context, scope, attachment_id, action)
+ 
+ 
+ def checkpoint_get(context, operation_id):
+@@ -2107,9 +2109,9 @@ def checkpoint_pending(context, host):
+ 
+ 
+ def checkpoint_continuation_resources(
+-        context, scope):
++        context, scope, action='capabilities'):
+     return IMPL.checkpoint_continuation_resources(
+-        context, scope)
++        context, scope, action)
+ 
+ 
+ def checkpoint_continuation_step_claim(
+diff --git a/cinder/db/sqlalchemy/api.py b/cinder/db/sqlalchemy/api.py
+index adc0a8e..ed5f670 100644
+--- a/cinder/db/sqlalchemy/api.py
++++ b/cinder/db/sqlalchemy/api.py
+@@ -8752,9 +8752,9 @@ def checkpoint_reserve(context, values, volume_ids):
+     return checkpoints.reserve(context, values, volume_ids)
+ 
+ 
+-def checkpoint_continuation_get(context, nova_operation_id):
++def checkpoint_continuation_get(context, nova_operation_id, action='read'):
+     from cinder.db.sqlalchemy import checkpoint_continuation
+-    return checkpoint_continuation.get(context, nova_operation_id)
++    return checkpoint_continuation.get(context, nova_operation_id, action)
+ 
+ 
+ def checkpoint_continuation_scope(context, nova_operation_id, generation,
+@@ -8788,9 +8788,9 @@ def checkpoint_attachment_intent_prepare(context, scope, request):
+     return continuation.attachment_prepare(context, scope, request)
+ 
+ 
+-def checkpoint_attachment_intent_get(context, scope, child_id):
++def checkpoint_attachment_intent_get(context, scope, child_id, action='read'):
+     from cinder.db.sqlalchemy import checkpoint_continuation as continuation
+-    return continuation.attachment_get(context, scope, child_id)
++    return continuation.attachment_get(context, scope, child_id, action)
+ 
+ 
+ def checkpoint_attachment_intent_claim(context, child_id, executor_id):
+@@ -8803,9 +8803,11 @@ def checkpoint_attachment_intent_finish(context, child_id, result):
+     return continuation.attachment_finish(context, child_id, result)
+ 
+ 
+-def checkpoint_continuation_attachment(context, scope, attachment_id):
++def checkpoint_continuation_attachment(context, scope, attachment_id,
++                                       action='attachment_read'):
+     from cinder.db.sqlalchemy import checkpoint_continuation as continuation
+-    return continuation.current_attachment(context, scope, attachment_id)
++    return continuation.current_attachment(
++        context, scope, attachment_id, action)
+ 
+ 
+ def checkpoint_get(context, operation_id):
+@@ -8886,10 +8888,10 @@ def checkpoint_pending(context, host):
+ 
+ 
+ def checkpoint_continuation_resources(
+-        context, scope):
++        context, scope, action='capabilities'):
+     from cinder.db.sqlalchemy import checkpoint_continuation
+     return checkpoint_continuation.resources(
+-        context, scope)
++        context, scope, action)
+ 
+ 
+ def checkpoint_continuation_step_claim(
+diff --git a/cinder/db/sqlalchemy/checkpoint_continuation.py b/cinder/db/sqlalchemy/checkpoint_continuation.py
+index f0cd069..f961c58 100644
+--- a/cinder/db/sqlalchemy/checkpoint_continuation.py
++++ b/cinder/db/sqlalchemy/checkpoint_continuation.py
+@@ -25,7 +25,6 @@ from cinder.db.sqlalchemy import api
+ from cinder.db.sqlalchemy import checkpoints as journal
+ from cinder.db.sqlalchemy import models
+ from cinder import exception
+-from cinder.policies import checkpoints as policies
+ 
+ 
+ def _grant(context, nova_operation_id, executor, lock=False):
+@@ -95,19 +94,15 @@ def mark_released(context, operation):
+ 
+ @api.require_context
+ @api.main_context_manager.reader
+-def get(context, nova_operation_id):
+-    executor = continuation.require_executor(context)
+-    context.authorize(policies.CONTINUATION_READ_POLICY)
++def get(context, nova_operation_id, action='read'):
++    executor = continuation.require_policy(context, action)
+     grant = _grant(context, nova_operation_id, executor)
+     operation = _bound_operation(context, grant)
+     return dict(grant, operation=journal._as_dict(context, operation))
+ 
+ 
+ def _scope(context, nova_operation_id, generation, action, volume_id=None):
+-    executor = continuation.require_executor(context)
+-    if action not in ('read', 'execute', 'reconcile', 'cleanup', 'release',
+-                      'capabilities', 'attachment'):
+-        raise exception.InvalidInput(reason='invalid_continuation_action')
++    executor = continuation.require_policy(context, action)
+     grant = _grant(context, nova_operation_id, executor)
+     operation = _bound_operation(context, grant)
+     if type(generation) is not int or generation != operation.generation:
+@@ -347,13 +342,15 @@ def attachment_prepare(context, scope, request):
+ 
+ @api.require_context
+ @api.main_context_manager.writer
+-def attachment_get(context, scope, child_id):
+-    scope = _checked_scope(context, scope, 'read')
++def attachment_get(context, scope, child_id, action='read'):
++    if action not in ('read', 'attachment'):
++        raise exception.InvalidInput(reason='invalid_continuation_action')
++    scope = _checked_scope(context, scope, action)
+     return _result(_intent(context, scope, child_id))
+ 
+ 
+ def _intent_scope(context, child_id):
+-    executor = continuation.require_executor(context)
++    executor = continuation.require_policy(context, 'attachment')
+     row = journal._query(context, models.CheckpointAttachmentIntent).filter_by(
+         id=child_id).first()
+     if row is None:
+@@ -411,8 +408,11 @@ def attachment_finish(context, child_id, result):
+ 
+ @api.require_context
+ @api.main_context_manager.writer
+-def current_attachment(context, scope, attachment_id):
+-    scope = _checked_scope(context, scope)
++def current_attachment(context, scope, attachment_id,
++                       action='attachment_read'):
++    if action not in ('attachment_read', 'attachment'):
++        raise exception.InvalidInput(reason='invalid_continuation_action')
++    scope = _checked_scope(context, scope, action)
+     row = journal._query(context, models.VolumeAttachment).filter_by(
+         id=attachment_id, instance_uuid=scope.instance_uuid).first()
+     if row is None or row.volume_id not in scope.volume_ids:
+@@ -429,13 +429,17 @@ def current_attachment(context, scope, attachment_id):
+     return result
+ 
+ 
+-def check_attachment_release(context, operation):
++def check_attachment_release(context, operation, outcome):
+     intents = journal._current(journal._query(
+         context, models.CheckpointAttachmentIntent).filter_by(
+             operation_id=operation.id)).all()
+     if any(row.status not in ('succeeded', 'failed_no_effect')
+            for row in intents):
+         journal._conflict('attachment_result_not_confirmed')
++    if outcome == 'abort' and any(
++            row.action == 'delete' and row.status == 'succeeded'
++            for row in intents):
++        journal._conflict('attachment_effect_not_cleaned')
+     completed = {row.volume_id for row in intents
+                  if row.action == 'complete' and row.status == 'succeeded'}
+     if any(row.action == 'create' and row.status == 'succeeded' and
+@@ -466,8 +470,10 @@ def _volume_data(row):
+ 
+ @api.require_context
+ @api.main_context_manager.writer
+-def resources(context, scope):
+-    scope = _checked_scope(context, scope, 'capabilities')
++def resources(context, scope, action='capabilities'):
++    if action not in ('capabilities', 'execute', 'reconcile', 'attachment'):
++        raise exception.InvalidInput(reason='invalid_continuation_action')
++    scope = _checked_scope(context, scope, action)
+     volumes = {row.id: _volume_data(row) for row in _volumes(context, scope)}
+     snapshots = {}
+     for resource in journal._resources(context, scope.checkpoint_id):
+diff --git a/cinder/db/sqlalchemy/checkpoints.py b/cinder/db/sqlalchemy/checkpoints.py
+index 45cab74..c5da880 100644
+--- a/cinder/db/sqlalchemy/checkpoints.py
++++ b/cinder/db/sqlalchemy/checkpoints.py
+@@ -504,7 +504,7 @@ def _release(context, operation, instance, volumes, outcome):
+             _conflict('release_outcome_changed')
+         return _as_dict(context, operation)
+     from cinder.db.sqlalchemy import checkpoint_continuation as continuation
+-    continuation.check_attachment_release(context, operation)
++    continuation.check_attachment_release(context, operation, outcome)
+     steps = _steps(context, operation_id)
+     if outcome == 'commit':
+         if any(s.status != 'succeeded' for s in steps):
+diff --git a/cinder/tests/unit/api/v3/test_checkpoint_continuation.py b/cinder/tests/unit/api/v3/test_checkpoint_continuation.py
+index d41dbe7..b7503e4 100644
+--- a/cinder/tests/unit/api/v3/test_checkpoint_continuation.py
++++ b/cinder/tests/unit/api/v3/test_checkpoint_continuation.py
+@@ -12,6 +12,8 @@
+ 
+ from unittest import mock
+ 
++import oslo_messaging
++from oslo_policy import policy as oslo_policy
+ from oslo_serialization import jsonutils
+ from oslo_utils.fixture import uuidsentinel as uuids
+ import webob
+@@ -22,12 +24,14 @@ from cinder.checkpoints import api
+ from cinder.checkpoints import continuation_api
+ from cinder import db
+ from cinder.db.sqlalchemy import models
++from cinder import policy
+ from cinder.tests.unit.api import fakes
+ from cinder.tests.unit.checkpoints import test_attachment_intents
+ from cinder.tests.unit.checkpoints import test_continuation_db
+ from cinder.tests.unit.checkpoints import test_contracts
+ from cinder.tests.unit.checkpoints import test_db
+ from cinder.tests.unit import test
++from cinder.volume import rpcapi
+ 
+ 
+ class CheckpointContinuationAPITest(test_continuation_db.ContinuationHelpers,
+@@ -225,7 +229,11 @@ class CheckpointAttachmentAPITest(
+         self.requests_path = self.service_path + '/attachment-requests'
+         self.service_api = continuation_api.ContinuationAPI(rpc=mock.Mock(
+             spec=['assert_checkpoint_continuation_ready',
+-                  'execute_checkpoint_attachment']))
++                  'execute_checkpoint_attachment',
++                  'get_checkpoint_continuation_capabilities',
++                  'execute_checkpoint_continuation']))
++        self.service_api.rpc.get_checkpoint_continuation_capabilities.\
++            return_value = test_contracts.supported_capabilities()
+         self.mock_object(api, 'API', return_value=self.api)
+         self.mock_object(continuation_api, 'ContinuationAPI',
+                          return_value=self.service_api)
+@@ -239,6 +247,62 @@ class CheckpointAttachmentAPITest(
+         return self.request_as(self.service_ctx, 'POST', self.requests_path,
+                                {'attachment_request': body})
+ 
++    def test_read_and_write_policies_are_independent_for_all_routes(self):
++        self.addCleanup(policy.reset)
++        request = self.request_for('delete', self.original[0])
++        self.assertEqual(202, self.post_request(request).status_int)
++        paths = (self.service_path,
++                 self.requests_path + '/' + request.id,
++                 self.service_path + '/attachments/' + self.original[0],
++                 self.service_path + '/volumes/' + self.volumes[0] +
++                 '/capabilities')
++        for read, write in ((True, False), (False, True)):
++            policy.set_rules(oslo_policy.Rules.from_dict({
++                'checkpoint:continuation_read': (
++                    'role:service' if read else '!'),
++                'checkpoint:continue': 'role:service' if write else '!'}),
++                overwrite=False)
++            for path in paths:
++                with self.subTest(read=read, path=path):
++                    response = self.request_as(self.service_ctx, 'GET', path)
++                    self.assertEqual(200 if read else 403,
++                                     response.status_int, response.text)
++            with self.subTest(write=write, route='attachment'):
++                response = self.post_request(request)
++                self.assertEqual(202 if write else 403, response.status_int,
++                                 response.text)
++            with self.subTest(write=write, route='operation'):
++                response = self.request_as(
++                    self.service_ctx, 'POST', self.service_path + '/action',
++                    {'execute': {'generation': 1}})
++                self.assertEqual(202 if write else 403, response.status_int,
++                                 response.text)
++
++    def test_rpc_timeout_returns_503_and_keeps_attachment_intent(self):
++        rpc = rpcapi.VolumeAPI()
++        client = self.mock_object(rpc, '_get_cctxt').return_value
++        client.call.side_effect = oslo_messaging.MessagingTimeout()
++        client.cast.side_effect = oslo_messaging.MessagingTimeout()
++        self.service_api.rpc.get_checkpoint_continuation_capabilities = (
++            rpc.get_checkpoint_continuation_capabilities)
++        self.service_api.rpc.execute_checkpoint_attachment = (
++            rpc.execute_checkpoint_attachment)
++        response = self.request_as(
++            self.service_ctx, 'GET', self.service_path + '/volumes/' +
++            self.volumes[0] + '/capabilities')
++        self.assertEqual(503, response.status_int, response.text)
++        request = self.request_for('delete', self.original[0])
++        response = self.post_request(request)
++        self.assertEqual(503, response.status_int, response.text)
++        response = self.request_as(self.service_ctx, 'GET',
++                                   self.requests_path + '/' + request.id)
++        self.assertEqual(200, response.status_int, response.text)
++        self.assertEqual('prepared', response.json['attachment_request'][
++            'status'])
++        client.cast.side_effect = None
++        self.assertEqual(202, self.post_request(request).status_int)
++        self.assertEqual(1, self.count_attachment_intents('delete'))
++
+     def test_create_replay_and_query_return_same_safe_result(self):
+         self.enter_reconnect()
+         first = self.post_request(self.create_request)
+diff --git a/cinder/tests/unit/checkpoints/test_continuation_contracts.py b/cinder/tests/unit/checkpoints/test_continuation_contracts.py
+index 6a7b3e9..5f53929 100644
+--- a/cinder/tests/unit/checkpoints/test_continuation_contracts.py
++++ b/cinder/tests/unit/checkpoints/test_continuation_contracts.py
+@@ -288,7 +288,8 @@ class ContinuationIdentityTest(test.TestCase):
+                                side_effect=exception.PolicyNotAuthorized(
+                                    action=policies.CONTINUE_POLICY)) as check:
+             self.assertRaises(exception.PolicyNotAuthorized,
+-                              continuation.require_executor, self.ctx)
++                              continuation.require_policy, self.ctx,
++                              'execute')
+         check.assert_called_once_with(
+             policies.CONTINUE_POLICY,
+             target={'project_id': uuids.service_project,
+diff --git a/cinder/tests/unit/checkpoints/test_continuation_manager.py b/cinder/tests/unit/checkpoints/test_continuation_manager.py
+index bf5351a..50d2418 100644
+--- a/cinder/tests/unit/checkpoints/test_continuation_manager.py
++++ b/cinder/tests/unit/checkpoints/test_continuation_manager.py
+@@ -14,6 +14,7 @@ import dataclasses
+ import json
+ from types import SimpleNamespace
+ 
++from oslo_policy import policy as oslo_policy
+ from oslo_utils.fixture import uuidsentinel as uuids
+ from oslo_utils import timeutils
+ 
+@@ -26,6 +27,7 @@ from cinder.db.sqlalchemy import api as sqla_api
+ from cinder.db.sqlalchemy import models
+ from cinder import exception
+ from cinder import objects
++from cinder import policy
+ from cinder.tests.unit.checkpoints import fake_driver
+ from cinder.tests.unit.checkpoints import test_attachment_intents
+ from cinder.tests.unit.checkpoints import test_continuation_db
+@@ -83,6 +85,19 @@ class ContinuationWorkerTest(WorkerHelpers, test.TestCase):
+         self.assertEqual(uuids.nova_operation,
+                          self.service_ctx.checkpoint_continuation_id)
+ 
++    def test_write_policy_does_not_require_read_permission(self):
++        self.addCleanup(policy.reset)
++        policy.set_rules(oslo_policy.Rules.from_dict({
++            'checkpoint:continue': 'role:service',
++            'checkpoint:continuation_read': '!'}), overwrite=False)
++        for worker in self.workers:
++            worker.execute(self.service_ctx, uuids.nova_operation, 1)
++        self.assertEqual(
++            [1, 1], [owner.driver.native_call_count
++                     for owner in self.owners])
++        operation = db.checkpoint_get(self.ctxt, self.operation.id)
++        self.assertEqual('succeeded', operation['status'])
++
+     def test_unknown_step_query_never_reexecutes(self):
+         self.driver.outcomes['snapshot'].append(TimeoutError('not-public'))
+         self.worker.execute(self.service_ctx, uuids.nova_operation, 1)
+@@ -239,6 +254,31 @@ class AttachmentWorkerTest(test_attachment_intents.AttachmentHelpers,
+         self.assertEqual(1, self.driver.terminate_connection.call_count)
+         self.assertEqual(1, self.driver.remove_export.call_count)
+ 
++    def test_abort_after_attachment_delete_preserves_both_release_paths(self):
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            self.ctxt.session.query(models.VolumeAttachment).filter_by(
++                id=self.original[0]).update({
++                    'connector': json.dumps({'host': 'compute-one'})})
++        deleted = self.submit(self.request_for('delete', self.original[0]))
++        self.worker.execute_attachment(self.service_ctx, uuids.nova_operation,
++                                       deleted.id, 1)
++        self.assertEqual('succeeded', self.worker.query_attachment(
++            self.service_ctx, uuids.nova_operation, deleted.id, 1)['status'])
++        for service in (True, False):
++            with self.subTest(service=service):
++                if service:
++                    self.assertRaises(
++                        exception.CheckpointConflict,
++                        db.checkpoint_continuation_transition,
++                        self.service_ctx, uuids.nova_operation, 1,
++                        'release', 'abort')
++                else:
++                    self.assertRaises(exception.CheckpointConflict,
++                                      db.checkpoint_release, self.ctxt,
++                                      self.operation.id, 1, 'abort')
++                self.assertEqual(2, len(self.locks()))
++        self.assertEqual('active', self.grant()['state'])
++
+     def test_legacy_attachment_path_cannot_bypass_child_journal(self):
+         self.assertRaises(exception.CheckpointConflict,
+                           db.checkpoint_attachment_scope, self.ctxt,
+diff --git a/cinder/volume/rpcapi.py b/cinder/volume/rpcapi.py
+index 51062c6..f881054 100644
+--- a/cinder/volume/rpcapi.py
++++ b/cinder/volume/rpcapi.py
+@@ -646,44 +646,47 @@ class VolumeAPI(rpc.RPCAPI):
+         cctxt.cast(ctxt, 'reconcile_checkpoint_step', step_id=step_id,
+                    generation=generation)
+ 
++    def _checkpoint_continuation_rpc(self, ctxt, host, transport, method,
++                                     **kwargs):
++        try:
++            cctxt = self._get_cctxt(host, version='3.22')
++            return getattr(cctxt, transport)(ctxt, method, **kwargs)
++        except oslo_messaging.MessagingException:
++            raise exception.CheckpointBackendUnavailable() from None
++
+     @rpc.assert_min_rpc_version('3.22')
+     def get_checkpoint_continuation_capabilities(
+             self, ctxt, nova_operation_id, volume_id, host):
+-        cctxt = self._get_cctxt(host, version='3.22')
+-        return cctxt.call(
+-            ctxt, 'get_checkpoint_continuation_capabilities',
++        return self._checkpoint_continuation_rpc(
++            ctxt, host, 'call', 'get_checkpoint_continuation_capabilities',
+             nova_operation_id=nova_operation_id, volume_id=volume_id)
+ 
+     @rpc.assert_min_rpc_version('3.22')
+     def execute_checkpoint_continuation(
+             self, ctxt, nova_operation_id, generation, host):
+-        cctxt = self._get_cctxt(host, version='3.22')
+-        return cctxt.cast(
+-            ctxt, 'execute_checkpoint_continuation',
++        return self._checkpoint_continuation_rpc(
++            ctxt, host, 'cast', 'execute_checkpoint_continuation',
+             nova_operation_id=nova_operation_id, generation=generation)
+ 
+     @rpc.assert_min_rpc_version('3.22')
+     def reconcile_checkpoint_continuation(
+             self, ctxt, nova_operation_id, generation, host):
+-        cctxt = self._get_cctxt(host, version='3.22')
+-        return cctxt.cast(
+-            ctxt, 'reconcile_checkpoint_continuation',
++        return self._checkpoint_continuation_rpc(
++            ctxt, host, 'cast', 'reconcile_checkpoint_continuation',
+             nova_operation_id=nova_operation_id, generation=generation)
+ 
+     @rpc.assert_min_rpc_version('3.22')
+     def execute_checkpoint_attachment(
+             self, ctxt, nova_operation_id, child_id, generation, host):
+-        cctxt = self._get_cctxt(host, version='3.22')
+-        return cctxt.cast(
+-            ctxt, 'execute_checkpoint_attachment',
++        return self._checkpoint_continuation_rpc(
++            ctxt, host, 'cast', 'execute_checkpoint_attachment',
+             nova_operation_id=nova_operation_id, child_id=child_id,
+             generation=generation)
+ 
+     @rpc.assert_min_rpc_version('3.22')
+     def query_checkpoint_attachment(
+             self, ctxt, nova_operation_id, child_id, generation, host):
+-        cctxt = self._get_cctxt(host, version='3.22')
+-        return cctxt.call(
+-            ctxt, 'query_checkpoint_attachment',
++        return self._checkpoint_continuation_rpc(
++            ctxt, host, 'call', 'query_checkpoint_attachment',
+             nova_operation_id=nova_operation_id, child_id=child_id,
+             generation=generation)
+diff --git a/doc/source/admin/checkpoint-continuation.rst b/doc/source/admin/checkpoint-continuation.rst
+index 5f7c123..643962f 100644
+--- a/doc/source/admin/checkpoint-continuation.rst
++++ b/doc/source/admin/checkpoint-continuation.rst
+@@ -59,6 +59,11 @@ host и driver profile. Состояние ``revoked`` запрещает про
+ семантикой кэширования. Это не мгновенная отмена уже принятого RPC или I/O.
+ Для исключения позднего эффекта нужно подтверждённое прекращение исполнения.
+ 
++Политики ``checkpoint:continuation_read`` и ``checkpoint:continue``
++независимы: первая применяется ко всем scoped GET, включая connection_info;
++вторая — к mutations. Mandatory subject/role/allowlist и grant binding
++проверяются при обеих политиках. Read-only scope не разрешает запись.
++
+ Attachment requests при revert
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+@@ -102,8 +107,12 @@ Timeout, потеря ответа или ошибка после dispatch пр
+    reserve; нельзя подменять actor или автоматически возвращать квоту.
+ #. При lost release response прочитать operation. Released tombstone
+    подтверждает release и остаётся доступным; новые mutations запрещены.
++   Неизменяемы identity/generation/release state операции. Вложенные resources
++   отражают текущий общий C1 journal, а не исторический снимок каждого ответа.
+ #. Если attachment result не терминален или create не завершён complete,
+-   release отвергается. Unknown и частичный revert сохраняют locks.
++   release отвергается. После успешного delete исходного attachment abort
++   тоже запрещён, даже если disk steps ещё prepared: attachment effect уже
++   изменил ресурс. Unknown и частичный revert сохраняют locks.
+ 
+ Не удалять intent, grant или lock вручную для повторного backend I/O.
+ Пакет не содержит force-unlock и смену executor. RAM-store и libvirt executor

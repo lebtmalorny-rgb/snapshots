@@ -1,0 +1,1661 @@
+From 5735bf4f25a765b83af6b22515c6b1563b650cb2 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 20:32:47 +0300
+Subject: [PATCH 02/10] feat: journal checkpoint child effects and partial
+ resources
+
+---
+ nova/checkpoints/contracts_v2.py              |  12 +-
+ nova/checkpoints/workflow_v2.py               |  74 +++
+ nova/db/main/checkpoint_effects.py            | 530 ++++++++++++++++++
+ nova/db/main/checkpoints.py                   |  26 +-
+ .../5d9b2ea784c1_add_checkpoint_effects.py    |  98 ++++
+ nova/db/main/models.py                        |  66 +++
+ nova/objects/__init__.py                      |   1 +
+ nova/objects/checkpoint.py                    |  66 ++-
+ nova/objects/checkpoint_effect.py             |  62 ++
+ .../functional/db/test_checkpoint_effects.py  | 334 +++++++++++
+ nova/tests/functional/test_checkpoints.py     |   2 +-
+ nova/tests/unit/db/main/test_migrations.py    |  35 ++
+ nova/tests/unit/objects/test_checkpoint.py    |   6 +-
+ nova/tests/unit/objects/test_objects.py       |  14 +-
+ 14 files changed, 1300 insertions(+), 26 deletions(-)
+ create mode 100644 nova/db/main/checkpoint_effects.py
+ create mode 100644 nova/db/main/migrations/versions/5d9b2ea784c1_add_checkpoint_effects.py
+ create mode 100644 nova/objects/checkpoint_effect.py
+ create mode 100644 nova/tests/functional/db/test_checkpoint_effects.py
+
+diff --git a/nova/checkpoints/contracts_v2.py b/nova/checkpoints/contracts_v2.py
+index e7716fd8c600e094275eeddcaeea712518d6f2eb..44f252223ce6159898732be8ca1b429923474a5e 100644
+--- a/nova/checkpoints/contracts_v2.py
++++ b/nova/checkpoints/contracts_v2.py
+@@ -373,7 +373,17 @@ def validate_result(phase, value):
+ 
+ 
+ def _child_success(action, evidence):
+-    if action in ('restore_paused', 'unpause'):
++    if action == 'reserve_staging':
++        v1._keys(evidence, ('workspace_id', 'limit_bytes'))
++        v1._uuid(evidence['workspace_id'])
++        v1._integer(evidence['limit_bytes'], minimum=1)
++    elif action == 'delete':
++        v1._keys(evidence, (
++            'artifact_id', 'deleted', 'late_effect_impossible'))
++        v1._uuid(evidence['artifact_id'])
++        v1._require(evidence['deleted'] is True and
++                    evidence['late_effect_impossible'] is True)
++    elif action in ('restore_paused', 'unpause'):
+         v1._keys(evidence, ('fingerprint', 'power_state'))
+         v1._digest(evidence['fingerprint'])
+         v1._require(evidence['power_state'] == (
+diff --git a/nova/checkpoints/workflow_v2.py b/nova/checkpoints/workflow_v2.py
+index 580d274fccfad5842b6a92cc00942f28f30c2acd..ea344bc2c8423ee0a6d7b899725857e758ce9162 100644
+--- a/nova/checkpoints/workflow_v2.py
++++ b/nova/checkpoints/workflow_v2.py
+@@ -12,6 +12,10 @@
+ 
+ """V2 ordering keeps both RAM copies charged until the writer is fenced."""
+ 
++import uuid
++
++from nova.checkpoints import contracts as c
++
+ CREATE = ('preflight', 'cinder_reserve', 'runtime_save', 'disk_snapshot',
+           'artifact_publish_shared', 'runtime_restore_current',
+           'staging_cleanup', 'cinder_release')
+@@ -37,3 +41,73 @@ def steps_for(kind):
+                 'cleanup': CLEANUP}[kind]
+     except (KeyError, TypeError):
+         raise ValueError('Invalid checkpoint workflow') from None
++
++
++def child_plan(kind, phase, resources):
++    """Build the complete linear graph from a locked, service-owned manifest.
++
++    Attachment IDs returned by Cinder are predecessor results, never guesses
++    in a pre-dispatch intent. UUID5 only provides stable names, not authority.
++    """
++    c._require(phase in steps_for(kind))
++    operation = resources['operation_id']
++    checkpoint = resources['checkpoint_id']
++    parent = resources['parent_step_id']
++    for value in (operation, checkpoint, parent):
++        c._uuid(value)
++    volumes = resources['volume_ids']
++    c._ids(volumes, nonempty=True)
++    artifacts = resources.get('artifacts', [])
++    entries = []
++
++    def add(action, target, **payload):
++        c._uuid(target)
++        ident = str(uuid.uuid5(uuid.UUID(parent), action + ':' + target))
++        payload['depends_on'] = [entries[-1]['id']] if entries else []
++        entries.append(dict(id=ident, action=action, resource_id=target,
++                            payload=payload))
++
++    if phase == 'preflight':
++        add('inspect', checkpoint)
++    elif phase == 'cinder_reserve':
++        add('reserve', operation)
++    elif phase == 'runtime_save':
++        add('reserve_staging', operation)
++        for item in artifacts:
++            if item['kind'] == 'config':
++                add('copy_config', item['id'], artifact_ids=[item['id']])
++        ram = next(item for item in artifacts if item['kind'] == 'ram')
++        add('save', ram['id'], artifact_ids=[ram['id']])
++    elif phase in ('disk_snapshot', 'disk_revert', 'disk_snapshot_delete',
++                   'cleanup_disk_snapshots'):
++        add('submit_disk_operation', operation)
++    elif phase in ('artifact_publish_shared', 'artifact_stage',
++                   'artifact_delete', 'cleanup_artifacts',
++                   'staging_cleanup'):
++        action = {'artifact_publish_shared': 'publish',
++                  'artifact_stage': 'download'}.get(phase, 'delete')
++        for item in artifacts:
++            if phase == 'staging_cleanup' and item['location'] != 'staging':
++                continue
++            add(action, item['id'], artifact_ids=[item['id']],
++                source_id=item.get('source_id'))
++    elif phase == 'runtime_stop':
++        add('stop', checkpoint)
++    elif phase in ('runtime_restore_current', 'runtime_restore_checkpoint',
++                   'cleanup_runtime_restore_current'):
++        add('restore_paused', checkpoint)
++        add('unpause', checkpoint)
++    elif phase in ('volume_disconnect', 'volume_reconnect'):
++        actions = (('host_disconnect', 'attachment_delete')
++                   if phase == 'volume_disconnect' else (
++                       'attachment_create', 'attachment_update',
++                       'host_connect',
++                       'bdm_update', 'attachment_complete'))
++        for volume in sorted(volumes):
++            for action in actions:
++                add(action, volume)
++    elif phase in ('cinder_release', 'cleanup_cinder_release'):
++        add('release', operation)
++    else:
++        raise ValueError('Unsupported checkpoint phase')
++    return tuple(entries)
+diff --git a/nova/db/main/checkpoint_effects.py b/nova/db/main/checkpoint_effects.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f143df2ce6c6f3a814f83cde1417c7d4b1366b0
+--- /dev/null
++++ b/nova/db/main/checkpoint_effects.py
+@@ -0,0 +1,530 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Cell-owned effects serialized by the Instance and guard fence."""
++
++import uuid
++
++from oslo_serialization import jsonutils
++from oslo_utils import uuidutils
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova.checkpoints import workflow_v2 as workflow
++from nova.compute import task_states
++from nova import conf
++from nova.db.main import api as db
++from nova.db.main import checkpoints as journal
++from nova.db.main import models as m
++from nova.db.utils import require_context
++from nova import exception
++
++TERMINAL = ('succeeded', 'failed_no_effect', 'failed_with_effects')
++
++
++def admission_fields(admission):
++    if not isinstance(admission, v2.AdmissionV2):
++        return {'contract_version': 1}
++    binding = v2.Binding(
++        conf.CONF.checkpoint.deployment_id, admission.cell_uuid,
++        admission.key.project_id, admission.key.instance_uuid,
++        admission.checkpoint_id, admission.host, admission.node,
++        admission.executor_id, admission.fingerprint,
++        admission.runtime_fingerprint, admission.runtime_profile_id,
++        admission.store_profile_id, admission.staging_profile_id)
++    fields = dict(contract_version=2,
++                  binding=journal._encode(binding.to_primitive()))
++    for name in ('runtime_fingerprint', 'runtime_profile_id',
++                 'store_profile_id', 'staging_profile_id'):
++        fields[name] = getattr(admission, name)
++    return fields
++
++
++def _load(context, parent_id, owned=True):
++    parent = context.session.get(m.InstanceCheckpointStep, parent_id)
++    if parent is None:
++        raise exception.NotFound()
++    if owned:
++        unused, guard, checkpoint, operation = journal._owned(
++            context, parent.operation_id)
++        context.session.refresh(parent, with_for_update=True)
++    else:
++        operation = journal._operation(context, parent.operation_id)
++        checkpoint = journal._checkpoint(context, operation.checkpoint_id)
++    if parent.contract_version != 2 or operation.contract_version != 2:
++        journal._conflict('incompatible_service')
++    return parent, checkpoint, operation
++
++
++def _rows(context, parent):
++    rows = context.session.query(m.InstanceCheckpointEffect).filter_by(
++        parent_step_id=parent.uuid).order_by(
++            m.InstanceCheckpointEffect.sequence).all()
++    graph = [dict(id=row.id, action=row.action, resource_id=row.resource_id,
++                  payload=jsonutils.loads(row.payload)) for row in rows]
++    if len(rows) != parent.child_plan_count or c.canonical_payload_hash(
++            {'children': graph}) != parent.child_plan_hash:
++        journal._conflict('identity_changed')
++    return rows
++
++
++def _projection(row, parent):
++    value = journal._row(row)
++    value['revision'] = parent.version
++    return value
++
++
++def _reservations(context, checkpoint_id):
++    return context.session.query(
++        m.InstanceCheckpointArtifactReservation).filter_by(
++            checkpoint_id=checkpoint_id).order_by(
++                m.InstanceCheckpointArtifactReservation.id).all()
++
++
++def _logical(binding, artifact_id):
++    return c.canonical_payload_hash({
++        name: binding[name] for name in ('deployment_id', 'cell_uuid',
++        'project_id', 'instance_uuid', 'checkpoint_id')} |
++        {'artifact_id': artifact_id})
++
++
++def _artifact_plan(context, operation, checkpoint, phase):
++    existing = _reservations(context, checkpoint.uuid)
++    if phase == 'runtime_save':
++        kinds = ['ram']
++        if jsonutils.loads(checkpoint.device_manifest)['config_drive']:
++            kinds.append('config')
++        admission = v2.decode_admission(jsonutils.loads(operation.admission))
++        return [dict(
++            id=str(uuid.uuid5(uuid.UUID(operation.uuid), 'staging:' + kind)),
++            kind=kind, location='staging',
++            upper_bound=admission.save_bytes_limit) for kind in kinds]
++    if phase in ('artifact_publish_shared', 'artifact_stage'):
++        location = (
++            'shared' if phase == 'artifact_publish_shared' else 'staging')
++        source_location = 'staging' if location == 'shared' else 'shared'
++        source = [r for r in existing if r.location == source_location and
++                  r.writer_state == 'closed' and (location == 'staging' or
++                  r.operation_id == operation.uuid)]
++        return [dict(id=str(uuid.uuid5(uuid.UUID(operation.uuid),
++                                      location + ':' + item.id)),
++                     kind=item.kind, location=location,
++                     upper_bound=item.upper_bound, source_id=item.id)
++                for item in source]
++    return [dict(id=item.id, kind=item.kind, location=item.location,
++                 upper_bound=item.upper_bound)
++            for item in existing if item.writer_state != 'deleted']
++
++
++def claim_parent(context, instance, checkpoint, operation, phase):
++    phases = workflow.steps_for(operation.kind)
++    steps = {s.phase: s for s in journal._steps(context, operation.uuid)}
++    if phase not in phases:
++        journal._conflict()
++    if phase in steps:
++        return None
++    if any(p not in steps or steps[p].status != 'succeeded'
++           for p in phases[:phases.index(phase)]):
++        journal._conflict()
++    if any(p in steps for p in phases[phases.index(phase) + 1:]):
++        journal._conflict()
++    ident = uuidutils.generate_uuid()
++    binding = jsonutils.loads(operation.binding)
++    artifacts = _artifact_plan(context, operation, checkpoint, phase)
++    resources = dict(parent_step_id=ident, operation_id=operation.uuid,
++                     checkpoint_id=checkpoint.uuid,
++                     volume_ids=[d.volume_id for d in journal._disks(
++                         context, checkpoint.uuid)], artifacts=artifacts)
++    graph = workflow.child_plan(operation.kind, phase, resources)
++    payload = dict(binding=binding, kind=operation.kind, generation=1,
++                   budgets=dict(total_bytes=checkpoint.artifact_upper_bound,
++                                version=checkpoint.artifact_budget_version),
++                   children=[item['id'] for item in graph],
++                   resources=resources,
++                   prior={name: jsonutils.loads(step.result)
++                          for name, step in steps.items()})
++    intent = v2.StepIntentV2(ident, operation.uuid, 1, phase,
++                             operation.executor_id,
++                             c.canonical_payload_hash(payload), payload)
++    parent = m.InstanceCheckpointStep(
++        uuid=ident, operation_id=operation.uuid, generation=1, phase=phase,
++        executor_id=operation.executor_id, payload_hash=intent.payload_hash,
++        payload=journal._encode(payload), status='dispatching', version=1,
++        contract_version=2, child_plan_count=len(graph),
++        child_plan_hash=c.canonical_payload_hash({'children': graph}))
++    context.session.add(parent)
++    context.session.flush()
++    for position, item in enumerate(graph):
++        child = m.InstanceCheckpointEffect(
++            id=item['id'], parent_step_id=ident, operation_id=operation.uuid,
++            generation=1, executor_id=operation.executor_id,
++            action=item['action'], resource_id=item['resource_id'],
++            payload=journal._encode(item['payload']),
++            payload_hash=c.canonical_payload_hash(item['payload']),
++            status='prepared', revision=1, sequence=position)
++        context.session.add(child)
++        context.session.flush()
++        if child.action in ('save', 'copy_config', 'publish', 'download'):
++            descriptor = next(
++                a for a in artifacts if a['id'] == child.resource_id)
++            _reserve(context, child, checkpoint, operation, descriptor['id'],
++                     descriptor['location'], descriptor['upper_bound'],
++                     descriptor['kind'])
++    operation.phase = phase
++    operation.state = 'running'
++    operation.version += 1
++    context.session.flush()
++    return intent
++
++
++def _child(context, child_id):
++    child = context.session.get(m.InstanceCheckpointEffect, child_id)
++    if child is None:
++        raise exception.NotFound()
++    parent, checkpoint, operation = _load(context, child.parent_step_id)
++    rows = _rows(context, parent)
++    child = next(row for row in rows if row.id == child_id)
++    context.session.refresh(child, with_for_update=True)
++    return parent, checkpoint, operation, child, rows
++
++
++def _bump(parent, operation, child):
++    parent.version += 1
++    operation.version += 1
++    child.revision += 1
++
++
++@require_context
++@db.pick_context_manager_writer
++def prepare(context, parent_step_id, action, resource_id, payload):
++    parent, checkpoint, operation = _load(context, parent_step_id)
++    for row in _rows(context, parent):
++        if (row.action, row.resource_id) == (action, resource_id):
++            if row.payload_hash != c.canonical_payload_hash(payload):
++                journal._conflict('identity_changed')
++            return _projection(row, parent)
++    journal._conflict('operation_conflict')
++
++
++@require_context
++@db.pick_context_manager_writer
++def claim(context, child_id, generation, executor_id, expected_revision):
++    v2.validate_generation(generation)
++    c._integer(expected_revision, minimum=1)
++    parent, checkpoint, operation, child, rows = _child(context, child_id)
++    if operation.executor_id != executor_id or not operation.quota_ready:
++        journal._conflict('identity_changed')
++    if child.status != 'prepared' or parent.version != expected_revision:
++        return None
++    if any(row.status != 'succeeded' for row in rows[:child.sequence]):
++        return None
++    if parent.status not in ('dispatching', 'pending', 'unknown', 'ready'):
++        return None
++    child.status = 'dispatching'
++    _bump(parent, operation, child)
++    for item in _reservations(context, checkpoint.uuid):
++        if item.child_id == child.id:
++            if item.writer_state != 'reserved':
++                journal._conflict('resources_remaining')
++            item.writer_state = 'dispatching'
++    context.session.flush()
++    return _projection(child, parent)
++
++
++def _bind_child(context, checkpoint, operation, child, result):
++    evidence = result.evidence
++    reservations = [r for r in _reservations(context, checkpoint.uuid)
++                    if r.child_id == child.id]
++    valid = True
++    if result.status == 'failed_with_effects':
++        valid = (set(evidence['terminal_child_ids']) == {child.id} and
++                 set(evidence['resource_ids']) == {r.id for r in reservations})
++    if result.status == 'succeeded':
++        if 'fingerprint' in evidence:
++            valid &= evidence['fingerprint'] == checkpoint.fingerprint
++        if 'host' in evidence:
++            valid &= (evidence['host'], evidence['node']) == (
++                operation.host, operation.node)
++        if child.action == 'reserve_staging':
++            admission = v2.decode_admission(
++                jsonutils.loads(operation.admission))
++            limit = (admission.save_bytes_limit if operation.kind == 'create'
++                     else admission.restore_bytes_limit)
++            valid &= (evidence['workspace_id'] == operation.uuid and
++                      evidence['limit_bytes'] == limit)
++        if child.action in ('save', 'copy_config', 'publish', 'download'):
++            refs = evidence.get('artifacts', [evidence.get('artifact')])
++            refs = [v2.ArtifactRef.from_primitive(ref) for ref in refs]
++            valid &= {r.id for r in refs} == {r.id for r in reservations}
++            for ref in refs:
++                row = next((r for r in reservations if r.id == ref.id), None)
++                valid &= row is not None and (
++                    row.kind == ref.kind and row.location == ref.location and
++                    row.logical_id == ref.logical_id and
++                    ref.bytes <= row.upper_bound)
++        if child.action == 'delete':
++            valid &= evidence['artifact_id'] == child.resource_id
++    if not valid:
++        return v2.EffectResult('unknown', {}, 'identity_changed')
++    return result
++
++
++@require_context
++@db.pick_context_manager_writer
++def observe(context, child_id, generation, result):
++    v2.validate_generation(generation)
++    parent, checkpoint, operation, child, rows = _child(context, child_id)
++    if child.status == 'prepared':
++        journal._conflict('operation_conflict')
++    value = v2.validate_child_result(child.action, result)
++    value = _bind_child(context, checkpoint, operation, child, value)
++    encoded = journal._encode(value.to_primitive())
++    if child.status in TERMINAL:
++        if child.result != encoded:
++            journal._conflict('identity_changed')
++        return _projection(child, parent)
++    child.status, child.result = value.status, encoded
++    _bump(parent, operation, child)
++    reservations = [r for r in _reservations(context, checkpoint.uuid)
++                    if r.child_id == child.id]
++    for item in reservations:
++        item.writer_state = ('closed' if value.status in
++            ('succeeded', 'failed_with_effects') else
++            'deleted' if value.status == 'failed_no_effect' else value.status)
++    if value.status == 'succeeded':
++        refs = value.evidence.get('artifacts', [])
++        if 'artifact' in value.evidence:
++            refs = [value.evidence['artifact']]
++        for ref in refs:
++            item = next(r for r in reservations if r.id == ref['id'])
++            item.actual_bytes = ref['bytes']
++            item.checksum = ref['checksum']
++        if child.action == 'delete':
++            _deleted(context, checkpoint, operation, child.resource_id, child)
++    context.session.flush()
++    return _projection(child, parent)
++
++
++@require_context
++@db.pick_context_manager_reader
++def get_children(context, parent_step_id):
++    parent, checkpoint, operation = _load(context, parent_step_id, owned=False)
++    return [_projection(row, parent) for row in _rows(context, parent)]
++
++
++def _continuation(context, parent):
++    for row in _rows(context, parent):
++        if row.status == 'succeeded':
++            continue
++        if row.status == 'prepared':
++            return dict(step_id=parent.uuid, journal_revision=parent.version,
++                        next_child_id=row.id)
++        return None
++    return None
++
++
++@require_context
++@db.pick_context_manager_reader
++def continuation(context, parent_step_id):
++    parent, checkpoint, operation = _load(context, parent_step_id, owned=False)
++    return _continuation(context, parent)
++
++
++@require_context
++@db.pick_context_manager_writer
++def cancel_prepared(context, operation_id, generation):
++    v2.validate_generation(generation)
++    unused, guard, checkpoint, operation = journal._owned(
++        context, operation_id, generation)
++    for parent in journal._steps(context, operation_id):
++        for child in _rows(context, parent):
++            if child.status != 'prepared':
++                continue
++            value = v2.EffectResult('failed_no_effect', dict(
++                no_effect=True, late_effect_impossible=True),
++                'admission_cancelled')
++            child.status = value.status
++            child.result = journal._encode(value.to_primitive())
++            _bump(parent, operation, child)
++            for item in _reservations(context, checkpoint.uuid):
++                if item.child_id == child.id:
++                    item.writer_state = 'deleted'
++
++
++def _reserve(context, child, checkpoint, operation, artifact_id, location,
++             upper_bound, kind):
++    c._uuid(artifact_id)
++    c._integer(upper_bound, minimum=1)
++    if location not in ('staging', 'shared') or child.status != 'prepared':
++        journal._conflict()
++    binding = jsonutils.loads(operation.binding)
++    namespace = _logical(binding, artifact_id)
++    row = context.session.get(m.InstanceCheckpointArtifactReservation,
++                              artifact_id)
++    if row is not None:
++        if (row.child_id, row.namespace_hash,
++                row.location, row.upper_bound) != (
++                child.id, namespace, location, upper_bound):
++            journal._conflict('identity_changed')
++        return row
++    row = m.InstanceCheckpointArtifactReservation(
++        id=artifact_id, child_id=child.id, operation_id=operation.uuid,
++        checkpoint_id=checkpoint.uuid, namespace_hash=namespace,
++        logical_id=namespace, kind=kind, location=location,
++        upper_bound=upper_bound, writer_state='reserved')
++    context.session.add(row)
++    context.session.flush()
++    return row
++
++
++@require_context
++@db.pick_context_manager_writer
++def reserve(context, child_id, artifact_id, location, upper_bound):
++    parent, checkpoint, operation, child, rows = _child(context, child_id)
++    payload = jsonutils.loads(parent.payload)
++    descriptor = next((a for a in payload['resources']['artifacts']
++                       if a['id'] == artifact_id), None)
++    if (descriptor is None or child.resource_id != artifact_id or
++            child.action not in (
++                'save', 'copy_config', 'publish', 'download') or
++            descriptor['location'] != location or
++            descriptor['upper_bound'] != upper_bound):
++        journal._conflict('identity_changed')
++    return journal._row(_reserve(context, child, checkpoint, operation,
++        artifact_id, location, upper_bound, descriptor['kind']))
++
++
++@require_context
++@db.pick_context_manager_writer
++def confirm(context, artifact_id, result):
++    row = context.session.get(m.InstanceCheckpointArtifactReservation,
++                              artifact_id)
++    if row is None:
++        raise exception.NotFound()
++    parent, checkpoint, operation, child, rows = _child(context, row.child_id)
++    ref = v2.ArtifactRef.from_primitive(result)
++    if (child.status != 'succeeded' or row.writer_state != 'closed' or
++            (ref.id, ref.bytes, ref.checksum, ref.location,
++             ref.logical_id) !=
++            (row.id, row.actual_bytes, row.checksum, row.location,
++             row.logical_id)):
++        journal._conflict('identity_changed')
++    return journal._row(row)
++
++
++def _deleted(context, checkpoint, operation, artifact_id, child):
++    row = context.session.get(m.InstanceCheckpointArtifactReservation,
++                              artifact_id)
++    if row is None or row.checkpoint_id != checkpoint.uuid:
++        raise exception.NotFound()
++    writer = context.session.get(m.InstanceCheckpointEffect, row.child_id)
++    if (child.action != 'delete' or child.resource_id != artifact_id or
++            child.status != 'succeeded' or writer.status not in TERMINAL or
++            row.writer_state not in ('closed', 'deleted')):
++        journal._conflict('resources_remaining')
++    # A retained shared artifact is not removable while another operation
++    # owns this checkpoint; _owned already enforces the sole operation.
++    row.writer_state = 'deleted'
++    row.cleanup_child_id = child.id
++    return row
++
++
++@require_context
++@db.pick_context_manager_writer
++def deleted(context, artifact_id, child_id):
++    parent, checkpoint, operation, child, rows = _child(context, child_id)
++    return journal._row(_deleted(context, checkpoint, operation,
++                                 artifact_id, child))
++
++
++@require_context
++@db.pick_context_manager_reader
++def get_reservations(context, checkpoint_id):
++    journal._checkpoint(context, checkpoint_id)
++    return [journal._row(r) for r in _reservations(context, checkpoint_id)]
++
++
++def _parent_success(parent, children, evidence):
++    if any(row.status != 'succeeded' for row in children):
++        return False
++    proofs = [jsonutils.loads(row.result)['evidence'] for row in children]
++    if parent.phase in ('runtime_save', 'artifact_publish_shared',
++                        'artifact_stage'):
++        refs = []
++        for proof in proofs:
++            refs.extend(proof.get('artifacts', []))
++            if 'artifact' in proof:
++                refs.append(proof['artifact'])
++        return sorted(refs, key=lambda r: r['id']) == sorted(
++            evidence['artifacts'], key=lambda r: r['id'])
++    if parent.phase in ('runtime_restore_current',
++                        'runtime_restore_checkpoint',
++                        'cleanup_runtime_restore_current'):
++        return bool(proofs) and proofs[-1] == evidence
++    if parent.phase in ('staging_cleanup', 'artifact_delete',
++                        'cleanup_artifacts'):
++        return set(evidence['artifact_ids']) == {
++            row.resource_id for row in children}
++    # Other multi-resource adapters add their closed aggregation here when
++    # their success evidence is implemented. Empty graphs never imply success.
++    return len(proofs) == 1 and proofs[0] == evidence
++
++
++def finish_parent(context, instance, checkpoint, operation, parent, value):
++    result = v2.validate_result(parent.phase, value.to_primitive())
++    children = _rows(context, parent)
++    valid = True
++    if result.status == 'succeeded':
++        valid = _parent_success(
++            parent, children, result.to_primitive()['evidence'])
++        if 'fingerprint' in result.evidence:
++            valid &= result.evidence['fingerprint'] == checkpoint.fingerprint
++    elif result.status == 'ready':
++        valid = dict(result.evidence) == _continuation(context, parent)
++    elif result.status == 'failed_with_effects':
++        valid = (all(row.status in TERMINAL for row in children) and
++                 set(result.evidence['terminal_child_ids']) ==
++                 {row.id for row in children} and
++                 set(result.evidence['resource_ids']) == {r.id for r in
++                     _reservations(context, checkpoint.uuid)
++                     if r.child_id in {row.id for row in children}})
++    elif result.status == 'failed_no_effect':
++        valid = all(row.status == 'failed_no_effect' for row in children)
++    if not valid:
++        result = v2.EffectResult('unknown', {}, 'invalid_executor_result')
++    encoded = journal._encode(result.to_primitive())
++    if parent.status in TERMINAL:
++        if parent.result != encoded:
++            journal._conflict()
++        return
++    parent.status, parent.result = result.status, encoded
++    parent.version += 1
++    operation.version += 1
++    operation.error_code = result.error_code
++    if result.status in ('unknown', 'failed_no_effect', 'failed_with_effects'):
++        operation.state = 'recovery_required'
++        instance.task_state = task_states.CHECKPOINT_RECOVERING
++
++
++def resources_closed(context, checkpoint):
++    if any(row.writer_state != 'deleted'
++           for row in _reservations(context, checkpoint.uuid)):
++        return False
++    operations = context.session.query(
++        m.InstanceCheckpointOperation).filter_by(
++        checkpoint_id=checkpoint.uuid).all()
++    for operation in operations:
++        for parent in journal._steps(context, operation.uuid):
++            if any(row.status not in TERMINAL
++                   for row in _rows(context, parent)):
++                return False
++    return True
+diff --git a/nova/db/main/checkpoints.py b/nova/db/main/checkpoints.py
+index 36affa7218fb460062dbeaba3eae3f94eea2d4ad..781525a77dfbd218ea9e67f1426637ba93e1eb49 100644
+--- a/nova/db/main/checkpoints.py
++++ b/nova/db/main/checkpoints.py
+@@ -40,6 +40,7 @@ from nova import exception
+ CONF = conf.CONF
+ _JSON_COLUMNS = frozenset(
+     (
++        'binding',
+         'device_manifest',
+         'admission',
+         'payload',
+@@ -348,7 +349,10 @@ def find_request(context, key):
+ @oslo_db_api.wrap_db_retry(max_retries=5, retry_on_deadlock=True)
+ @db.pick_context_manager_writer
+ def admit(context, admission, ticket_id):
++    from nova.db.main import checkpoint_effects as effects
++
+     a = admission
++    extra = effects.admission_fields(a)
+     c._uuid(ticket_id)
+     instance = _instance(context, a.key.instance_uuid, lock=True)
+     if instance.project_id != a.key.project_id or (
+@@ -392,7 +396,7 @@ def admit(context, admission, ticket_id):
+             host=a.host,
+             node=a.node,
+             cell_uuid=a.cell_uuid,
+-            format_version=1,
++            format_version=extra['contract_version'],
+             fingerprint=a.fingerprint,
+             device_manifest=_encode(a.to_primitive()['device_manifest']),
+             quota_ticket_id=ticket_id,
+@@ -401,6 +405,7 @@ def admit(context, admission, ticket_id):
+             artifact_upper_bound=a.artifact_upper_bound,
+             artifact_budget_version=1,
+             artifact_usage_revision=0,
++            **extra,
+         )
+         context.session.add(checkpoint)
+         for disk in a.device_manifest['disks']:
+@@ -425,6 +430,8 @@ def admit(context, admission, ticket_id):
+         ):
+             raise exception.NotFound()
+         if (
++            checkpoint.contract_version != extra['contract_version'] or
++            checkpoint.binding != extra.get('binding') or
+             checkpoint.status != 'available' or
+             checkpoint.quota_ticket_id != ticket_id or
+             checkpoint.fingerprint != a.fingerprint or
+@@ -458,6 +465,7 @@ def admit(context, admission, ticket_id):
+         quota_released=False,
+         version=1,
+         admission=_encode(a.to_primitive()),
++        **extra,
+     )
+     context.session.add(operation)
+     guard.operation_id = a.operation_id
+@@ -609,6 +617,10 @@ def claim_step(context, operation_id, generation, phase, executor_id):
+         (instance.host, instance.node) != (operation.host, operation.node)
+     ):
+         _conflict()
++    if operation.contract_version == 2:
++        from nova.db.main import checkpoint_effects as effects
++        return effects.claim_parent(
++            context, instance, checkpoint, operation, phase)
+     steps = {step.phase: step for step in _steps(context, operation_id)}
+     phases, cleaning = workflow.execution_plan(
+         operation.kind, {name: step.status for name, step in steps.items()}
+@@ -834,6 +846,11 @@ def finish_step(context, step_id, generation, result):
+         context, step.operation_id, generation
+     )
+     context.session.refresh(step, with_for_update=True)
++    if step.contract_version == 2:
++        from nova.db.main import checkpoint_effects as effects
++        effects.finish_parent(
++            context, instance, checkpoint, operation, step, result)
++        return
+     result = c.validate_result(step.phase, result.to_primitive())
+     result = _bind_result(context, checkpoint, step, result)
+     encoded = _encode(result.to_primitive())
+@@ -869,6 +886,9 @@ def finalize(context, operation_id, generation, outcome):
+     instance, guard, checkpoint, operation = _owned(
+         context, operation_id, generation
+     )
++    if operation.contract_version == 2:
++        # V2 finalization requires its complete orchestrator and proofs.
++        _conflict('resources_remaining')
+     steps = {step.phase: step for step in _steps(context, operation_id)}
+     phases, cleaning = workflow.execution_plan(
+         operation.kind, {name: step.status for name, step in steps.items()}
+@@ -948,6 +968,10 @@ def close_proof(context, create_operation_id):
+         checkpoint.create_operation_id != operation.uuid
+     ):
+         _conflict()
++    if checkpoint.contract_version == 2:
++        from nova.db.main import checkpoint_effects as effects
++        if not effects.resources_closed(context, checkpoint):
++            return None
+     if not checkpoint.terminal_operation_id:
+         return None
+     return c.CloseProof(
+diff --git a/nova/db/main/migrations/versions/5d9b2ea784c1_add_checkpoint_effects.py b/nova/db/main/migrations/versions/5d9b2ea784c1_add_checkpoint_effects.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..55757eca680b4a55857ee8260f8ba9a388f131d7
+--- /dev/null
++++ b/nova/db/main/migrations/versions/5d9b2ea784c1_add_checkpoint_effects.py
+@@ -0,0 +1,98 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Add checkpoint child journals and pre-effect artifact reservations.
++
++Revision ID: 5d9b2ea784c1
++Revises: 4a8c2d7e9101
++"""
++
++from alembic import op
++import sqlalchemy as sa
++
++revision = '5d9b2ea784c1'
++down_revision = '4a8c2d7e9101'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    for table in ('instance_checkpoints', 'instance_checkpoint_operations'):
++        op.add_column(table, sa.Column('contract_version', sa.Integer,
++                                      nullable=False, server_default='1'))
++        op.add_column(table, sa.Column('binding', sa.Text, nullable=True))
++        op.add_column(table, sa.Column('runtime_fingerprint', sa.String(64),
++                                      nullable=True))
++        for name in ('runtime_profile_id', 'store_profile_id',
++                     'staging_profile_id'):
++            op.add_column(table, sa.Column(name, sa.String(36), nullable=True))
++    op.add_column('instance_checkpoint_steps', sa.Column(
++        'contract_version', sa.Integer, nullable=False, server_default='1'))
++    op.add_column('instance_checkpoint_steps', sa.Column(
++        'child_plan_hash', sa.String(64), nullable=True))
++    op.add_column('instance_checkpoint_steps', sa.Column(
++        'child_plan_count', sa.Integer, nullable=False, server_default='0'))
++    op.create_table(
++        'instance_checkpoint_effects',
++        sa.Column('id', sa.String(36), primary_key=True, nullable=False),
++        sa.Column(
++            'parent_step_id', sa.String(36),
++            sa.ForeignKey('instance_checkpoint_steps.uuid'),
++            nullable=False),
++        sa.Column(
++            'operation_id', sa.String(36),
++            sa.ForeignKey('instance_checkpoint_operations.uuid'),
++            nullable=False),
++        sa.Column('generation', sa.Integer, nullable=False),
++        sa.Column('action', sa.String(64), nullable=False),
++        sa.Column('resource_id', sa.String(36), nullable=False),
++        sa.Column('executor_id', sa.String(255), nullable=False),
++        sa.Column('payload', sa.Text, nullable=False),
++        sa.Column('payload_hash', sa.String(64), nullable=False),
++        sa.Column('status', sa.String(32), nullable=False),
++        sa.Column('result', sa.Text, nullable=True),
++        sa.Column('revision', sa.Integer, nullable=False),
++        sa.Column('sequence', sa.Integer, nullable=False),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        sa.UniqueConstraint('parent_step_id', 'action', 'resource_id',
++                            name='uniq_checkpoint_effect_resource'),
++        mysql_engine='InnoDB', mysql_charset='utf8',
++    )
++    op.create_table(
++        'instance_checkpoint_artifact_reservations',
++        sa.Column('id', sa.String(36), primary_key=True, nullable=False),
++        sa.Column(
++            'child_id', sa.String(36),
++            sa.ForeignKey('instance_checkpoint_effects.id'),
++            nullable=False),
++        sa.Column(
++            'operation_id', sa.String(36),
++            sa.ForeignKey('instance_checkpoint_operations.uuid'),
++            nullable=False),
++        sa.Column(
++            'checkpoint_id', sa.String(36),
++            sa.ForeignKey('instance_checkpoints.uuid'),
++            nullable=False),
++        sa.Column('namespace_hash', sa.String(64), nullable=False),
++        sa.Column('logical_id', sa.String(64), nullable=False),
++        sa.Column('kind', sa.String(32), nullable=False),
++        sa.Column('location', sa.String(32), nullable=False),
++        sa.Column('upper_bound', sa.BigInteger, nullable=False),
++        sa.Column('actual_bytes', sa.BigInteger, nullable=True),
++        sa.Column('checksum', sa.String(64), nullable=True),
++        sa.Column('writer_state', sa.String(32), nullable=False),
++        sa.Column('cleanup_child_id', sa.String(36), nullable=True),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        mysql_engine='InnoDB', mysql_charset='utf8',
++    )
+diff --git a/nova/db/main/models.py b/nova/db/main/models.py
+index 909b9a3fac415cd89a71fab3e972137449284993..5391f7f40f6c3687f9a4c63ff8d93c810a517595 100644
+--- a/nova/db/main/models.py
++++ b/nova/db/main/models.py
+@@ -1247,6 +1247,13 @@ class InstanceCheckpoint(BASE, NovaBase):
+             'uuid',
+         ),
+     )
++    contract_version = sa.Column(
++        sa.Integer, nullable=False, server_default='1')
++    binding = sa.Column(sa.Text, nullable=True)
++    runtime_fingerprint = sa.Column(sa.String(64), nullable=True)
++    runtime_profile_id = sa.Column(sa.String(36), nullable=True)
++    store_profile_id = sa.Column(sa.String(36), nullable=True)
++    staging_profile_id = sa.Column(sa.String(36), nullable=True)
+     uuid = sa.Column(sa.String(36), primary_key=True, nullable=False)
+     instance_uuid = sa.Column(sa.String(36), nullable=False)
+     project_id = sa.Column(sa.String(255), nullable=False)
+@@ -1317,6 +1324,13 @@ class InstanceCheckpointOperation(BASE, NovaBase):
+             'checkpoint_operation_reconcile_idx', 'state', 'updated_at', 'uuid'
+         ),
+     )
++    contract_version = sa.Column(
++        sa.Integer, nullable=False, server_default='1')
++    binding = sa.Column(sa.Text, nullable=True)
++    runtime_fingerprint = sa.Column(sa.String(64), nullable=True)
++    runtime_profile_id = sa.Column(sa.String(36), nullable=True)
++    store_profile_id = sa.Column(sa.String(36), nullable=True)
++    staging_profile_id = sa.Column(sa.String(36), nullable=True)
+     uuid = sa.Column(sa.String(36), primary_key=True, nullable=False)
+     instance_uuid = sa.Column(sa.String(36), nullable=False)
+     checkpoint_id = sa.Column(sa.String(36), nullable=False)
+@@ -1354,6 +1368,11 @@ class InstanceCheckpointStep(BASE, NovaBase):
+             'operation_id', 'phase', name='uniq_checkpoint_operation_phase'
+         ),
+     )
++    contract_version = sa.Column(
++        sa.Integer, nullable=False, server_default='1')
++    child_plan_hash = sa.Column(sa.String(64), nullable=True)
++    child_plan_count = sa.Column(
++        sa.Integer, nullable=False, server_default='0')
+     uuid = sa.Column(sa.String(36), primary_key=True, nullable=False)
+     operation_id = sa.Column(sa.String(36), nullable=False)
+     generation = sa.Column(sa.Integer, nullable=False)
+@@ -1394,3 +1413,50 @@ class InstanceCheckpointAdmissionTombstone(BASE, NovaBase):
+     payload_hash = sa.Column(sa.String(64), nullable=False)
+     checkpoint_id = sa.Column(sa.String(36), nullable=False)
+     admission = sa.Column(sa.Text, nullable=False)
++
++
++class InstanceCheckpointEffect(BASE, NovaBase):
++    __tablename__ = 'instance_checkpoint_effects'
++    __table_args__ = (sa.UniqueConstraint(
++        'parent_step_id', 'action', 'resource_id',
++        name='uniq_checkpoint_effect_resource'),)
++    id = sa.Column(sa.String(36), primary_key=True, nullable=False)
++    parent_step_id = sa.Column(
++        sa.String(36), sa.ForeignKey('instance_checkpoint_steps.uuid'),
++        nullable=False)
++    operation_id = sa.Column(
++        sa.String(36), sa.ForeignKey('instance_checkpoint_operations.uuid'),
++        nullable=False)
++    generation = sa.Column(sa.Integer, nullable=False)
++    action = sa.Column(sa.String(64), nullable=False)
++    resource_id = sa.Column(sa.String(36), nullable=False)
++    executor_id = sa.Column(sa.String(255), nullable=False)
++    payload = sa.Column(sa.Text, nullable=False)
++    payload_hash = sa.Column(sa.String(64), nullable=False)
++    status = sa.Column(sa.String(32), nullable=False)
++    result = sa.Column(sa.Text, nullable=True)
++    revision = sa.Column(sa.Integer, nullable=False)
++    sequence = sa.Column(sa.Integer, nullable=False)
++
++
++class InstanceCheckpointArtifactReservation(BASE, NovaBase):
++    __tablename__ = 'instance_checkpoint_artifact_reservations'
++    id = sa.Column(sa.String(36), primary_key=True, nullable=False)
++    child_id = sa.Column(
++        sa.String(36), sa.ForeignKey('instance_checkpoint_effects.id'),
++        nullable=False)
++    operation_id = sa.Column(
++        sa.String(36), sa.ForeignKey('instance_checkpoint_operations.uuid'),
++        nullable=False)
++    checkpoint_id = sa.Column(
++        sa.String(36), sa.ForeignKey('instance_checkpoints.uuid'),
++        nullable=False)
++    namespace_hash = sa.Column(sa.String(64), nullable=False)
++    logical_id = sa.Column(sa.String(64), nullable=False)
++    kind = sa.Column(sa.String(32), nullable=False)
++    location = sa.Column(sa.String(32), nullable=False)
++    upper_bound = sa.Column(sa.BigInteger, nullable=False)
++    actual_bytes = sa.Column(sa.BigInteger, nullable=True)
++    checksum = sa.Column(sa.String(64), nullable=True)
++    writer_state = sa.Column(sa.String(32), nullable=False)
++    cleanup_child_id = sa.Column(sa.String(36), nullable=True)
+diff --git a/nova/objects/__init__.py b/nova/objects/__init__.py
+index beef1271c49674f52011f08437a0d337d54aaabb..e94032b780a8a7807e8db1345c3e0dcc9b23ef43 100644
+--- a/nova/objects/__init__.py
++++ b/nova/objects/__init__.py
+@@ -29,6 +29,7 @@ def register_all():
+     __import__('nova.objects.build_request')
+     __import__('nova.objects.cell_mapping')
+     __import__('nova.objects.checkpoint')
++    __import__('nova.objects.checkpoint_effect')
+     __import__('nova.objects.compute_node')
+     __import__('nova.objects.diagnostics')
+     __import__('nova.objects.console_auth_token')
+diff --git a/nova/objects/checkpoint.py b/nova/objects/checkpoint.py
+index a659a3b5889448f9d11808e1eceddaaf7028592d..deebe04b76a769173d3e8d408662ea04d5ba75b5 100644
+--- a/nova/objects/checkpoint.py
++++ b/nova/objects/checkpoint.py
+@@ -19,6 +19,7 @@ Compute delegates SQL to conductor through standard object indirection.
+ from oslo_versionedobjects import exception as ovo_exc
+ 
+ from nova.checkpoints import contracts
++from nova.checkpoints import contracts_v2
+ from nova.db.api import checkpoints as quota_db
+ from nova.db.main import checkpoints as db
+ from nova import objects
+@@ -49,11 +50,31 @@ class CheckpointJSONField(fields.AutoTypedField):
+ 
+ class _VersionOne:
+     def obj_make_compatible(self, primitive, target_version):
+-        if target_version != '1.0':
++        if target_version not in ('1.0', self.VERSION):
+             raise ovo_exc.UnsupportedObjectError(objtype=self.obj_name())
+         super().obj_make_compatible(primitive, target_version)
+ 
+ 
++class _VersionTwo:
++    def obj_make_compatible(self, primitive, target_version):
++        if target_version == '1.0':
++            if primitive.get('contract_version', 1) != 1:
++                raise ovo_exc.UnsupportedObjectError(objtype=self.obj_name())
++            for key in self._v2_fields:
++                primitive.pop(key, None)
++        super().obj_make_compatible(primitive, target_version)
++
++
++_BINDING_FIELDS = {
++    'contract_version': fields.IntegerField(),
++    'binding': CheckpointJSONField(nullable=True),
++    'runtime_fingerprint': fields.StringField(nullable=True),
++    'runtime_profile_id': fields.UUIDField(nullable=True),
++    'store_profile_id': fields.UUIDField(nullable=True),
++    'staging_profile_id': fields.UUIDField(nullable=True),
++}
++
++
+ class _Projection(_VersionOne, base.NovaObject, base.NovaObjectDictCompat):
+     VERSION = '1.0'
+     fields = {
+@@ -77,10 +98,12 @@ class _Projection(_VersionOne, base.NovaObject, base.NovaObjectDictCompat):
+ 
+ 
+ @base.NovaObjectRegistry.register
+-class InstanceCheckpoint(_Projection):
+-    VERSION = '1.0'
++class InstanceCheckpoint(_VersionTwo, _Projection):
++    VERSION = '1.1'
++    _v2_fields = _BINDING_FIELDS
+ 
+     fields = {
++        **_v2_fields,
+         'uuid': fields.UUIDField(),
+         'instance_uuid': fields.UUIDField(),
+         'project_id': fields.StringField(),
+@@ -146,10 +169,12 @@ class InstanceCheckpointArtifact(_Projection):
+ 
+ 
+ @base.NovaObjectRegistry.register
+-class InstanceCheckpointOperation(_Projection):
+-    VERSION = '1.0'
++class InstanceCheckpointOperation(_VersionTwo, _Projection):
++    VERSION = '1.1'
++    _v2_fields = _BINDING_FIELDS
+ 
+     fields = {
++        **_v2_fields,
+         'uuid': fields.UUIDField(),
+         'instance_uuid': fields.UUIDField(),
+         'checkpoint_id': fields.UUIDField(),
+@@ -178,12 +203,12 @@ class InstanceCheckpointOperation(_Projection):
+ 
+     @base.remotable_classmethod
+     def admit(cls, context, admission, ticket_id):
+-        admission = contracts.Admission.from_primitive(admission)
++        admission = contracts_v2.decode_admission(admission)
+         return cls._from_row(context, db.admit(context, admission, ticket_id))
+ 
+     @base.remotable_classmethod
+     def cancel_admission(cls, context, admission):
+-        admission = contracts.Admission.from_primitive(admission)
++        admission = contracts_v2.decode_admission(admission)
+         return db.cancel_admission(context, admission).to_primitive()
+ 
+     @base.remotable_classmethod
+@@ -208,7 +233,12 @@ class InstanceCheckpointOperation(_Projection):
+ 
+     @base.remotable_classmethod
+     def finish_step(cls, context, step_id, generation, result):
+-        result = contracts.StepResult.from_primitive(result)
++        version = result.get('schema_version')
++        if type(version) is not int or version not in (1, 2):
++            raise ValueError('Unsupported checkpoint result version')
++        result = (contracts_v2.EffectResult.from_primitive(result)
++                  if version == 2 else
++                  contracts.StepResult.from_primitive(result))
+         db.finish_step(context, step_id, generation, result)
+ 
+     @base.remotable_classmethod
+@@ -248,10 +278,14 @@ class InstanceCheckpointOperation(_Projection):
+ 
+ 
+ @base.NovaObjectRegistry.register
+-class InstanceCheckpointStep(_Projection):
+-    VERSION = '1.0'
++class InstanceCheckpointStep(_VersionTwo, _Projection):
++    VERSION = '1.1'
++    _v2_fields = {'contract_version': fields.IntegerField(),
++        'child_plan_hash': fields.StringField(nullable=True),
++        'child_plan_count': fields.IntegerField()}
+ 
+     fields = {
++        **_v2_fields,
+         'uuid': fields.UUIDField(),
+         'operation_id': fields.UUIDField(),
+         'generation': fields.IntegerField(),
+@@ -348,9 +382,9 @@ class InstanceCheckpointGuard(_Projection):
+ class InstanceCheckpointList(
+     _VersionOne, base.ObjectListBase, base.NovaObject
+ ):
+-    VERSION = '1.0'
++    VERSION = '1.1'
+     fields = {'objects': fields.ListOfObjectsField('InstanceCheckpoint')}
+-    obj_relationships = {'objects': [('1.0', '1.0')]}
++    obj_relationships = {'objects': [('1.0', '1.0'), ('1.1', '1.1')]}
+ 
+     @base.remotable_classmethod
+     def get_by_instance_uuid(
+@@ -402,9 +436,9 @@ class InstanceCheckpointArtifactList(
+ class InstanceCheckpointStepList(
+     _VersionOne, base.ObjectListBase, base.NovaObject
+ ):
+-    VERSION = '1.0'
++    VERSION = '1.1'
+     fields = {'objects': fields.ListOfObjectsField('InstanceCheckpointStep')}
+-    obj_relationships = {'objects': [('1.0', '1.0')]}
++    obj_relationships = {'objects': [('1.0', '1.0'), ('1.1', '1.1')]}
+ 
+     @base.remotable_classmethod
+     def get_by_operation(cls, context, operation_id):
+@@ -459,11 +493,11 @@ class CheckpointQuotaTicketList(
+ class InstanceCheckpointOperationList(
+     _VersionOne, base.ObjectListBase, base.NovaObject
+ ):
+-    VERSION = '1.0'
++    VERSION = '1.1'
+     fields = {
+         'objects': fields.ListOfObjectsField('InstanceCheckpointOperation')
+     }
+-    obj_relationships = {'objects': [('1.0', '1.0')]}
++    obj_relationships = {'objects': [('1.0', '1.0'), ('1.1', '1.1')]}
+ 
+     @base.remotable_classmethod
+     def get_recovery_page(cls, context, marker=None, limit=100):
+diff --git a/nova/objects/checkpoint_effect.py b/nova/objects/checkpoint_effect.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf6bece4892eea43b9f648043da511a8d8e14fa6
+--- /dev/null
++++ b/nova/objects/checkpoint_effect.py
+@@ -0,0 +1,62 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Explicit conductor-indirected child effect and resource transitions."""
++
++from nova.db.main import checkpoint_effects as db
++from nova.objects import base
++
++
++@base.NovaObjectRegistry.register
++class CheckpointEffect(base.NovaObject):
++    VERSION = '1.0'
++
++    @base.remotable_classmethod
++    def prepare(cls, context, parent_step_id, action, resource_id, payload):
++        return db.prepare(
++            context, parent_step_id, action, resource_id, payload)
++
++    @base.remotable_classmethod
++    def claim(cls, context, child_id, generation, executor_id,
++              expected_revision):
++        return db.claim(
++            context, child_id, generation, executor_id, expected_revision)
++
++    @base.remotable_classmethod
++    def observe(cls, context, child_id, generation, result):
++        return db.observe(context, child_id, generation, result)
++
++    @base.remotable_classmethod
++    def get_children(cls, context, parent_step_id):
++        return db.get_children(context, parent_step_id)
++
++    @base.remotable_classmethod
++    def continuation(cls, context, parent_step_id):
++        return db.continuation(context, parent_step_id)
++
++
++@base.NovaObjectRegistry.register
++class CheckpointArtifactReservation(base.NovaObject):
++    VERSION = '1.0'
++
++    @base.remotable_classmethod
++    def reserve(cls, context, child_id, artifact_id, location, upper_bound):
++        return db.reserve(
++            context, child_id, artifact_id, location, upper_bound)
++
++    @base.remotable_classmethod
++    def confirm(cls, context, artifact_id, result):
++        return db.confirm(context, artifact_id, result)
++
++    @base.remotable_classmethod
++    def deleted(cls, context, artifact_id, child_id):
++        return db.deleted(context, artifact_id, child_id)
+diff --git a/nova/tests/functional/db/test_checkpoint_effects.py b/nova/tests/functional/db/test_checkpoint_effects.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c53cef4883b8539a0f503c8ae4f9df29307c801f
+--- /dev/null
++++ b/nova/tests/functional/db/test_checkpoint_effects.py
+@@ -0,0 +1,334 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import dataclasses
++import threading
++from unittest import mock
++
++from oslo_db.sqlalchemy import enginefacade
++from oslo_db.sqlalchemy import test_fixtures
++from oslo_utils.fixture import uuidsentinel as uuids
++from oslo_versionedobjects import exception as ovo_exception
++
++from nova.checkpoints import contracts_v2 as v2
++from nova import context
++from nova.db.main import api as db_api
++from nova.db.main import checkpoint_effects as effects
++from nova.db.main import checkpoints as journal
++from nova.db.main import models
++from nova.db import migration
++from nova import exception
++from nova import objects
++from nova import test
++from nova.tests.unit.checkpoints import test_cell_db
++
++
++class EffectTests:
++    def prepare_effects(self):
++        self.flags(enabled=True, deployment_id=uuids.deployment,
++                   group='checkpoint')
++        self.ctx = context.RequestContext('actor', 'project')
++        if hasattr(self, 'manager'):
++            self.ctx.db_connection = self.manager
++        test_cell_db.make_instance(self.ctx)
++        old = test_cell_db.admission(self.ctx)
++        self.admission = v2.AdmissionV2(
++            **{f.name: getattr(old, f.name) for f in dataclasses.fields(old)},
++            runtime_fingerprint='b' * 64, runtime_profile_id=uuids.runtime,
++            store_profile_id=uuids.store, staging_profile_id=uuids.staging,
++            save_bytes_limit=4096, restore_bytes_limit=4096)
++        self.operation = objects.InstanceCheckpointOperation.admit(
++            self.ctx, self.admission.to_primitive(), uuids.ticket)
++        journal.mark_quota_ready(self.ctx, uuids.operation, uuids.ticket)
++        self.parent = journal.claim_step(
++            self.ctx, uuids.operation, 1, 'preflight', 'test-executor')
++
++    def children(self):
++        return objects.CheckpointEffect.get_children(self.ctx, self.parent.id)
++
++    def claim(self, child):
++        return objects.CheckpointEffect.claim(
++            self.ctx, child['id'], 1, 'test-executor', child['revision'])
++
++    def finish(self, child, evidence):
++        self.claim(child)
++        value = v2.EffectResult('succeeded', evidence, None)
++        objects.CheckpointEffect.observe(
++            self.ctx, child['id'], 1, value.to_primitive())
++        objects.InstanceCheckpointOperation.finish_step(
++            self.ctx, self.parent.id, 1, value.to_primitive())
++
++    def save_parent(self):
++        self.finish(self.children()[0], dict(
++            fingerprint=self.admission.fingerprint,
++            host='compute', node='node'))
++        self.parent = journal.claim_step(
++            self.ctx, uuids.operation, 1, 'cinder_reserve', 'test-executor')
++        self.finish(self.children()[0], dict(
++            operation_id=uuids.cinder, generation=1,
++            volume_ids=[uuids.volume], state='reserved'))
++        self.parent = journal.claim_step(
++            self.ctx, uuids.operation, 1, 'runtime_save', 'test-executor')
++
++    def test_closed_plan_and_exact_prepare_replay(self):
++        before = self.children()
++        self.assertEqual(['inspect'], [c['action'] for c in before])
++        child = before[0]
++        replay = objects.CheckpointEffect.prepare(
++            self.ctx, self.parent.id, child['action'], child['resource_id'],
++            child['payload'])
++        self.assertEqual(child['id'], replay['id'])
++        self.assertRaises(exception.CheckpointConflict,
++                          objects.CheckpointEffect.prepare, self.ctx,
++                          self.parent.id, 'save', uuids.foreign, {})
++        self.assertEqual(before, self.children())
++
++    def test_claim_once_and_stale_revision_cannot_dispatch(self):
++        child = self.children()[0]
++        self.assertIsNotNone(self.claim(child))
++        self.assertIsNone(self.claim(child))
++        self.assertEqual('dispatching', self.children()[0]['status'])
++
++    def test_ready_is_not_success_and_observe_does_not_add_children(self):
++        self.save_parent()
++        before = self.children()
++        self.assertEqual(['reserve_staging', 'save'],
++                         [c['action'] for c in before])
++        child = before[0]
++        self.claim(child)
++        objects.CheckpointEffect.observe(self.ctx, child['id'], 1,
++            v2.EffectResult('succeeded', dict(workspace_id=uuids.operation,
++                                            limit_bytes=4096), None
++                            ).to_primitive())
++        ready = objects.CheckpointEffect.continuation(self.ctx, self.parent.id)
++        self.assertEqual(before[1]['id'], ready['next_child_id'])
++        self.assertEqual('dispatching', journal.step_get(
++            self.ctx, self.parent.id)['status'])
++        self.assertEqual([c['id'] for c in before],
++                         [c['id'] for c in self.children()])
++        self.assertIsNone(self.claim(before[1]))
++        self.assertIsNotNone(objects.CheckpointEffect.claim(
++            self.ctx, ready['next_child_id'], 1, 'test-executor',
++            ready['journal_revision']))
++
++    def test_unknown_save_reservation_blocks_cleanup_and_close(self):
++        self.save_parent()
++        child = self.children()[0]
++        self.claim(child)
++        objects.CheckpointEffect.observe(self.ctx, child['id'], 1,
++            v2.EffectResult('succeeded', dict(workspace_id=uuids.operation,
++                                            limit_bytes=4096), None
++                            ).to_primitive())
++        child = self.children()[1]
++        self.claim(child)
++        objects.CheckpointEffect.observe(self.ctx, child['id'], 1,
++            v2.EffectResult('unknown', {}, 'recovery_required').to_primitive())
++        rows = effects.get_reservations(self.ctx, uuids.checkpoint)
++        self.assertEqual(1, len(rows))
++        self.assertEqual('unknown', rows[0]['writer_state'])
++        self.assertRaises(exception.CheckpointConflict,
++                          objects.CheckpointArtifactReservation.deleted,
++                          self.ctx, rows[0]['id'], child['id'])
++        self.assertIsNone(journal.close_proof(self.ctx, uuids.operation))
++
++    def test_partial_result_cannot_claim_foreign_or_unknown_children(self):
++        child = self.children()[0]
++        self.claim(child)
++        value = v2.EffectResult('failed_with_effects', dict(
++            resource_ids=[uuids.foreign], terminal_child_ids=[uuids.foreign],
++            late_effect_impossible=True), 'resources_remaining')
++        objects.CheckpointEffect.observe(
++            self.ctx, child['id'], 1, value.to_primitive())
++        self.assertEqual('unknown', self.children()[0]['status'])
++
++    def test_fenced_prepared_child_rejects_late_claim(self):
++        child = self.children()[0]
++        effects.cancel_prepared(self.ctx, uuids.operation, 1)
++        self.assertIsNone(self.claim(child))
++        self.assertEqual('failed_no_effect', self.children()[0]['status'])
++
++    def test_parent_success_cannot_bypass_child_dispatch(self):
++        value = v2.EffectResult('succeeded', dict(
++            fingerprint=self.admission.fingerprint,
++            host='compute', node='node'),
++            None)
++        objects.InstanceCheckpointOperation.finish_step(
++            self.ctx, self.parent.id, 1, value.to_primitive())
++        self.assertNotEqual('succeeded', journal.step_get(
++            self.ctx, self.parent.id)['status'])
++        self.assertEqual('prepared', self.children()[0]['status'])
++
++    def complete_save_child(self):
++        self.save_parent()
++        child = self.children()[0]
++        self.claim(child)
++        objects.CheckpointEffect.observe(self.ctx, child['id'], 1,
++            v2.EffectResult('succeeded', dict(workspace_id=uuids.operation,
++                limit_bytes=4096), None).to_primitive())
++        child = self.children()[1]
++        self.claim(child)
++        row = effects.get_reservations(self.ctx, uuids.checkpoint)[0]
++        ref = v2.ArtifactRef(row['id'], 'ram', row['logical_id'],
++                            1024, 'c' * 64, 'staging').to_primitive()
++        value = v2.EffectResult('succeeded', dict(writes_stopped=True,
++                               artifacts=[ref]), None)
++        objects.CheckpointEffect.observe(self.ctx, child['id'], 1,
++                                          value.to_primitive())
++        return value
++
++    def test_parent_cannot_substitute_artifact_after_children_succeed(self):
++        value = self.complete_save_child().to_primitive()
++        value['evidence']['artifacts'][0]['id'] = uuids.foreign
++        objects.InstanceCheckpointOperation.finish_step(
++            self.ctx, self.parent.id, 1, value)
++        self.assertEqual('unknown', journal.step_get(
++            self.ctx, self.parent.id)['status'])
++
++    def test_confirm_cannot_change_recorded_resource(self):
++        value = self.complete_save_child().to_primitive()
++        ref = value['evidence']['artifacts'][0]
++        self.assertEqual(1024, objects.CheckpointArtifactReservation.confirm(
++            self.ctx, ref['id'], ref)['actual_bytes'])
++        ref['bytes'] = 1
++        self.assertRaises(exception.CheckpointConflict,
++            objects.CheckpointArtifactReservation.confirm,
++            self.ctx, ref['id'], ref)
++
++    def test_foreign_namespace_collision_rolls_back_complete_graph(self):
++        self.save_parent()
++        original = effects.get_reservations(self.ctx, uuids.checkpoint)[0]
++        test_cell_db.make_instance(self.ctx, uuids.instance2, uuids.bdm2,
++                                   uuids.volume2)
++        old = test_cell_db.admission(self.ctx, request_id=uuids.request2,
++            checkpoint_id=uuids.checkpoint2, operation_id=uuids.operation2,
++            instance_uuid=uuids.instance2)
++        other = dataclasses.replace(self.admission,
++            **{f.name: getattr(old, f.name) for f in dataclasses.fields(old)})
++        other = dataclasses.replace(other, cell_uuid=uuids.cell2)
++        objects.InstanceCheckpointOperation.admit(
++            self.ctx, other.to_primitive(), uuids.ticket2)
++        journal.mark_quota_ready(self.ctx, other.operation_id, uuids.ticket2)
++        for phase, evidence in (
++                ('preflight', dict(fingerprint=other.fingerprint,
++                                   host='compute', node='node')),
++                ('cinder_reserve', dict(operation_id=uuids.cinder2,
++                    generation=1, volume_ids=[uuids.volume2],
++                    state='reserved'))):
++            self.parent = journal.claim_step(self.ctx, other.operation_id, 1,
++                                            phase, 'test-executor')
++            self.finish(self.children()[0], evidence)
++        with mock.patch.object(effects, '_artifact_plan', return_value=[dict(
++                id=original['id'], kind='ram', location='staging',
++                upper_bound=4096)]):
++            self.assertRaises(
++                exception.CheckpointConflict, journal.claim_step,
++                self.ctx, other.operation_id, 1,
++                'runtime_save', 'test-executor')
++        self.assertEqual(['preflight', 'cinder_reserve'], [r['phase'] for r in
++            sorted(journal.steps_get(self.ctx, other.operation_id),
++                   key=lambda r: r['created_at'])])
++        self.assertEqual([], effects.get_reservations(self.ctx,
++                                                      uuids.checkpoint2))
++        self.assertEqual(original, effects.get_reservations(
++            self.ctx, uuids.checkpoint)[0])
++
++    def test_namespace_includes_cell_and_instance(self):
++        binding = self.admission.to_primitive()
++        binding = dict(deployment_id=uuids.deployment,
++            cell_uuid=binding['cell_uuid'], project_id='project',
++            instance_uuid=uuids.instance, checkpoint_id=uuids.checkpoint)
++        name = effects._logical(binding, uuids.artifact)
++        for field in ('cell_uuid', 'instance_uuid', 'checkpoint_id',
++                      'deployment_id', 'project_id'):
++            self.assertNotEqual(name, effects._logical(
++                dict(binding, **{field: uuids.foreign}), uuids.artifact))
++
++    def test_unknown_writer_defeats_terminal_marker(self):
++        self.save_parent()
++
++        @db_api.pick_context_manager_writer
++        def mark_terminal(ctx):
++            row = ctx.session.get(models.InstanceCheckpoint, uuids.checkpoint)
++            row.terminal_operation_id = uuids.operation
++        mark_terminal(self.ctx)
++        self.assertIsNone(journal.close_proof(self.ctx, uuids.operation))
++
++    def test_stale_ready_evidence_does_not_advance_parent(self):
++        child = self.children()[0]
++        ready = objects.CheckpointEffect.continuation(self.ctx, self.parent.id)
++        self.claim(child)
++        objects.InstanceCheckpointOperation.finish_step(
++            self.ctx, self.parent.id, 1,
++            v2.EffectResult('ready', ready, None).to_primitive())
++        self.assertEqual('unknown', journal.step_get(
++            self.ctx, self.parent.id)['status'])
++
++    def test_v2_objects_cannot_be_downgraded(self):
++        self.assertRaises(ovo_exception.UnsupportedObjectError,
++                          self.operation.obj_to_primitive,
++                          target_version='1.0')
++
++
++class EffectDBTest(EffectTests, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_effects()
++
++
++class EffectRaceTests(EffectTests):
++    USES_DB_SELF = True
++
++    def setUp(self):
++        super().setUp()
++        engine = enginefacade.writer.get_engine()
++        self.manager = db_api.create_context_manager(
++            engine.url.render_as_string(hide_password=False))
++        with mock.patch.object(migration, '_get_engine', return_value=engine):
++            migration.db_sync(database='main')
++        self.addCleanup(self.manager.dispose_pool)
++        self.prepare_effects()
++
++    def test_parallel_claim_has_one_dispatch(self):
++        child = self.children()[0]
++        barrier = threading.Barrier(2)
++        values, failures = [], []
++
++        def claim():
++            try:
++                ctx = context.RequestContext('actor', 'project')
++                ctx.db_connection = self.manager
++                barrier.wait(timeout=10)
++                values.append(objects.CheckpointEffect.claim(
++                    ctx, child['id'], 1, 'test-executor', child['revision']))
++            except Exception as exc:
++                failures.append(exc)
++
++        threads = [threading.Thread(target=claim) for _ in range(2)]
++        for thread in threads:
++            thread.start()
++        for thread in threads:
++            thread.join(timeout=20)
++        self.assertFalse(any(t.is_alive() for t in threads))
++        self.assertEqual([], failures)
++        self.assertEqual(1, sum(v is not None for v in values))
++
++
++class EffectMySQLTest(EffectRaceTests,
++                      test_fixtures.OpportunisticDBTestMixin,
++                      test.NoDBTestCase):
++    FIXTURE = test_fixtures.MySQLOpportunisticFixture
++
++
++class EffectPostgreSQLTest(EffectRaceTests,
++                           test_fixtures.OpportunisticDBTestMixin,
++                           test.NoDBTestCase):
++    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
+diff --git a/nova/tests/functional/test_checkpoints.py b/nova/tests/functional/test_checkpoints.py
+index c701f84f73e51d8bad17ff7b88f4e10626268872..ea70e3e065408e1d17440f2d9ac18823f725af20 100644
+--- a/nova/tests/functional/test_checkpoints.py
++++ b/nova/tests/functional/test_checkpoints.py
+@@ -35,7 +35,7 @@ class CheckpointLifecycleTest(checkpoints.CheckpointTestCase):
+             service = objects.Service.get_by_host_and_binary(
+                 ctx, 'compute0', 'nova-compute'
+             )
+-            self.assertEqual(69, service.version)
++            self.assertEqual(70, service.version)
+             api = rpcapi.ComputeAPI()
+             client = api.router.client(ctx)
+             self.assertTrue(
+diff --git a/nova/tests/unit/db/main/test_migrations.py b/nova/tests/unit/db/main/test_migrations.py
+index a1b326bbbbf1a6981a86a1db4c32b105ecf50508..0702314c8c20268f7ef28c301897ad146090ca21 100644
+--- a/nova/tests/unit/db/main/test_migrations.py
++++ b/nova/tests/unit/db/main/test_migrations.py
+@@ -412,6 +412,41 @@ class NovaMigrationsWalk(
+             self.assertEqual(rows, list(
+                 connection.execute(table.select()).mappings()))
+ 
++    def _pre_upgrade_5d9b2ea784c1(self, connection):
++        table = Table('instance_checkpoint_steps', sa.MetaData(),
++                      autoload_with=connection)
++        connection.execute(table.insert().values(
++            uuid='00000000-0000-4000-8000-000000000993',
++            operation_id='00000000-0000-4000-8000-000000000994',
++            generation=1, phase='runtime_save', executor_id='old-executor',
++            payload_hash='a' * 64, payload='{"schema_version":1}',
++            status='unknown', version=7))
++        self._old_checkpoint_step = dict(
++            connection.execute(table.select()).mappings().one())
++
++    def _check_5d9b2ea784c1(self, connection):
++        inspector = sa.inspect(connection)
++        for name in ('instance_checkpoint_effects',
++                     'instance_checkpoint_artifact_reservations'):
++            self.assertIn(name, inspector.get_table_names())
++            self.assertNotIn('shadow_' + name, inspector.get_table_names())
++        for name in ('instance_checkpoints', 'instance_checkpoint_operations'):
++            for column in ('contract_version', 'binding',
++                           'runtime_fingerprint', 'runtime_profile_id',
++                           'store_profile_id', 'staging_profile_id'):
++                self.assertColumnExists(connection, name, column)
++        table = Table('instance_checkpoint_steps', sa.MetaData(),
++                      autoload_with=connection)
++        row = dict(connection.execute(table.select()).mappings().one())
++        self.assertEqual(1, row.pop('contract_version'))
++        self.assertEqual(0, row.pop('child_plan_count'))
++        self.assertIsNone(row.pop('child_plan_hash'))
++        self.assertEqual(self._old_checkpoint_step, row)
++        uniques = inspector.get_unique_constraints(
++            'instance_checkpoint_effects')
++        self.assertIn(['parent_step_id', 'action', 'resource_id'],
++                      [item['column_names'] for item in uniques])
++
+     def test_single_base_revision(self):
+         """Ensure we only have a single base revision.
+ 
+diff --git a/nova/tests/unit/objects/test_checkpoint.py b/nova/tests/unit/objects/test_checkpoint.py
+index cd6cfaf55fab5d44d64ed03fac43eb9164053665..3ae534ae2c8e5a0c15b584f053a4c3a4674cf109 100644
+--- a/nova/tests/unit/objects/test_checkpoint.py
++++ b/nova/tests/unit/objects/test_checkpoint.py
+@@ -34,7 +34,11 @@ class CheckpointObjectTest(test.TestCase):
+         received = serializer.deserialize_entity(self.ctx, wire)
+         self.assertIsInstance(received, objects.InstanceCheckpointOperation)
+         self.assertEqual(op.uuid, received.uuid)
+-        self.assertEqual('1.0', received.VERSION)
++        self.assertEqual('1.1', received.VERSION)
++        old = received.obj_to_primitive(target_version='1.0')
++        self.assertNotIn('contract_version', old['nova_object.data'])
++        self.assertNotIn('binding', old['nova_object.data'])
++        self.assertEqual('1.0', old['nova_object.version'])
+         self.assertRaises(NotImplementedError, received.save, self.ctx)
+         self.assertFalse(hasattr(received, 'create'))
+         self.assertEqual('2.8', objects.Instance.VERSION)
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 4567d90edef43556220b51e7fe4468575e130eef..66f40cf013fd8a844d5ee1817cd405253d01ea2c 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1078,18 +1078,20 @@ class TestRegistry(test.NoDBTestCase):
+ # objects
+ object_data = {
+     'CheckpointQuotaTicketList': '1.0-9eef9c15e15020a0109f01c50e13d512',
++    'CheckpointArtifactReservation': '1.0-9f6b8a6916e0371c680d06dd63981f96',
++    'CheckpointEffect': '1.0-13cf039b4ec72f2f3ed688650759d4bb',
+     'CheckpointQuotaTicket': '1.0-123c9a95dc1d0bcfc8aa604d0b84f236',
+-    'InstanceCheckpoint': '1.0-cb5ed39f906933b5c5fffb66160eb464',
++    'InstanceCheckpoint': '1.1-ea9a09e3cc68cbe3aa8030418eef7950',
+     'InstanceCheckpointArtifact': '1.0-230a6b36d1ee8416232da223889e465e',
+     'InstanceCheckpointArtifactList': '1.0-980a2e851b91058a2b688bee649202ef',
+     'InstanceCheckpointDisk': '1.0-32b4b8527364c69b5b047d3534dc2f26',
+     'InstanceCheckpointDiskList': '1.0-980a2e851b91058a2b688bee649202ef',
+     'InstanceCheckpointGuard': '1.0-5e31c03abf15dacea7608da5f153c4d8',
+-    'InstanceCheckpointList': '1.0-df8bec672e55a3a45b40eaded98ec218',
+-    'InstanceCheckpointOperation': '1.0-6c6013918c1bbadc5b1a96574e975d11',
+-    'InstanceCheckpointOperationList': '1.0-833a632736c862175708703dba0e8e9e',
+-    'InstanceCheckpointStep': '1.0-c93b4ee2e9176e4e97356aab8ea3dd0a',
+-    'InstanceCheckpointStepList': '1.0-380130b03f40b317487ed802199130bb',
++    'InstanceCheckpointList': '1.1-df8bec672e55a3a45b40eaded98ec218',
++    'InstanceCheckpointOperation': '1.1-0118dc03189a367f0d383b15b3db9c73',
++    'InstanceCheckpointOperationList': '1.1-833a632736c862175708703dba0e8e9e',
++    'InstanceCheckpointStep': '1.1-4d410c24789820813df06e5149911dfb',
++    'InstanceCheckpointStepList': '1.1-380130b03f40b317487ed802199130bb',
+     'Aggregate': '1.3-f315cb68906307ca2d1cca84d4753585',
+     'AggregateList': '1.3-3ea55a050354e72ef3306adefa553957',
+     'BlockDeviceMapping': '1.21-220abb8aa1450e759b72fce8ec6ff955',

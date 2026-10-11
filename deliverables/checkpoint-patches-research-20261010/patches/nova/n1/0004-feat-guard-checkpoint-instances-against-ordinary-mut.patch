@@ -1,0 +1,3798 @@
+From 7bcfe9a1c8b380e1f99c85e084c7e014f00628c4 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 10:43:32 +0300
+Subject: [PATCH 04/10] feat: guard checkpoint instances against ordinary
+ mutations
+
+---
+ doc/source/admin/instance-checkpoints.rst     | 101 +++
+ nova/api/openstack/compute/admin_actions.py   |  18 +-
+ nova/api/openstack/compute/server_shares.py   |   2 +
+ nova/checkpoints/contracts.py                 | 193 ++++--
+ nova/checkpoints/guards.py                    | 249 +++++++
+ nova/compute/api.py                           | 123 ++++
+ nova/compute/manager.py                       | 178 +++++
+ nova/compute/rpcapi.py                        |   4 +-
+ nova/conductor/manager.py                     |  16 +
+ nova/conductor/rpcapi.py                      |   4 +-
+ nova/conductor/tasks/cross_cell_migrate.py    |  22 +
+ nova/conductor/tasks/live_migrate.py          |   4 +
+ nova/conductor/tasks/migrate.py               |   4 +
+ nova/context.py                               |  27 +-
+ nova/db/main/api.py                           |  63 ++
+ nova/db/main/checkpoints.py                   | 455 ++++++++++++-
+ .../4a8c2d7e9101_add_instance_checkpoints.py  |   1 +
+ nova/db/main/models.py                        |   1 +
+ nova/objects/checkpoint.py                    |  26 +
+ nova/rpc.py                                   |  11 +-
+ nova/test.py                                  |  14 +
+ .../unit/checkpoints/test_guard_races.py      |  87 +++
+ nova/tests/unit/checkpoints/test_guards.py    | 641 ++++++++++++++++++
+ nova/tests/unit/compute/test_compute_mgr.py   |   3 +-
+ .../tasks/test_cross_cell_migrate.py          |   2 +-
+ nova/tests/unit/db/main/test_api.py           |   2 +
+ nova/tests/unit/objects/test_objects.py       |   4 +-
+ nova/tests/unit/test_rpc.py                   |   2 +-
+ 28 files changed, 2163 insertions(+), 94 deletions(-)
+ create mode 100644 doc/source/admin/instance-checkpoints.rst
+ create mode 100644 nova/checkpoints/guards.py
+ create mode 100644 nova/tests/unit/checkpoints/test_guard_races.py
+ create mode 100644 nova/tests/unit/checkpoints/test_guards.py
+
+diff --git a/doc/source/admin/instance-checkpoints.rst b/doc/source/admin/instance-checkpoints.rst
+new file mode 100644
+index 0000000..836c3d1
+--- /dev/null
++++ b/doc/source/admin/instance-checkpoints.rst
+@@ -0,0 +1,101 @@
++Instance checkpoint model (N1)
++==============================
++
++This private extension provides the journal, ownership and accounting model.
++It does not implement RAM capture or storage snapshots. The production executor
++is unsupported until the separately delivered N2 implementation is installed
++and validated for the intended storage. Fake executors belong to tests only.
++
++Ordinary operation barriers
++---------------------------
++
++The cell Instance row serializes checkpoint admission, ordinary claims and
++identity updates. SQL transactions end before RPC, driver or storage calls.
++Generation 1 has no takeover. Administrative reset, unlock, elapsed time and
++disabling checkpoint creation do not release an owner with an unknown result.
++
++With ``checkpoint.enabled=false`` and no live checkpoint or durable owner, the
++ordinary entrypoint retains its legacy context and does not create a claim.
++The option is not runtime mutable. Activation requires coordinated configuration
++of all writers and a live supported executor; a version number alone is not
++readiness evidence. Previously admitted work remains protected when disabled.
++
++.. list-table:: Entrypoint, first effect and persistent barrier
++   :header-rows: 1
++   :widths: 30 30 40
++
++   * - Entrypoint
++     - First effect
++     - Barrier
++   * - Compute API delete/soft-delete/force-delete/restore; rebuild,
++       resize/confirm/revert, live migration/abort/force-complete,
++       evacuate, shelve/offload/unshelve
++     - Quota, placement, storage/network preparation or task dispatch
++     - Ordinary claim before method body and validation callbacks. Live
++       checkpoints reject topology changes. Existing pending task states remain
++       additional admission barriers.
++   * - Compute API start/stop/reboot, pause/unpause, suspend/resume,
++       image snapshot/backup, crash dump, lock/unlock, network-info injection
++     - State update, Glance image creation or compute RPC
++     - Ordinary claim; these actions can run between checkpoints but cannot
++       overlap an active checkpoint operation. Nested power scopes cannot
++       authorize an attach or another topology operation.
++   * - Volume attach/detach/swap; interface attach/detach; runtime SSH key;
++       allow/deny share; set-admin-password
++     - Attachment creation, reservation, port operation, key CAS or RPC
++     - API claim before external I/O. All device changes remain forbidden while
++       a checkpoint is retained. Key CAS retains its existing optimistic test.
++   * - Server shares controller create/delete
++     - Manila query, ShareMapping write, allow/deny RPC
++     - Guard check before Manila; ShareMapping write joins the Instance lock.
++       A newly created mapping changes the admission fingerprint. The compute
++       API claims before allow/deny effects and hands ownership to compute.
++   * - Cinder volume-snapshot callbacks
++     - Compute snapshot RPC
++     - Claim after BDM/Instance lookup, before dispatch; the worker repeats the
++       check. Partial disk selection is not a checkpoint interface.
++   * - Admin reset-state
++     - InstanceAction and Instance save
++     - Ordinary claim after authorization; active checkpoint/ordinary owners
++       deny the reset. Reset does not clear journal ownership.
++   * - Compute mutation handlers
++     - Driver, attachment, interface, share or migration I/O
++     - Old RPC without a scope acquires before I/O. New asynchronous RPC adopts
++       its queued endpoint/host exactly once and rotates the token. A duplicate
++       delivery cannot adopt a running or completed claim.
++   * - Conductor migrate/rebuild/unshelve and cross-cell confirm/revert
++     - Placement, scheduler, network/storage preparation or compute RPC
++     - Cell targeting precedes ownership. Nested migration tasks cover both
++       execution and rollback. Source and destination cells use separate local
++       scopes; source ownership is never valid in the destination cell.
++   * - Compute live-migration queue
++     - Thread-pool submission, then migration driver
++     - Explicit handoff to ``_do_live_migration`` before submission; the worker
++       adopts before effects. Submission failure retains the queued claim.
++   * - Cell DB Instance/BDM/VIF/ShareMapping/InstanceExtra/info-cache writers
++     - SQL mutation
++     - Same writer transaction locks Instance first. Matching durable scope is
++       required for state changes under ownership; topology cannot change while
++       checkpoints exist. Network status/IP observations and ordinary metadata
++       remain current. Device serial, bus/type/format and related disk properties
++       participate in identity protection.
++
++Only compute and compute-task RPC clients carry the call/cast ownership
++protocol. Synchronous calls borrow the caller's held claim; asynchronous casts
++hand it off. OVO remoting retains its existing conductor protocol and validates
++the internal scope at each DB mutation. Nested OVO arguments use the same scope.
++Scopes are never accepted from HTTP headers or request bodies and are stripped
++from notification contexts. Possession of a scope still requires its current
++cell record, token, action and generation to match. Checkpoint writes additionally
++require a matching claimed phase; only runtime state or reconnection bookkeeping
++is writable, never the protected device identity.
++
++Ordinary failures after acquisition retain the claim for investigation. N1
++provides no automatic unlock or ordinary-worker takeover. Cross-cell workflows
++retain their native pending/resize states and API mapping protocol in addition
++to local claims; a copied Instance row is not a transferable checkpoint owner.
++Runtime proof against real RPC, hypervisor, Neutron and SAN is separate from
++unit SQL/serializer evidence.
++
++The remaining API, recovery and deployment sections are completed with the
++N1 integration and delivery tasks.
+diff --git a/nova/api/openstack/compute/admin_actions.py b/nova/api/openstack/compute/admin_actions.py
+index bbeff22..a2312f8 100644
+--- a/nova/api/openstack/compute/admin_actions.py
++++ b/nova/api/openstack/compute/admin_actions.py
+@@ -18,6 +18,7 @@ from nova.api.openstack import common
+ from nova.api.openstack.compute.schemas import admin_actions as schema
+ from nova.api.openstack import wsgi
+ from nova.api import validation
++from nova.checkpoints import guards
+ from nova.compute import api as compute
+ from nova.compute import instance_actions
+ from nova.compute import vm_states
+@@ -62,7 +63,7 @@ class AdminActionsController(wsgi.Controller):
+             raise exc.HTTPConflict(explanation=e.format_message())
+ 
+     @wsgi.response(202)
+-    @wsgi.expected_errors(404)
++    @wsgi.expected_errors((404, 409))
+     @wsgi.action('os-resetState')
+     @validation.schema(schema.reset_state)
+     @validation.response_body_schema(schema.reset_state_response)
+@@ -73,15 +74,18 @@ class AdminActionsController(wsgi.Controller):
+         context.can(aa_policies.POLICY_ROOT % 'reset_state',
+                     target={'project_id': instance.project_id})
+ 
+-        # Log os-resetState as an instance action
+-        instance_action = objects.InstanceAction.action_start(
+-            context, instance.uuid, instance_actions.RESET_STATE)
+-
+-        # Identify the desired state from the body
+         state = {
+             'active': vm_states.ACTIVE,
+             'error': vm_states.ERROR,
+-        }[body["os-resetState"]["state"]]
++        }[body['os-resetState']['state']]
++        self._reset_instance_state(context, instance, state)
++
++    @guards.entrypoint('reset')
++    def _reset_instance_state(self, context, instance, state):
++
++        # Log os-resetState as an instance action
++        instance_action = objects.InstanceAction.action_start(
++            context, instance.uuid, instance_actions.RESET_STATE)
+ 
+         instance.vm_state = state
+         instance.task_state = None
+diff --git a/nova/api/openstack/compute/server_shares.py b/nova/api/openstack/compute/server_shares.py
+index f054623..38da18a 100644
+--- a/nova/api/openstack/compute/server_shares.py
++++ b/nova/api/openstack/compute/server_shares.py
+@@ -20,6 +20,7 @@ from nova.api.openstack.compute.schemas import server_shares as schema
+ from nova.api.openstack.compute.views import server_shares
+ from nova.api.openstack import wsgi
+ from nova.api import validation
++from nova.checkpoints import guards
+ from nova.compute import api as compute
+ from nova.compute import vm_states
+ from nova import context as nova_context
+@@ -52,6 +53,7 @@ class ServerSharesController(wsgi.Controller):
+ 
+     def _check_instance_in_valid_state(self, context, server_id, action):
+         instance = self._get_instance_from_server_uuid(context, server_id)
++        guards.check(context, instance.uuid, 'share')
+         if (
+             (action == "create share" and
+              instance.vm_state not in vm_states.STOPPED) or
+diff --git a/nova/checkpoints/contracts.py b/nova/checkpoints/contracts.py
+index f4293a5..5e96cdb 100644
+--- a/nova/checkpoints/contracts.py
++++ b/nova/checkpoints/contracts.py
+@@ -27,20 +27,57 @@ from oslo_serialization import jsonutils
+ 
+ from nova.checkpoints import workflow
+ 
+-MAX_BYTES = 2 ** 63 - 1
++MAX_BYTES = 2**63 - 1
+ PROFILE = 'kvm-bios-same-host-v1'
+-REASONS = frozenset({
+-    'disabled', 'executor_unsupported', 'invalid_executor_result',
+-    'executor_unavailable', 'executor_rejected', 'incompatible_service',
+-    'unsupported_profile', 'quota_exceeded', 'guard_busy', 'identity_changed',
+-    'invalid_state', 'operation_conflict', 'recovery_required',
+-    'cell_unavailable', 'admission_cancelled', 'resources_remaining',
+-})
++ORDINARY_NON_TOPOLOGY = frozenset(
++    (
++        'start',
++        'stop',
++        'reboot',
++        'pause',
++        'unpause',
++        'suspend',
++        'resume',
++        'snapshot',
++        'backup',
++        'trigger_crash_dump',
++        'lock',
++        'unlock',
++        'reset',
++        'inject_network_info',
++        'power_sync',
++        'quiesce',
++        'unquiesce',
++    )
++)
++REASONS = frozenset(
++    {
++        'disabled',
++        'executor_unsupported',
++        'invalid_executor_result',
++        'executor_unavailable',
++        'executor_rejected',
++        'incompatible_service',
++        'unsupported_profile',
++        'quota_exceeded',
++        'guard_busy',
++        'identity_changed',
++        'invalid_state',
++        'operation_conflict',
++        'recovery_required',
++        'cell_unavailable',
++        'admission_cancelled',
++        'resources_remaining',
++    }
++)
+ 
+ 
+ def reason_code(value):
+-    return value if type(value) is str and value in REASONS else (
+-        'invalid_executor_result')
++    return (
++        value
++        if type(value) is str and value in REASONS
++        else ('invalid_executor_result')
++    )
+ 
+ 
+ def _require(condition):
+@@ -83,8 +120,9 @@ def _json(value, depth=0):
+ 
+ def _freeze(value):
+     if isinstance(value, Mapping):
+-        return MappingProxyType({key: _freeze(item)
+-                                 for key, item in value.items()})
++        return MappingProxyType(
++            {key: _freeze(item) for key, item in value.items()}
++        )
+     if type(value) in (list, tuple):
+         return tuple(_freeze(item) for item in value)
+     return value
+@@ -93,8 +131,12 @@ def _freeze(value):
+ def canonical_payload_hash(payload):
+     _require(isinstance(payload, Mapping))
+     encoded = jsonutils.dumps(
+-        _json(payload), sort_keys=True, separators=(',', ':'),
+-        ensure_ascii=True, allow_nan=False).encode('ascii')
++        _json(payload),
++        sort_keys=True,
++        separators=(',', ':'),
++        ensure_ascii=True,
++        allow_nan=False,
++    ).encode('ascii')
+     return hashlib.sha256(encoded).hexdigest()
+ 
+ 
+@@ -117,9 +159,18 @@ def device_projection(manifest):
+     from an unfiltered Glance/Instance metadata or connection_info dictionary.
+     """
+     _require(isinstance(manifest, Mapping))
+-    required = ('instance_uuid', 'host', 'node', 'flavor', 'image_properties',
+-                'config_drive', 'disks', 'ports', 'shares',
+-                'runtime_key_fingerprints')
++    required = (
++        'instance_uuid',
++        'host',
++        'node',
++        'flavor',
++        'image_properties',
++        'config_drive',
++        'disks',
++        'ports',
++        'shares',
++        'runtime_key_fingerprints',
++    )
+     _require(all(key in manifest for key in required))
+     result = {key: _json(manifest[key]) for key in required}
+     _uuid(result['instance_uuid'])
+@@ -135,6 +186,9 @@ def device_projection(manifest):
+         for item in result[kind]:
+             _require(isinstance(item, dict) and all(k in item for k in keys))
+             projected.append({key: item[key] for key in keys})
++            if kind == 'disks' and 'device_properties' in item:
++                _require(isinstance(item['device_properties'], dict))
++                projected[-1]['device_properties'] = item['device_properties']
+         _ids([item['uuid'] for item in projected], nonempty=kind == 'disks')
+         result[kind] = sorted(projected, key=lambda item: item['uuid'])
+     _ids([item['volume_id'] for item in result['disks']], nonempty=True)
+@@ -151,8 +205,9 @@ def device_projection(manifest):
+     _require(type(result['runtime_key_fingerprints']) is list)
+     for key in result['runtime_key_fingerprints']:
+         _string(key)
+-    result['runtime_key_fingerprints'] = sorted(set(
+-        result['runtime_key_fingerprints']))
++    result['runtime_key_fingerprints'] = sorted(
++        set(result['runtime_key_fingerprints'])
++    )
+     return result
+ 
+ 
+@@ -173,9 +228,11 @@ class _Contract:
+         value = {'schema_version': 1}
+         for field in dataclasses.fields(self):
+             item = getattr(self, field.name)
+-            value[field.name] = (item.to_primitive()
+-                                 if isinstance(item, _Contract)
+-                                 else _json(item))
++            value[field.name] = (
++                item.to_primitive()
++                if isinstance(item, _Contract)
++                else _json(item)
++            )
+         return value
+ 
+     @classmethod
+@@ -231,8 +288,9 @@ class Admission(_Contract):
+         _integer(self.artifact_upper_bound, minimum=1)
+         _digest(self.fingerprint)
+         _require(self.fingerprint == device_fingerprint(self.device_manifest))
+-        _require(self.key.instance_uuid ==
+-                 self.device_manifest['instance_uuid'])
++        _require(
++            self.key.instance_uuid == self.device_manifest['instance_uuid']
++        )
+         _require(self.host == self.device_manifest['host'])
+         _require(self.node == self.device_manifest['node'])
+ 
+@@ -251,23 +309,31 @@ class Probe(_Contract):
+     def _validate(self):
+         _require(type(self.supported) is bool)
+         _require(type(self.reasons) is tuple)
+-        _require(all(type(code) is str and code in REASONS
+-                     for code in self.reasons))
++        _require(
++            all(type(code) is str and code in REASONS for code in self.reasons)
++        )
+         _integer(self.contract_version, minimum=1, maximum=1)
+         if self.supported:
+             _require(not self.reasons)
+             _string(self.executor_id)
+             _require(self.executor_profile == PROFILE)
+             _digest(self.fingerprint)
+-            _require(self.fingerprint == device_fingerprint(
+-                self.device_manifest))
++            _require(
++                self.fingerprint == device_fingerprint(self.device_manifest)
++            )
+             _integer(self.artifact_upper_bound, minimum=1)
+         else:
+             _require(bool(self.reasons))
+-            _require(self.executor_id == self.executor_profile ==
+-                     self.fingerprint == '')
+-            _require(isinstance(self.device_manifest, Mapping) and
+-                     not self.device_manifest)
++            _require(
++                self.executor_id ==
++                self.executor_profile ==
++                self.fingerprint ==
++                ''
++            )
++            _require(
++                isinstance(self.device_manifest, Mapping) and
++                not self.device_manifest
++            )
+             _integer(self.artifact_upper_bound, maximum=0)
+ 
+ 
+@@ -327,11 +393,15 @@ class StepResult(_Contract):
+     error_code: str | None
+ 
+     def _validate(self):
+-        _require(self.status in ('pending', 'succeeded', 'failed_no_effect',
+-                                 'unknown'))
++        _require(
++            self.status
++            in ('pending', 'succeeded', 'failed_no_effect', 'unknown')
++        )
+         _require(isinstance(self.evidence, Mapping))
+-        _require(self.error_code is None or
+-                 (type(self.error_code) is str and self.error_code in REASONS))
++        _require(
++            self.error_code is None or
++            (type(self.error_code) is str and self.error_code in REASONS)
++        )
+         if self.status == 'succeeded':
+             _require(self.error_code is None)
+ 
+@@ -346,8 +416,12 @@ class CloseProof(_Contract):
+     proof_version: int = 1
+ 
+     def _validate(self):
+-        for value in (self.create_operation_id, self.closing_operation_id,
+-                      self.checkpoint_id, self.cell_uuid):
++        for value in (
++            self.create_operation_id,
++            self.closing_operation_id,
++            self.checkpoint_id,
++            self.cell_uuid,
++        ):
+             _uuid(value)
+         _integer(self.proof_version, minimum=1, maximum=1)
+         _require(self.kind in ('admission_cancelled', 'resources_deleted'))
+@@ -363,8 +437,9 @@ def _artifacts(items):
+         ids.append(item['id'])
+         _require(item['kind'] in ('ram', 'runtime', 'config'))
+         _string(item['logical_id'])
+-        _require('/' not in item['logical_id'] and
+-                 '\\' not in item['logical_id'])
++        _require(
++            '/' not in item['logical_id'] and '\\' not in item['logical_id']
++        )
+         _digest(item['checksum'])
+         _integer(item['bytes'], minimum=1)
+     _ids(ids, nonempty=True)
+@@ -402,30 +477,44 @@ def _success_evidence(phase, evidence):
+         _keys(evidence, ('writes_stopped', 'power_state'))
+         _require(evidence['writes_stopped'] is True)
+         _require(evidence['power_state'] == 'SHUTOFF')
+-    elif phase in ('runtime_restore_current', 'runtime_restore_checkpoint',
+-                    'cleanup_runtime_restore_current'):
++    elif phase in (
++        'runtime_restore_current',
++        'runtime_restore_checkpoint',
++        'cleanup_runtime_restore_current',
++    ):
+         _keys(evidence, ('fingerprint', 'power_state'))
+         _digest(evidence['fingerprint'])
+         _require(evidence['power_state'] == 'RUNNING')
+-    elif phase in ('disk_snapshot', 'disk_revert', 'disk_snapshot_delete',
+-                    'cleanup_disk_snapshots'):
++    elif phase in (
++        'disk_snapshot',
++        'disk_revert',
++        'disk_snapshot_delete',
++        'cleanup_disk_snapshots',
++    ):
+         _keys(evidence, ('volume_ids', 'snapshots'))
+         _require(type(evidence['snapshots']) in (tuple, list))
+         status = {'disk_snapshot': 'available', 'disk_revert': 'reverted'}.get(
+-            phase, 'deleted')
++            phase, 'deleted'
++        )
+         volumes, snapshots = [], []
+         for item in evidence['snapshots']:
+             _keys(item, ('volume_id', 'snapshot_id', 'status'))
+             _require(item['status'] == status)
+             volumes.append(item['volume_id'])
+             snapshots.append(item['snapshot_id'])
+-        _same_ids(evidence['volume_ids'], volumes,
+-                  nonempty=phase != 'cleanup_disk_snapshots')
++        _same_ids(
++            evidence['volume_ids'],
++            volumes,
++            nonempty=phase != 'cleanup_disk_snapshots',
++        )
+         _ids(snapshots)
+     elif phase == 'volume_disconnect':
+         _keys(evidence, ('volume_ids', 'disconnected_volume_ids'))
+-        _same_ids(evidence['volume_ids'], evidence['disconnected_volume_ids'],
+-                  nonempty=True)
++        _same_ids(
++            evidence['volume_ids'],
++            evidence['disconnected_volume_ids'],
++            nonempty=True,
++        )
+     elif phase == 'volume_reconnect':
+         _keys(evidence, ('volume_ids', 'port_ids', 'attachments'))
+         _ids(evidence['port_ids'])
+@@ -456,8 +545,10 @@ def validate_result(phase, value):
+             _success_evidence(phase, result.evidence)
+         elif result.status == 'failed_no_effect':
+             _keys(result.evidence, ('no_effect', 'late_effect_impossible'))
+-            _require(result.evidence['no_effect'] is True and
+-                     result.evidence['late_effect_impossible'] is True)
++            _require(
++                result.evidence['no_effect'] is True and
++                result.evidence['late_effect_impossible'] is True
++            )
+             _require(result.error_code is not None)
+         else:
+             _keys(result.evidence, ())
+diff --git a/nova/checkpoints/guards.py b/nova/checkpoints/guards.py
+new file mode 100644
+index 0000000..0a15bcc
+--- /dev/null
++++ b/nova/checkpoints/guards.py
+@@ -0,0 +1,249 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Durable ordinary ownership through OVO; safe on nova-compute without SQL."""
++
++import contextlib
++import copy
++import functools
++
++from nova.checkpoints import contracts
++from nova import exception
++from nova import objects
++
++
++def check(context, instance_uuid, action):
++    objects.InstanceCheckpointGuard.check(context, instance_uuid, action)
++
++
++@contextlib.contextmanager
++def scope(context, value):
++    if not isinstance(value, contracts.Scope):
++        value = contracts.Scope.from_primitive(value)
++    ctx = copy.copy(context)
++    ctx.checkpoint_scope = value.to_primitive()
++    ctx.checkpoint_scope_cell_uuid = context.cell_uuid or getattr(
++        context, 'checkpoint_scope_cell_uuid', None
++    )
++    check(ctx, value.instance_uuid, value.action)
++    yield ctx
++
++
++@contextlib.contextmanager
++def worker(context, instance_uuid, action, target=None):
++    """Acquire before I/O. Exceptions retain ownership until investigated.
++
++    Local nesting is reentrant. The local marker is not serialized:
++    an RPC consumer must atomically adopt a queued claim and rotate its token.
++    OVO persistence needs only the durable scope, not that local marker.
++    """
++    existing = getattr(context, 'checkpoint_scope', None)
++    if existing and (
++        existing['action'] in contracts.ORDINARY_NON_TOPOLOGY and
++        action not in contracts.ORDINARY_NON_TOPOLOGY
++    ):
++        raise exception.CheckpointConflict(reason='identity_changed')
++    if existing and getattr(context, '_checkpoint_local_scope', None) == (
++        existing['token']
++    ):
++        check(context, instance_uuid, existing['action'])
++        yield context
++        return
++    if existing and getattr(context, 'checkpoint_borrowed_target', None):
++        if context.checkpoint_borrowed_target != target:
++            raise exception.CheckpointConflict(reason='guard_busy')
++        with scope(context, existing) as ctx:
++            ctx._checkpoint_local_scope = existing['token']
++            ctx._checkpoint_handed_off = False
++            yield ctx
++        return
++    if existing:
++        if target is None:
++            raise exception.CheckpointConflict(reason='guard_busy')
++        value = objects.InstanceCheckpointGuard.adopt(
++            context, existing, target
++        )
++    else:
++        value = objects.InstanceCheckpointGuard.acquire(
++            context, instance_uuid, action
++        )
++    if value is None:
++        # Legacy cleanup of an already absent Instance has no admissible
++        # checkpoint. An existing guard is never bypassed this way.
++        yield context
++        return
++    with scope(context, value) as ctx:
++        ctx._checkpoint_local_scope = value['token']
++        ctx._checkpoint_handed_off = False
++        yield ctx
++        if not ctx._checkpoint_handed_off:
++            objects.InstanceCheckpointGuard.release(ctx, value)
++
++
++def handoff(context, target):
++    if not getattr(context, 'checkpoint_scope', None):
++        return context
++    value = objects.InstanceCheckpointGuard.handoff(
++        context, context.checkpoint_scope, target
++    )
++    context._checkpoint_handed_off = True
++    outgoing = copy.copy(context)
++    outgoing.checkpoint_scope = value
++    outgoing.checkpoint_borrowed_target = None
++    outgoing._checkpoint_local_scope = None
++    return outgoing
++
++
++@contextlib.contextmanager
++def _bound_objects(value, context):
++    saved = {}
++
++    def bind(item):
++        if id(item) in saved:
++            return
++        if isinstance(item, objects.base.NovaObject):
++            saved[id(item)] = (item, item._context)
++            item._context = context
++            for field in item.fields:
++                if item.obj_attr_is_set(field):
++                    bind(getattr(item, field))
++        elif isinstance(item, dict):
++            for child in item.values():
++                bind(child)
++        elif isinstance(item, (list, tuple)):
++            for child in item:
++                bind(child)
++
++    bind(value)
++    try:
++        yield
++    finally:
++        for item, original in saved.values():
++            if item._context is context:
++                item._context = original
++
++
++def entrypoint(action, service='api', instance_arg=1):
++    """Bind both explicit context and nested OVO saves to the same claim."""
++
++    def decorate(function):
++        @functools.wraps(function)
++        def wrapped(self, *args, **kwargs):
++            positional = list(args)
++            name = 'context' if 'context' in kwargs else 'ctxt'
++            ctx = positional[0] if positional else kwargs[name]
++            instance = (
++                kwargs['instance']
++                if 'instance' in kwargs
++                else positional[instance_arg]
++            )
++            instance_uuid = (
++                instance['uuid']
++                if isinstance(instance, dict)
++                else instance.uuid
++            )
++            target = '%s:%s:%s' % (
++                service,
++                function.__name__,
++                getattr(self, 'host', '*') if service == 'compute' else '*',
++            )
++            with worker(ctx, instance_uuid, action, target=target) as owned:
++                if positional:
++                    positional[0] = owned
++                else:
++                    kwargs[name] = owned
++                with _bound_objects((positional, kwargs), owned):
++                    return function(self, *positional, **kwargs)
++
++        return wrapped
++
++    return decorate
++
++
++def run_task(task, execute, action):
++    """Cover TaskBase execution and rollback with the same durable owner."""
++    previous = task.context
++    with worker(previous, task.instance.uuid, action) as ctx:
++        task.context = ctx
++        try:
++            with _bound_objects(task.instance, ctx):
++                return execute()
++        finally:
++            task.context = previous
++
++
++class RPCClient:
++    """Propagate ownership at the actual RPC call or cast.
++
++    A synchronous nested call borrows its caller's still-held claim. A cast
++    transfers it to one queued consumer; a lost response keeps the claim.
++    Object-conductor RPC is never wrapped and keeps its normal OVO remoting.
++    """
++
++    def __init__(self, client, service, server='*'):
++        self._client = client
++        self._service = service
++        self._server = server
++
++    def __getattr__(self, name):
++        return getattr(self._client, name)
++
++    def prepare(self, **kwargs):
++        return RPCClient(
++            self._client.prepare(**kwargs),
++            self._service,
++            kwargs.get('server', self._server),
++        )
++
++    def _context(self, context, method, transfer):
++        if not getattr(context, 'checkpoint_scope', None):
++            return context
++        target = '%s:%s:%s' % (self._service, method, self._server)
++        if transfer:
++            return handoff(context, target)
++        borrowed = copy.copy(context)
++        borrowed.checkpoint_borrowed_target = target
++        borrowed._checkpoint_local_scope = None
++        return borrowed
++
++    def call(self, context, method, **kwargs):
++        result = self._client.call(
++            self._context(context, method, False), method, **kwargs
++        )
++        value = getattr(context, 'checkpoint_scope', None)
++        if value:
++            guard = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++                context, value['instance_uuid']
++            )
++            if (
++                guard is None or
++                guard.ordinary_token != value['token'] or
++                guard.ordinary_state != 'running'
++            ):
++                context._checkpoint_handed_off = True
++        return result
++
++    def cast(self, context, method, **kwargs):
++        return self._client.cast(
++            self._context(context, method, True), method, **kwargs
++        )
++
++
++class RPCRouter:
++    def __init__(self, router):
++        self._router = router
++
++    def client(self, context):
++        return RPCClient(self._router.client(context), 'compute')
++
++    def __getattr__(self, name):
++        return getattr(self._router, name)
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index e43c57e..8ab4622 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -40,6 +40,7 @@ from oslo_utils import uuidutils
+ from nova.accelerator import cyborg
+ from nova import availability_zones
+ from nova import block_device
++from nova.checkpoints import guards
+ from nova.compute import flavors
+ from nova.compute import instance_actions
+ from nova.compute import instance_list
+@@ -2735,6 +2736,9 @@ class API:
+         self._update_queued_for_deletion(context, instance.uuid, True)
+ 
+     # NOTE(maoy): we allow delete to be called no matter what vm_state says.
++    @guards.entrypoint(
++        'soft_delete',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=None, task_state=None,
+                           must_have_launched=True)
+@@ -2751,6 +2755,9 @@ class API:
+         self._delete(context, instance, 'delete', self._do_delete,
+                      task_state=task_states.DELETING)
+ 
++    @guards.entrypoint(
++        'delete',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=None, task_state=None,
+                           must_have_launched=False)
+@@ -2759,6 +2766,9 @@ class API:
+         LOG.debug("Going to try to terminate instance", instance=instance)
+         self._delete_instance(context, instance)
+ 
++    @guards.entrypoint(
++        'restore',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.SOFT_DELETED])
+     def restore(self, context, instance):
+@@ -2790,6 +2800,9 @@ class API:
+             instance.save(expected_task_state=[None])
+         self._update_queued_for_deletion(context, instance.uuid, False)
+ 
++    @guards.entrypoint(
++        'force_delete',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(task_state=None,
+                           must_have_launched=False)
+@@ -2810,6 +2823,9 @@ class API:
+         self.compute_rpcapi.stop_instance(context, instance, do_cast=do_cast,
+                                           clean_shutdown=clean_shutdown)
+ 
++    @guards.entrypoint(
++        'stop',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_host()
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.ERROR])
+@@ -2817,6 +2833,9 @@ class API:
+         """Stop an instance."""
+         self.force_stop(context, instance, do_cast, clean_shutdown)
+ 
++    @guards.entrypoint(
++        'start',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_host()
+     @check_instance_state(vm_state=[vm_states.STOPPED])
+@@ -2830,6 +2849,9 @@ class API:
+         self._record_action_start(context, instance, instance_actions.START)
+         self.compute_rpcapi.start_instance(context, instance)
+ 
++    @guards.entrypoint(
++        'trigger_crash_dump',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_host()
+     @check_instance_state(vm_state=vm_states.ALLOW_TRIGGER_CRASH_DUMP)
+@@ -3344,6 +3366,9 @@ class API:
+ 
+     # NOTE(melwitt): We don't check instance lock for backup because lock is
+     #                intended to prevent accidental change/delete of instances
++    @guards.entrypoint(
++        'backup',
++        service='api', instance_arg=1)
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
+                                     vm_states.PAUSED, vm_states.SUSPENDED])
+     def backup(self, context, instance, name, backup_type, rotation,
+@@ -3385,6 +3410,9 @@ class API:
+ 
+     # NOTE(melwitt): We don't check instance lock for snapshot because lock is
+     #                intended to prevent accidental change/delete of instances
++    @guards.entrypoint(
++        'snapshot',
++        service='api', instance_arg=1)
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
+                                     vm_states.PAUSED, vm_states.SUSPENDED])
+     def snapshot(self, context, instance, name, extra_properties=None):
+@@ -3442,6 +3470,9 @@ class API:
+ 
+     # NOTE(melwitt): We don't check instance lock for snapshot because lock is
+     #                intended to prevent accidental change/delete of instances
++    @guards.entrypoint(
++        'snapshot',
++        service='api', instance_arg=1)
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
+                                     vm_states.PAUSED, vm_states.SUSPENDED])
+     def snapshot_volume_backed(self, context, instance, name,
+@@ -3583,6 +3614,9 @@ class API:
+ 
+         return self.image_api.create(context, image_meta)
+ 
++    @guards.entrypoint(
++        'reboot',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     def reboot(self, context, instance, reboot_type):
+         """Reboot the given instance."""
+@@ -3622,6 +3656,9 @@ class API:
+             if img_arch:
+                 fields_obj.Architecture.canonicalize(img_arch)
+ 
++    @guards.entrypoint(
++        'rebuild',
++        service='api', instance_arg=1)
+     @block_shares_not_supported()
+     @reject_vtpm_instances(instance_actions.REBUILD)
+     @block_accelerators(until_service=SUPPORT_ACCELERATOR_SERVICE_FOR_REBUILD)
+@@ -3944,6 +3981,9 @@ class API:
+                                                  used=useds,
+                                                  allowed=total_alloweds)
+ 
++    @guards.entrypoint(
++        'revert_resize',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.RESIZED])
+     def revert_resize(self, context, instance):
+@@ -4055,6 +4095,9 @@ class API:
+         return objects.Service.get_by_compute_host(
+             context, migration.source_compute)
+ 
++    @guards.entrypoint(
++        'confirm_resize',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.RESIZED])
+     def confirm_resize(self, context, instance, migration=None):
+@@ -4194,6 +4237,9 @@ class API:
+ 
+         return node
+ 
++    @guards.entrypoint(
++        'resize',
++        service='api', instance_arg=1)
+     @block_shares_not_supported()
+     # TODO(stephenfin): This logic would be so much easier to grok if we
+     # finally split resize and cold migration into separate code paths
+@@ -4447,6 +4493,9 @@ class API:
+             allow_same_host = CONF.allow_resize_to_same_host
+         return allow_same_host
+ 
++    @guards.entrypoint(
++        'shelve',
++        service='api', instance_arg=1)
+     @block_shares_not_supported()
+     @block_port_accelerators()
+     @reject_vtpm_instances(instance_actions.SHELVE)
+@@ -4490,6 +4539,9 @@ class API:
+                 context, instance=instance, clean_shutdown=clean_shutdown,
+                 accel_uuids=accel_uuids)
+ 
++    @guards.entrypoint(
++        'shelve_offload',
++        service='api', instance_arg=1)
+     @block_port_accelerators()
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.SHELVED])
+@@ -4610,6 +4662,9 @@ class API:
+             context, context.project_id, instance.flavor, request_spec.is_bfv,
+             0, 0, delta_updates={'servers': 0})
+ 
++    @guards.entrypoint(
++        'unshelve',
++        service='api', instance_arg=1)
+     @block_extended_resource_request
+     @check_instance_lock
+     @check_instance_state(
+@@ -4732,6 +4787,9 @@ class API:
+         self.compute_rpcapi.remove_fixed_ip_from_instance(context,
+                 instance=instance, address=address)
+ 
++    @guards.entrypoint(
++        'pause',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE])
+     def pause(self, context, instance):
+@@ -4741,6 +4799,9 @@ class API:
+         self._record_action_start(context, instance, instance_actions.PAUSE)
+         self.compute_rpcapi.pause_instance(context, instance)
+ 
++    @guards.entrypoint(
++        'unpause',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.PAUSED])
+     def unpause(self, context, instance):
+@@ -4761,6 +4822,9 @@ class API:
+         return self.compute_rpcapi.get_instance_diagnostics(context,
+                                                             instance=instance)
+ 
++    @guards.entrypoint(
++        'suspend',
++        service='api', instance_arg=1)
+     @block_shares_not_supported()
+     @block_port_accelerators()
+     @reject_vdpa_instances(
+@@ -4777,6 +4841,9 @@ class API:
+         self._record_action_start(context, instance, instance_actions.SUSPEND)
+         self.compute_rpcapi.suspend_instance(context, instance)
+ 
++    @guards.entrypoint(
++        'resume',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @reject_vdpa_instances(
+         instance_actions.RESUME, until=MIN_COMPUTE_VDPA_HOTPLUG_LIVE_MIGRATION
+@@ -4789,6 +4856,9 @@ class API:
+         self._record_action_start(context, instance, instance_actions.RESUME)
+         self.compute_rpcapi.resume_instance(context, instance)
+ 
++    @guards.entrypoint(
++        'rescue',
++        service='api', instance_arg=1)
+     @reject_vtpm_instances(instance_actions.RESCUE)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
+@@ -4855,6 +4925,9 @@ class API:
+             rescue_password=rescue_password, rescue_image_ref=rescue_image_ref,
+             clean_shutdown=clean_shutdown)
+ 
++    @guards.entrypoint(
++        'unrescue',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.RESCUED])
+     def unrescue(self, context, instance):
+@@ -4866,6 +4939,9 @@ class API:
+ 
+         self.compute_rpcapi.unrescue_instance(context, instance=instance)
+ 
++    @guards.entrypoint(
++        'set_admin_password',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE])
+     def set_admin_password(self, context, instance, password):
+@@ -4927,6 +5003,9 @@ class API:
+         return self.compute_rpcapi.get_console_output(context,
+                 instance=instance, tail_length=tail_length)
+ 
++    @guards.entrypoint(
++        'lock',
++        service='api', instance_arg=1)
+     def lock(self, context, instance, reason=None):
+         """Lock the given instance."""
+         # Only update the lock if we are an admin (non-owner)
+@@ -4961,6 +5040,9 @@ class API:
+             return False
+         return True
+ 
++    @guards.entrypoint(
++        'unlock',
++        service='api', instance_arg=1)
+     def unlock(self, context, instance):
+         """Unlock the given instance."""
+         context = context.elevated()
+@@ -4981,6 +5063,9 @@ class API:
+             action=fields_obj.NotificationAction.UNLOCK,
+             source=fields_obj.NotificationSource.API)
+ 
++    @guards.entrypoint(
++        'inject_network_info',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     def inject_network_info(self, context, instance):
+         """Inject network info for the instance."""
+@@ -5200,6 +5285,9 @@ class API:
+ 
+         return volume_bdm.device_name
+ 
++    @guards.entrypoint(
++        'attach_volume',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
+                                     vm_states.STOPPED, vm_states.RESIZED,
+@@ -5301,6 +5389,9 @@ class API:
+         self.compute_rpcapi.detach_volume(context, instance=instance,
+                 volume_id=volume['id'], attachment_id=attachment_id)
+ 
++    @guards.entrypoint(
++        'detach_volume',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
+                                     vm_states.STOPPED, vm_states.RESIZED,
+@@ -5356,6 +5447,9 @@ class API:
+ 
+         return count
+ 
++    @guards.entrypoint(
++        'swap_volume',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
+                                     vm_states.RESIZED])
+@@ -5465,6 +5559,9 @@ class API:
+                     raise exception.AttachInterfaceWithQoSPolicyNotSupported(
+                         instance_uuid=instance.uuid)
+ 
++    @guards.entrypoint(
++        'attach_interface',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @reject_vdpa_instances(
+         instance_actions.ATTACH_INTERFACE, until=MIN_COMPUTE_VDPA_ATTACH_DETACH
+@@ -5503,6 +5600,9 @@ class API:
+             instance=instance, network_id=network_id, port_id=port_id,
+             requested_ip=requested_ip, tag=tag)
+ 
++    @guards.entrypoint(
++        'detach_interface',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @reject_vdpa_instances(
+         instance_actions.DETACH_INTERFACE, until=MIN_COMPUTE_VDPA_ATTACH_DETACH
+@@ -5563,6 +5663,9 @@ class API:
+ 
+         return _metadata
+ 
++    @guards.entrypoint(
++        'live_migrate',
++        service='api', instance_arg=1)
+     @block_shares_not_supported()
+     @block_extended_resource_request
+     @block_port_accelerators()
+@@ -5627,6 +5730,9 @@ class API:
+                                                           instance,
+                                                           messaging_timeout)
+ 
++    @guards.entrypoint(
++        'live_migrate_force_complete',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE],
+                           task_state=[task_states.MIGRATING])
+@@ -5658,6 +5764,9 @@ class API:
+         self.compute_rpcapi.live_migration_force_complete(
+             context, instance, migration)
+ 
++    @guards.entrypoint(
++        'live_migrate_abort',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(task_state=[task_states.MIGRATING])
+     def live_migrate_abort(self, context, instance, migration_id,
+@@ -5701,6 +5810,9 @@ class API:
+         self.compute_rpcapi.live_migration_abort(context,
+                 instance, migration.id)
+ 
++    @guards.entrypoint(
++        'evacuate',
++        service='api', instance_arg=1)
+     @block_shares_not_supported()
+     @block_extended_resource_request
+     @block_port_accelerators()
+@@ -5895,6 +6007,7 @@ class API:
+         # no task being performed on the instance and it has a host.
+         @check_instance_host()
+         @check_instance_state(vm_state=None)
++        @guards.entrypoint('snapshot')
+         def do_volume_snapshot_create(self, context, instance):
+             self.compute_rpcapi.volume_snapshot_create(context, instance,
+                     volume_id, create_info)
+@@ -5915,6 +6028,7 @@ class API:
+ 
+         @check_instance_host()
+         @check_instance_state(vm_state=None)
++        @guards.entrypoint('volume_snapshot_delete')
+         def do_volume_snapshot_delete(self, context, instance):
+             # FIXME(lyarwood): Avoid bug #1919487 by rejecting the request
+             # to delete an intermediary volume snapshot offline as this isn't
+@@ -6077,18 +6191,27 @@ class API:
+             host_statuses[instance.uuid] = host_status
+         return host_statuses
+ 
++    @guards.entrypoint(
++        'allow_share',
++        service='api', instance_arg=1)
+     def allow_share(self, context, instance, share_mapping):
+         self._record_action_start(
+             context, instance, instance_actions.ATTACH_SHARE)
+         self.compute_rpcapi.allow_share(
+             context, instance, share_mapping)
+ 
++    @guards.entrypoint(
++        'deny_share',
++        service='api', instance_arg=1)
+     def deny_share(self, context, instance, share_mapping):
+         self._record_action_start(
+             context, instance, instance_actions.DETACH_SHARE)
+         self.compute_rpcapi.deny_share(
+             context, instance, share_mapping)
+ 
++    @guards.entrypoint(
++        'add_runtime_ssh_key',
++        service='api', instance_arg=1)
+     @check_instance_lock
+     @check_instance_state(
+         vm_state=[vm_states.ACTIVE],
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 89d0d18..2c789e8 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -59,6 +59,7 @@ from oslo_utils import units
+ 
+ from nova.accelerator import cyborg
+ from nova import block_device
++from nova.checkpoints import guards
+ from nova.compute import api as compute
+ from nova.compute import build_results
+ from nova.compute import claims
+@@ -3348,6 +3349,9 @@ class ComputeManager(manager.Manager):
+                 self.host, action=fields.NotificationAction.DELETE,
+                 phase=fields.NotificationPhase.END, bdms=bdms)
+ 
++    @guards.entrypoint(
++        'delete',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -3390,6 +3394,9 @@ class ComputeManager(manager.Manager):
+     # NOTE(johannes): This is probably better named power_off_instance
+     # so it matches the driver method, but because of other issues, we
+     # can't use that name in grizzly.
++    @guards.entrypoint(
++        'stop',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -3478,6 +3485,9 @@ class ComputeManager(manager.Manager):
+     # NOTE(johannes): This is probably better named power_on_instance
+     # so it matches the driver method, but because of other issues, we
+     # can't use that name in grizzly.
++    @guards.entrypoint(
++        'start',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -3508,6 +3518,9 @@ class ComputeManager(manager.Manager):
+             self.host, action=fields.NotificationAction.POWER_ON,
+             phase=fields.NotificationPhase.END)
+ 
++    @guards.entrypoint(
++        'trigger_crash_dump',
++        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(NotImplementedError,
+                                    exception.TriggerCrashDumpNotSupported,
+                                    exception.InstanceNotRunning)
+@@ -3533,6 +3546,9 @@ class ComputeManager(manager.Manager):
+                 self.host, action=fields.NotificationAction.TRIGGER_CRASH_DUMP,
+                 phase=fields.NotificationPhase.END)
+ 
++    @guards.entrypoint(
++        'soft_delete',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -3555,6 +3571,9 @@ class ComputeManager(manager.Manager):
+             instance.task_state = None
+             instance.save(expected_task_state=[task_states.SOFT_DELETING])
+ 
++    @guards.entrypoint(
++        'restore',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -3789,6 +3808,9 @@ class ComputeManager(manager.Manager):
+             context, instance, self.host,
+             phase=fields.NotificationPhase.ERROR, exception=error, bdms=bdms)
+ 
++    @guards.entrypoint(
++        'rebuild',
++        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(exception.PreserveEphemeralNotSupported,
+                                    exception.BuildAbortException)
+     @wrap_exception()
+@@ -4347,6 +4369,9 @@ class ComputeManager(manager.Manager):
+ 
+         return share_info
+ 
++    @guards.entrypoint(
++        'reboot',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -4493,6 +4518,9 @@ class ComputeManager(manager.Manager):
+         self._snapshot_instance(context, image_id, instance,
+                                 task_states.IMAGE_BACKUP)
+ 
++    @guards.entrypoint(
++        'backup',
++        service='compute', instance_arg=2)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -4507,6 +4535,9 @@ class ComputeManager(manager.Manager):
+         self._do_snapshot_instance(context, image_id, instance)
+         self._rotate_backups(context, instance, backup_type, rotation)
+ 
++    @guards.entrypoint(
++        'snapshot',
++        service='compute', instance_arg=2)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -4607,6 +4638,9 @@ class ComputeManager(manager.Manager):
+             instance.save()
+             LOG.warning("Image not found during snapshot", instance=instance)
+ 
++    @guards.entrypoint(
++        'volume_snapshot_create',
++        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(NotImplementedError)
+     @wrap_exception()
+     def volume_snapshot_create(self, context, instance, volume_id,
+@@ -4619,6 +4653,9 @@ class ComputeManager(manager.Manager):
+             LOG.debug('Instance disappeared during volume snapshot create',
+                       instance=instance)
+ 
++    @guards.entrypoint(
++        'volume_snapshot_delete',
++        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(NotImplementedError)
+     @wrap_exception()
+     def volume_snapshot_delete(self, context, instance, volume_id,
+@@ -4631,6 +4668,9 @@ class ComputeManager(manager.Manager):
+             LOG.debug('Instance disappeared during volume snapshot delete',
+                       instance=instance)
+ 
++    @guards.entrypoint(
++        'allow_share',
++        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(NotImplementedError)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+@@ -4779,6 +4819,9 @@ class ComputeManager(manager.Manager):
+ 
+         _allow_share(context, instance, share_mapping)
+ 
++    @guards.entrypoint(
++        'deny_share',
++        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(NotImplementedError)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+@@ -5042,6 +5085,9 @@ class ComputeManager(manager.Manager):
+                              {'image_id': image_id, 'exc': exc},
+                              instance=instance)
+ 
++    @guards.entrypoint(
++        'set_admin_password',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -5135,6 +5181,9 @@ class ComputeManager(manager.Manager):
+         return objects.ImageMeta.from_image_ref(
+             context, self.image_api, rescue_image_ref)
+ 
++    @guards.entrypoint(
++        'rescue',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -5200,6 +5249,9 @@ class ComputeManager(manager.Manager):
+             context, instance, self.host, rescue_image_ref,
+             phase=fields.NotificationPhase.END)
+ 
++    @guards.entrypoint(
++        'unrescue',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -5232,6 +5284,9 @@ class ComputeManager(manager.Manager):
+             self.host, action=fields.NotificationAction.UNRESCUE,
+             phase=fields.NotificationPhase.END)
+ 
++    @guards.entrypoint(
++        'confirm_resize',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @errors_out_migration
+@@ -5419,6 +5474,9 @@ class ComputeManager(manager.Manager):
+         instance.system_metadata.pop('old_vm_state', None)
+         instance.save()
+ 
++    @guards.entrypoint(
++        'confirm_snapshot_based_resize_at_source',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @errors_out_migration
+@@ -5605,6 +5663,9 @@ class ComputeManager(manager.Manager):
+                     break
+         return bdms
+ 
++    @guards.entrypoint(
++        'revert_snapshot_based_resize_at_dest',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -5718,6 +5779,9 @@ class ComputeManager(manager.Manager):
+         instance.compute_id = cn.id
+         instance.save(expected_task_state=[task_states.RESIZE_REVERTING])
+ 
++    @guards.entrypoint(
++        'finish_revert_snapshot_based_resize_at_source',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -5876,6 +5940,9 @@ class ComputeManager(manager.Manager):
+         migration.status = 'reverted'
+         migration.save()
+ 
++    @guards.entrypoint(
++        'revert_resize',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -5924,6 +5991,9 @@ class ComputeManager(manager.Manager):
+             self.compute_rpcapi.finish_revert_resize(context, instance,
+                     migration, migration.source_compute, request_spec)
+ 
++    @guards.entrypoint(
++        'finish_revert_resize',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -6211,6 +6281,9 @@ class ComputeManager(manager.Manager):
+         compute_utils.notify_about_resize_prep_instance(
+             context, instance, self.host, phase, flavor)
+ 
++    @guards.entrypoint(
++        'prep_resize',
++        service='compute', instance_arg=2)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -6357,6 +6430,9 @@ class ComputeManager(manager.Manager):
+                 raise exc.with_traceback(exc_info[2])
+             raise exc
+ 
++    @guards.entrypoint(
++        'prep_snapshot_based_resize_at_dest',
++        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(exception.MigrationPreCheckError)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+@@ -6428,6 +6504,9 @@ class ComputeManager(manager.Manager):
+         # ResourceTracker.resize_claim() sets instance.migration_context.
+         return instance.migration_context
+ 
++    @guards.entrypoint(
++        'prep_snapshot_based_resize_at_source',
++        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(exception.InstancePowerOffFailure)
+     @wrap_exception()
+     @reverts_task_state
+@@ -6564,6 +6643,9 @@ class ComputeManager(manager.Manager):
+             fields.NotificationPhase.END)
+         self.instance_events.clear_events_for_instance(instance)
+ 
++    @guards.entrypoint(
++        'resize',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -6849,6 +6931,9 @@ class ComputeManager(manager.Manager):
+ 
+         return network_info
+ 
++    @guards.entrypoint(
++        'finish_resize',
++        service='compute', instance_arg=3)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -6929,6 +7014,9 @@ class ComputeManager(manager.Manager):
+             action=fields.NotificationAction.RESIZE_FINISH, phase=phase,
+             bdms=bdms)
+ 
++    @guards.entrypoint(
++        'finish_snapshot_based_resize_at_dest',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -7125,6 +7213,9 @@ class ComputeManager(manager.Manager):
+                                           self.host, bdm.volume_id,
+                                           instance=instance)
+ 
++    @guards.entrypoint(
++        'add_fixed_ip_to',
++        service='compute', instance_arg=2)
+     @wrap_exception()
+     @wrap_instance_fault
+     def add_fixed_ip_to_instance(self, context, network_id, instance):
+@@ -7169,6 +7260,9 @@ class ComputeManager(manager.Manager):
+         self._notify_about_instance_usage(
+             context, instance, "delete_ip.end", network_info=network_info)
+ 
++    @guards.entrypoint(
++        'pause',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -7191,6 +7285,9 @@ class ComputeManager(manager.Manager):
+                self.host, action=fields.NotificationAction.PAUSE,
+                phase=fields.NotificationPhase.END)
+ 
++    @guards.entrypoint(
++        'unpause',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -7328,6 +7425,9 @@ class ComputeManager(manager.Manager):
+                 state=power_state.STATE_MAP[instance.power_state],
+                 method='get_diagnostics')
+ 
++    @guards.entrypoint(
++        'suspend',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -7354,6 +7454,9 @@ class ComputeManager(manager.Manager):
+                 self.host, action=fields.NotificationAction.SUSPEND,
+                 phase=fields.NotificationPhase.END)
+ 
++    @guards.entrypoint(
++        'resume',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -7401,6 +7504,9 @@ class ComputeManager(manager.Manager):
+             self.host, action=fields.NotificationAction.RESUME,
+             phase=fields.NotificationPhase.END, bdms=bdms)
+ 
++    @guards.entrypoint(
++        'shelve',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -7486,6 +7592,9 @@ class ComputeManager(manager.Manager):
+                 context, instance, clean_shutdown=False, bdms=bdms,
+                 accel_uuids=accel_uuids)
+ 
++    @guards.entrypoint(
++        'shelve_offload',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -7581,6 +7690,9 @@ class ComputeManager(manager.Manager):
+                 self.host, action=fields.NotificationAction.SHELVE_OFFLOAD,
+                 phase=fields.NotificationPhase.END, bdms=bdms)
+ 
++    @guards.entrypoint(
++        'unshelve',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -7740,6 +7852,9 @@ class ComputeManager(manager.Manager):
+ 
+         self.driver.inject_network_info(instance, network_info)
+ 
++    @guards.entrypoint(
++        'inject_network_info',
++        service='compute', instance_arg=1)
+     @wrap_instance_fault
+     def inject_network_info(self, context, instance):
+         """Inject network info, but don't return the info."""
+@@ -7996,6 +8111,9 @@ class ComputeManager(manager.Manager):
+         # comparing the correct types.
+         return str(console_info.port) == port
+ 
++    @guards.entrypoint(
++        'reserve_block_device_name',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_fault
+@@ -8043,6 +8161,9 @@ class ComputeManager(manager.Manager):
+ 
+         return do_reserve()
+ 
++    @guards.entrypoint(
++        'attach_volume',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -8199,6 +8320,9 @@ class ComputeManager(manager.Manager):
+                                 'device metadata for disk %s', device,
+                                 instance=instance)
+ 
++    @guards.entrypoint(
++        'detach_volume',
++        service='compute', instance_arg=2)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -8390,6 +8514,9 @@ class ComputeManager(manager.Manager):
+ 
+         return (comp_ret, new_cinfo)
+ 
++    @guards.entrypoint(
++        'swap_volume',
++        service='compute', instance_arg=3)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -8501,6 +8628,9 @@ class ComputeManager(manager.Manager):
+             fields.NotificationPhase.END,
+             old_volume_id, new_volume_id)
+ 
++    @guards.entrypoint(
++        'remove_volume_connection',
++        service='compute', instance_arg=2)
+     @wrap_exception()
+     def remove_volume_connection(
+             self, context, volume_id, instance,
+@@ -8749,6 +8879,9 @@ class ComputeManager(manager.Manager):
+ 
+     # TODO(mriedem): There are likely race failures which can result in
+     # NotFound and QuotaError exceptions getting traced as well.
++    @guards.entrypoint(
++        'attach_interface',
++        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(
+         # Do not log a traceback for user errors. We use Invalid generically
+         # since this method can raise lots of different exceptions:
+@@ -8903,6 +9036,9 @@ class ComputeManager(manager.Manager):
+ 
+         return network_info[0]
+ 
++    @guards.entrypoint(
++        'detach_interface',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -9006,6 +9142,9 @@ class ComputeManager(manager.Manager):
+             delattr(dest_check_data, 'dst_supports_numa_live_migration')
+         return dest_check_data
+ 
++    @guards.entrypoint(
++        'check_can_live_migrate_destination',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -9232,6 +9371,9 @@ class ComputeManager(manager.Manager):
+             delattr(source_check_data, 'src_supports_numa_live_migration')
+         return source_check_data
+ 
++    @guards.entrypoint(
++        'check_can_live_migrate_source',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -9261,6 +9403,9 @@ class ComputeManager(manager.Manager):
+         LOG.debug('source check data is %s', result)
+         return result
+ 
++    @guards.entrypoint(
++        'pre_live_migration',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -9572,6 +9717,9 @@ class ComputeManager(manager.Manager):
+                     source_bdms)
+         return migrate_data
+ 
++    @guards.entrypoint(
++        '_do_live_migration',
++        service='compute', instance_arg=2)
+     def _do_live_migration(self, context, dest, instance, block_migration,
+                            migration, migrate_data):
+         # NOTE(danms): We should enhance the RT to account for migrations
+@@ -9641,6 +9789,9 @@ class ComputeManager(manager.Manager):
+                 self._set_instance_obj_error_state(instance,
+                                                    clean_task_state=True)
+ 
++    @guards.entrypoint(
++        'live_migration',
++        service='compute', instance_arg=2)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @errors_out_migration
+@@ -9663,6 +9814,9 @@ class ComputeManager(manager.Manager):
+         # in order to be able to track and abort it in the future.
+         self._waiting_live_migrations[instance.uuid] = (None, None)
+         try:
++            context = guards.handoff(
++                context, 'compute:_do_live_migration:%s' % self.host)
++            instance = instance.obj_clone()
+             future = nova.utils.pass_context(
+                 self._live_migration_executor.submit,
+                 self._do_live_migration, context, dest, instance,
+@@ -9677,6 +9831,9 @@ class ComputeManager(manager.Manager):
+             raise exception.LiveMigrationNotSubmitted(
+                 migration_uuid=migration.uuid, instance_uuid=instance.uuid)
+ 
++    @guards.entrypoint(
++        'live_migration_force_complete',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -9709,6 +9866,9 @@ class ComputeManager(manager.Manager):
+             action=fields.NotificationAction.LIVE_MIGRATION_ABORT,
+             phase=fields.NotificationPhase.END)
+ 
++    @guards.entrypoint(
++        'live_migration_abort',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -10118,6 +10278,9 @@ class ComputeManager(manager.Manager):
+             objects.ConsoleAuthToken.\
+                 clean_console_auths_for_instance(ctxt, instance.uuid)
+ 
++    @guards.entrypoint(
++        'post_live_migration_at_destination',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -10435,6 +10598,9 @@ class ComputeManager(manager.Manager):
+         # back to normal status, now set migration status to 'failed'
+         self._set_migration_status(migration, migration_status)
+ 
++    @guards.entrypoint(
++        'drop_move_claim_at_destination',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_fault
+     def drop_move_claim_at_destination(self, context, instance):
+@@ -10448,6 +10614,9 @@ class ComputeManager(manager.Manager):
+         self.rt.drop_move_claim(
+             context, instance, nodename, flavor=instance.flavor)
+ 
++    @guards.entrypoint(
++        'rollback_live_migration_at_destination',
++        service='compute', instance_arg=1)
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -11618,6 +11787,9 @@ class ComputeManager(manager.Manager):
+                             instance=instance)
+                 break
+ 
++    @guards.entrypoint(
++        'extend_volume',
++        service='compute', instance_arg=1)
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+     def extend_volume(self, context, instance, extended_volume_id):
+@@ -11956,6 +12128,9 @@ class ComputeManager(manager.Manager):
+                                 instance=instance)
+                 break
+ 
++    @guards.entrypoint(
++        'quiesce',
++        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(exception.InstanceQuiesceNotSupported,
+                                    exception.QemuGuestAgentNotEnabled,
+                                    exception.NovaException,
+@@ -11980,6 +12155,9 @@ class ComputeManager(manager.Manager):
+                 timer = loopingcall.FixedIntervalLoopingCall(_wait_snapshot)
+                 timer.start(interval=0.5).wait()
+ 
++    @guards.entrypoint(
++        'unquiesce',
++        service='compute', instance_arg=1)
+     @messaging.expected_exceptions(exception.InstanceQuiesceNotSupported,
+                                    exception.QemuGuestAgentNotEnabled,
+                                    exception.NovaException,
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index 348797b..5c9d8aa 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -20,6 +20,7 @@ from oslo_log import log as logging
+ import oslo_messaging as messaging
+ from oslo_utils import excutils
+ 
++from nova.checkpoints import guards
+ import nova.conf
+ from nova import context
+ from nova import exception
+@@ -461,7 +462,8 @@ class ComputeAPI(object):
+ 
+                     default_client = self.get_client(target, version_cap,
+                                                      serializer)
+-                    _ROUTER = rpc.ClientRouter(default_client)
++                    _ROUTER = guards.RPCRouter(
++                        rpc.ClientRouter(default_client))
+         return _ROUTER
+ 
+     def _ver(self, ctxt, old):
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index 769a5bb..d72aa19 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -35,6 +35,7 @@ from oslo_utils import versionutils
+ 
+ from nova.accelerator import cyborg
+ from nova import availability_zones
++from nova.checkpoints import guards
+ from nova.compute import instance_actions
+ from nova.compute import rpcapi as compute_rpcapi
+ from nova.compute import task_states
+@@ -306,6 +307,9 @@ class ComputeTaskManager:
+         exception.MigrationPreCheckError,
+         exception.UnsupportedPolicyException)
+     @targets_cell
++    @guards.entrypoint(
++        'migrate_server',
++        service='conductor', instance_arg=1)
+     @wrap_instance_event(prefix='conductor')
+     def migrate_server(self, context, instance, scheduler_hint, live, rebuild,
+             flavor, block_migration, disk_over_commit, reservations=None,
+@@ -1001,6 +1005,9 @@ class ComputeTaskManager:
+ 
+     # TODO(mriedem): Make request_spec required in ComputeTaskAPI RPC v2.0.
+     @targets_cell
++    @guards.entrypoint(
++        'unshelve',
++        service='conductor', instance_arg=1)
+     def unshelve_instance(self, context, instance, request_spec=None):
+         sys_meta = instance.system_metadata
+ 
+@@ -1201,6 +1208,9 @@ class ComputeTaskManager:
+ 
+     # TODO(mriedem): Make request_spec required in ComputeTaskAPI RPC v2.0.
+     @targets_cell
++    @guards.entrypoint(
++        'rebuild',
++        service='conductor', instance_arg=1)
+     def rebuild_instance(self, context, instance, orig_image_ref, image_ref,
+                          injected_files, new_pass, orig_sys_metadata,
+                          bdms, recreate, on_shared_storage,
+@@ -2185,6 +2195,9 @@ class ComputeTaskManager:
+             fields.NotificationPhase.END)
+ 
+     @targets_cell
++    @guards.entrypoint(
++        'confirm_snapshot_based_resize',
++        service='conductor', instance_arg=1)
+     @wrap_instance_event(prefix='conductor')
+     def confirm_snapshot_based_resize(self, context, instance, migration):
+         """Executes the ConfirmResizeTask
+@@ -2200,6 +2213,9 @@ class ComputeTaskManager:
+         task.execute()
+ 
+     @targets_cell
++    @guards.entrypoint(
++        'revert_snapshot_based_resize',
++        service='conductor', instance_arg=1)
+     # NOTE(mriedem): Upon successful completion of RevertResizeTask the
+     # instance is hard-deleted, along with its instance action record(s), from
+     # the target cell database so EventReporter hits InstanceActionNotFound on
+diff --git a/nova/conductor/rpcapi.py b/nova/conductor/rpcapi.py
+index a5f0cf0..4f9efcc 100644
+--- a/nova/conductor/rpcapi.py
++++ b/nova/conductor/rpcapi.py
+@@ -19,6 +19,7 @@ import oslo_messaging as messaging
+ from oslo_serialization import jsonutils
+ from oslo_versionedobjects import base as ovo_base
+ 
++from nova.checkpoints import guards
+ import nova.conf
+ from nova import exception
+ from nova.i18n import _
+@@ -296,7 +297,8 @@ class ComputeTaskAPI(object):
+                                   namespace='compute_task',
+                                   version='1.0')
+         serializer = objects_base.NovaObjectSerializer()
+-        self.client = rpc.get_client(target, serializer=serializer)
++        self.client = guards.RPCClient(
++            rpc.get_client(target, serializer=serializer), 'conductor')
+ 
+     def live_migrate_instance(self, context, instance, scheduler_hint,
+                               block_migration, disk_over_commit, request_spec):
+diff --git a/nova/conductor/tasks/cross_cell_migrate.py b/nova/conductor/tasks/cross_cell_migrate.py
+index ab391bc..65a9e42 100644
+--- a/nova/conductor/tasks/cross_cell_migrate.py
++++ b/nova/conductor/tasks/cross_cell_migrate.py
+@@ -18,6 +18,7 @@ import oslo_messaging as messaging
+ from oslo_utils import excutils
+ 
+ from nova import availability_zones
++from nova.checkpoints import guards
+ from nova.compute import instance_actions
+ from nova.compute import power_state
+ from nova.compute import task_states
+@@ -210,6 +211,9 @@ class TargetDBSetupTask(base.TaskBase):
+             # again without hitting a duplicate entry unique constraint error.
+             self._target_cell_instance.destroy(hard_delete=True)
+ 
++    def execute(self):
++        return guards.run_task(self, super().execute, 'migrate')
++
+ 
+ class PrepResizeAtDestTask(base.TaskBase):
+     """Task used to verify a given target host in a target cell.
+@@ -374,6 +378,9 @@ class PrepResizeAtDestTask(base.TaskBase):
+                               'attachment %s.', attachment_id,
+                               instance=self.instance)
+ 
++    def execute(self):
++        return guards.run_task(self, super().execute, 'migrate')
++
+ 
+ class PrepResizeAtSourceTask(base.TaskBase):
+     """Task to prepare the instance at the source host for the resize.
+@@ -462,6 +469,9 @@ class PrepResizeAtSourceTask(base.TaskBase):
+                   'failed. The instance may need to be hard rebooted.',
+                   self.instance.host, instance=self.instance)
+ 
++    def execute(self):
++        return guards.run_task(self, super().execute, 'migrate')
++
+ 
+ class FinishResizeAtDestTask(base.TaskBase):
+     """Task to finish the resize at the destination host.
+@@ -605,6 +615,9 @@ class FinishResizeAtDestTask(base.TaskBase):
+         # The method executed in this task are self-contained for rollbacks.
+         pass
+ 
++    def execute(self):
++        return guards.run_task(self, super().execute, 'migrate')
++
+ 
+ class CrossCellMigrationTask(base.TaskBase):
+     """Orchestrates a cross-cell cold migration (resize)."""
+@@ -863,6 +876,9 @@ class CrossCellMigrationTask(base.TaskBase):
+             except Exception:
+                 LOG.exception('Rollback for task %s failed.', task_name)
+ 
++    def execute(self):
++        return guards.run_task(self, super().execute, 'migrate')
++
+ 
+ def get_inst_and_cell_map_from_source(
+         target_cell_context, source_compute, instance_uuid):
+@@ -1073,6 +1089,9 @@ class ConfirmResizeTask(base.TaskBase):
+                 self.context, self.instance.uuid, 'compute_task',
+                 'migrate_server', updates, ex, request_spec)
+ 
++    def execute(self):
++        return guards.run_task(self, super().execute, 'migrate')
++
+ 
+ class RevertResizeTask(base.TaskBase):
+     """Task to orchestrate a cross-cell resize revert operation.
+@@ -1465,3 +1484,6 @@ class RevertResizeTask(base.TaskBase):
+             scheduler_utils.set_vm_state_and_notify(
+                 instance._context, instance.uuid, 'compute_task',
+                 'migrate_server', updates, ex, request_spec)
++
++    def execute(self):
++        return guards.run_task(self, super().execute, 'migrate')
+diff --git a/nova/conductor/tasks/live_migrate.py b/nova/conductor/tasks/live_migrate.py
+index a0c9497..12e593f 100644
+--- a/nova/conductor/tasks/live_migrate.py
++++ b/nova/conductor/tasks/live_migrate.py
+@@ -15,6 +15,7 @@ import oslo_messaging as messaging
+ from oslo_utils import excutils
+ 
+ from nova import availability_zones
++from nova.checkpoints import guards
+ from nova.compute import power_state
+ from nova.compute import utils as compute_utils
+ from nova.conductor.tasks import base
+@@ -607,3 +608,6 @@ class LiveMigrationTask(base.TaskBase):
+                    % {'max_retries': retries,
+                       'instance_uuid': self.instance.uuid})
+             raise exception.MaxRetriesExceeded(reason=msg)
++
++    def execute(self):
++        return guards.run_task(self, super().execute, 'migrate')
+diff --git a/nova/conductor/tasks/migrate.py b/nova/conductor/tasks/migrate.py
+index d770861..5f83754 100644
+--- a/nova/conductor/tasks/migrate.py
++++ b/nova/conductor/tasks/migrate.py
+@@ -14,6 +14,7 @@ from oslo_log import log as logging
+ from oslo_serialization import jsonutils
+ 
+ from nova import availability_zones
++from nova.checkpoints import guards
+ from nova.compute import utils as compute_utils
+ from nova.conductor.tasks import base
+ from nova.conductor.tasks import cross_cell_migrate
+@@ -408,3 +409,6 @@ class MigrationTask(base.TaskBase):
+ 
+         revert_allocation_for_migration(self.context, self._source_cn,
+                                         self.instance, self._migration)
++
++    def execute(self):
++        return guards.run_task(self, super().execute, 'migrate')
+diff --git a/nova/context.py b/nova/context.py
+index b993e65..a44bb78 100644
+--- a/nova/context.py
++++ b/nova/context.py
+@@ -84,7 +84,9 @@ class RequestContext(context.RequestContext):
+     def __init__(self, user_id=None, project_id=None, is_admin=None,
+                  read_deleted="no", remote_address=None, timestamp=None,
+                  quota_class=None, service_catalog=None,
+-                 user_auth_plugin=None, **kwargs):
++                 user_auth_plugin=None, checkpoint_scope=None,
++                 checkpoint_borrowed_target=None,
++                 checkpoint_scope_cell_uuid=None, **kwargs):
+         """:param read_deleted: 'no' indicates deleted records are hidden,
+                 'yes' indicates deleted records are visible,
+                 'only' indicates that *only* deleted records are visible.
+@@ -134,6 +136,11 @@ class RequestContext(context.RequestContext):
+         self.cell_uuid = None
+ 
+         self.user_auth_plugin = user_auth_plugin
++        # Internal RPC/OVO context only; HTTP auth middleware never populates
++        # this field. Every use checks its token against the cell record.
++        self.checkpoint_scope = checkpoint_scope
++        self.checkpoint_borrowed_target = checkpoint_borrowed_target
++        self.checkpoint_scope_cell_uuid = checkpoint_scope_cell_uuid
+         if self.is_admin is None:
+             self.is_admin = policy.check_is_admin(self)
+ 
+@@ -177,6 +184,13 @@ class RequestContext(context.RequestContext):
+             'service_catalog': getattr(self, 'service_catalog', None),
+             'project_name': getattr(self, 'project_name', None),
+         })
++        if self.checkpoint_scope is not None:
++            values['checkpoint_scope'] = copy.deepcopy(self.checkpoint_scope)
++            values['checkpoint_scope_cell_uuid'] = (
++                self.checkpoint_scope_cell_uuid)
++            if self.checkpoint_borrowed_target is not None:
++                values['checkpoint_borrowed_target'] = (
++                    self.checkpoint_borrowed_target)
+         # NOTE(tonyb): This can be removed once we're certain to have a
+         # RequestContext contains 'is_admin_project', We can only get away with
+         # this because we "know" the default value of 'is_admin_project' which
+@@ -200,6 +214,11 @@ class RequestContext(context.RequestContext):
+             timestamp=values.get('timestamp'),
+             quota_class=values.get('quota_class'),
+             service_catalog=values.get('service_catalog'),
++            checkpoint_scope=copy.deepcopy(values.get('checkpoint_scope')),
++            checkpoint_borrowed_target=values.get(
++                'checkpoint_borrowed_target'),
++            checkpoint_scope_cell_uuid=values.get(
++                'checkpoint_scope_cell_uuid'),
+         )
+ 
+     def elevated(self, read_deleted=None):
+@@ -337,6 +356,12 @@ def set_target_cell(context, cell_mapping):
+     :param cell_mapping: An objects.CellMapping object or None
+     """
+     global CELL_CACHE
++    target_uuid = cell_mapping.uuid if cell_mapping is not None else None
++    if (context.checkpoint_scope_cell_uuid is not None and
++            context.checkpoint_scope_cell_uuid != target_uuid):
++        context.checkpoint_scope = None
++        context.checkpoint_borrowed_target = None
++        context.checkpoint_scope_cell_uuid = None
+     if cell_mapping is not None:
+         # avoid circular import
+         from nova.db.main import api as db
+diff --git a/nova/db/main/api.py b/nova/db/main/api.py
+index 8318012..8b68cd1 100644
+--- a/nova/db/main/api.py
++++ b/nova/db/main/api.py
+@@ -30,6 +30,7 @@ from oslo_db.sqlalchemy import enginefacade
+ from oslo_db.sqlalchemy import update_match
+ from oslo_db.sqlalchemy import utils as sqlalchemyutils
+ from oslo_log import log as logging
++from oslo_serialization import jsonutils
+ from oslo_utils import excutils
+ from oslo_utils import importutils
+ from oslo_utils import timeutils
+@@ -1051,6 +1052,7 @@ def virtual_interface_create(context, values):
+ 
+     :param values: Dict containing column values.
+     """
++    _checkpoint_guard(context, values.get('instance_uuid'), 'topology')
+     try:
+         vif_ref = models.VirtualInterface()
+         vif_ref.update(values)
+@@ -1070,6 +1072,8 @@ def _virtual_interface_query(context):
+ @pick_context_manager_writer
+ def virtual_interface_update(context, vif_uuid, values):
+     """Create a virtual interface record in the database."""
++    _checkpoint_guard_row(context, models.VirtualInterface,
++                          {'uuid': vif_uuid}, 'topology', values)
+     vif_ref = virtual_interface_get_by_uuid(context, vif_uuid)
+     vif_ref.update(values)
+     vif_ref.save(context.session)
+@@ -1155,6 +1159,7 @@ def virtual_interface_delete_by_instance(context, instance_uuid):
+ 
+     :param instance_uuid: UUID of the instance to filter on.
+     """
++    _checkpoint_guard(context, instance_uuid, 'topology')
+     _virtual_interface_query(context).\
+            filter_by(instance_uuid=instance_uuid).\
+            soft_delete()
+@@ -1167,6 +1172,8 @@ def virtual_interface_delete(context, id):
+ 
+     :param id: ID of the interface.
+     """
++    _checkpoint_guard_row(context, models.VirtualInterface,
++                          {'id': id}, 'topology')
+     _virtual_interface_query(context).\
+         filter_by(id=id).\
+         soft_delete()
+@@ -1319,6 +1326,7 @@ def instance_destroy(
+     :param hard_delete: when set to True, removes all records related to the
+         instance
+     """
++    _checkpoint_guard(context, instance_uuid, 'destroy')
+     if uuidutils.is_uuid_like(instance_uuid):
+         instance_ref = _instance_get_by_uuid(context, instance_uuid)
+     else:
+@@ -2340,6 +2348,7 @@ def _instance_metadata_update_in_place(context, instance, metadata_type, model,
+ 
+ 
+ def _instance_update(context, instance_uuid, values, expected, original=None):
++    _checkpoint_guard(context, instance_uuid, 'instance', values)
+     if not uuidutils.is_uuid_like(instance_uuid):
+         raise exception.InvalidUUID(uuid=instance_uuid)
+ 
+@@ -2503,6 +2512,7 @@ def instance_info_cache_update(context, instance_uuid, values):
+     :param instance_uuid: = uuid of info cache's instance
+     :param values: = dict containing column values to update
+     """
++    _checkpoint_guard(context, instance_uuid, 'info_cache', values)
+     convert_objects_related_datetimes(values)
+ 
+     info_cache = model_query(context, models.InstanceInfoCache).\
+@@ -2541,6 +2551,7 @@ def instance_info_cache_delete(context, instance_uuid):
+ 
+     :param instance_uuid: = uuid of the instance tied to the cache record
+     """
++    _checkpoint_guard(context, instance_uuid, 'topology')
+     model_query(context, models.InstanceInfoCache).\
+                          filter_by(instance_uuid=instance_uuid).\
+                          soft_delete()
+@@ -2563,6 +2574,7 @@ def instance_extra_update_by_uuid(context, instance_uuid, updates):
+     :param instance_uuid: UUID of the instance tied to the record
+     :param updates: A dict of updates to apply
+     """
++    _checkpoint_guard(context, instance_uuid, 'extra', updates)
+     rows_updated = model_query(context, models.InstanceExtra).\
+         filter_by(instance_uuid=instance_uuid).\
+         update(updates)
+@@ -2583,6 +2595,8 @@ def instance_extra_update_keypairs_if_current(
+     updated_keypairs,
+ ):
+     """Update keypairs only if they have not changed concurrently."""
++    _checkpoint_guard(context, instance_uuid, 'extra',
++                      {'keypairs': updated_keypairs})
+ 
+     query = model_query(
+         context,
+@@ -2882,6 +2896,7 @@ def _set_or_validate_uuid(values):
+ @pick_context_manager_writer
+ def block_device_mapping_create(context, values, legacy=True):
+     """Create an entry of block device mapping."""
++    _checkpoint_guard(context, values.get('instance_uuid'), 'topology')
+     _scrub_empty_str_values(values, ['volume_size'])
+     values = _from_legacy_values(values, legacy)
+     convert_objects_related_datetimes(values)
+@@ -2898,6 +2913,8 @@ def block_device_mapping_create(context, values, legacy=True):
+ @pick_context_manager_writer
+ def block_device_mapping_update(context, bdm_id, values, legacy=True):
+     """Update an entry of block device mapping."""
++    _checkpoint_guard_row(context, models.BlockDeviceMapping,
++                          {'id': bdm_id}, 'bdm_update', values)
+     _scrub_empty_str_values(values, ['volume_size'])
+     values = _from_legacy_values(values, legacy, allow_updates=True)
+     convert_objects_related_datetimes(values)
+@@ -2913,6 +2930,7 @@ def block_device_mapping_update_or_create(context, values, legacy=True):
+ 
+     If not existed, create a new entry
+     """
++    _checkpoint_guard(context, values.get('instance_uuid'), 'topology')
+     # TODO(mdbooth): Remove this method entirely. Callers should know whether
+     # they require update or create, and call the appropriate method.
+ 
+@@ -3005,6 +3023,8 @@ def block_device_mapping_get_by_instance_and_volume_id(
+ @pick_context_manager_writer
+ def block_device_mapping_destroy(context, bdm_id):
+     """Destroy the block device mapping."""
++    _checkpoint_guard_row(context, models.BlockDeviceMapping,
++                          {'id': bdm_id}, 'topology')
+     _block_device_mapping_get_query(context).\
+             filter_by(id=bdm_id).\
+             soft_delete()
+@@ -3016,6 +3036,7 @@ def block_device_mapping_destroy_by_instance_and_volume(
+     context, instance_uuid, volume_id,
+ ):
+     """Destroy the block device mapping."""
++    _checkpoint_guard(context, instance_uuid, 'topology')
+     _block_device_mapping_get_query(context).\
+             filter_by(instance_uuid=instance_uuid).\
+             filter_by(volume_id=volume_id).\
+@@ -3028,6 +3049,7 @@ def block_device_mapping_destroy_by_instance_and_device(
+     context, instance_uuid, device_name,
+ ):
+     """Destroy the block device mapping."""
++    _checkpoint_guard(context, instance_uuid, 'topology')
+     _block_device_mapping_get_query(context).\
+             filter_by(instance_uuid=instance_uuid).\
+             filter_by(device_name=device_name).\
+@@ -3663,6 +3685,8 @@ def instance_system_metadata_get(context, instance_uuid):
+ @pick_context_manager_writer
+ def instance_system_metadata_update(context, instance_uuid, metadata, delete):
+     """Update metadata if it exists, otherwise create it."""
++    _checkpoint_guard(context, instance_uuid, 'system_metadata',
++                      {'metadata': metadata, 'delete': delete})
+     all_keys = metadata.keys()
+     if delete:
+         _instance_system_metadata_get_query(context, instance_uuid).\
+@@ -4990,6 +5014,7 @@ def share_mapping_get_by_instance_uuid_and_share_id(
+ def share_mapping_delete_by_instance_uuid_and_share_id(
+         context, instance_uuid, share_id):
+     """Delete share_mapping record for a specific instance and share_id."""
++    _checkpoint_guard(context, instance_uuid, 'topology')
+     context.session.query(models.ShareMapping).\
+     filter_by(instance_uuid=instance_uuid, share_id=share_id).delete()
+ 
+@@ -5003,6 +5028,7 @@ def share_mapping_update(
+     """Update share_mapping for a share
+     Creates new record if needed.
+     """
++    _checkpoint_guard(context, instance_uuid, 'topology')
+     share_mapping = share_mapping_get_by_instance_uuid_and_share_id(
+             context, instance_uuid, share_id)
+ 
+@@ -5026,3 +5052,40 @@ def share_mapping_update(
+         share_mapping.save(context.session)
+ 
+     return share_mapping
++
++
++def _checkpoint_guard(context, instance_uuid, action, values=None):
++    # Local import avoids the facade/helper import cycle. This is deliberately
++    # inside each existing writer, never a separate transaction.
++    from nova.db.main import checkpoints
++    checkpoints.guard_mutation(context, instance_uuid, action, values)
++
++
++def _checkpoint_guard_row(context, model, filters, action, values=None):
++    row = context.session.query(model.instance_uuid).filter_by(
++        **filters).first()
++    if row is None:
++        return
++    owners = {row.instance_uuid}
++    if values and values.get('instance_uuid'):
++        owners.add(values['instance_uuid'])
++    checked_values = dict(values or {})
++    for instance_uuid in sorted(owners):
++        _checkpoint_guard(context, instance_uuid, action, values)
++    if action == 'bdm_update' and 'connection_info' in checked_values:
++        original = context.session.query(model).filter_by(
++            **filters).populate_existing().first()
++        try:
++            before = jsonutils.loads(original.connection_info or '{}')
++            after = jsonutils.loads(checked_values['connection_info'] or '{}')
++            if (before.get('serial') or original.volume_id) != (
++                    after.get('serial') or original.volume_id):
++                checked_values['serial'] = 'changed'
++        except (ValueError, TypeError, AttributeError):
++            checked_values['serial'] = 'invalid'
++    for instance_uuid in sorted(owners):
++        _checkpoint_guard(context, instance_uuid, action, checked_values)
++    current = context.session.query(model.instance_uuid).filter_by(
++        **filters).first()
++    if current and current.instance_uuid != row.instance_uuid:
++        raise exception.CheckpointConflict(reason='identity_changed')
+diff --git a/nova/db/main/checkpoints.py b/nova/db/main/checkpoints.py
+index a727556..08986b6 100644
+--- a/nova/db/main/checkpoints.py
++++ b/nova/db/main/checkpoints.py
+@@ -38,8 +38,13 @@ from nova import exception
+ 
+ CONF = conf.CONF
+ _JSON_COLUMNS = frozenset(
+-    ('device_manifest', 'admission', 'payload', 'result',
+-     'artifact_usage_proof')
++    (
++        'device_manifest',
++        'admission',
++        'payload',
++        'result',
++        'artifact_usage_proof',
++    )
+ )
+ 
+ 
+@@ -69,7 +74,7 @@ def _authorize(context, project_id):
+         raise exception.NotFound()
+ 
+ 
+-def _instance(context, instance_uuid, lock=False):
++def _instance(context, instance_uuid, lock=False, authorize=True):
+     query = context.session.query(m.Instance).filter_by(
+         uuid=instance_uuid, deleted=0
+     )
+@@ -87,7 +92,17 @@ def _instance(context, instance_uuid, lock=False):
+     instance = query.first()
+     if instance is None:
+         raise exception.InstanceNotFound(instance_id=instance_uuid)
+-    _authorize(context, instance.project_id)
++    if lock:
++        # Refresh scalar state after waiting for a competing writer without
++        # expiring eager relationships needed by existing Instance OVO saves.
++        context.session.refresh(
++            instance,
++            attribute_names=[
++                column.name for column in m.Instance.__table__.columns
++            ],
++        )
++    if authorize:
++        _authorize(context, instance.project_id)
+     return instance
+ 
+ 
+@@ -96,6 +111,7 @@ def _guard(context, instance_uuid):
+         context.session.query(m.InstanceCheckpointGuard)
+         .filter_by(instance_uuid=instance_uuid)
+         .with_for_update()
++        .populate_existing()
+         .first()
+     )
+     if guard is None:
+@@ -226,6 +242,20 @@ def _manifest(context, instance):
+                     serial=connection.get('serial') or bdm.volume_id,
+                     device_name=bdm.device_name,
+                     boot_index=bdm.boot_index,
++                    device_properties={
++                        key: getattr(bdm, key)
++                        for key in (
++                            'source_type',
++                            'destination_type',
++                            'device_type',
++                            'disk_bus',
++                            'guest_format',
++                            'delete_on_termination',
++                            'volume_size',
++                            'tag',
++                            'volume_type',
++                        )
++                    },
+                 )
+             )
+         cache = (
+@@ -365,7 +395,8 @@ def admit(context, admission, ticket_id):
+             create_operation_id=a.operation_id,
+             active_operation_id=a.operation_id,
+             artifact_upper_bound=a.artifact_upper_bound,
+-            artifact_budget_version=1, artifact_usage_revision=0,
++            artifact_budget_version=1,
++            artifact_usage_revision=0,
+         )
+         context.session.add(checkpoint)
+         for disk in a.device_manifest['disks']:
+@@ -771,10 +802,13 @@ def finalize(context, operation_id, generation, outcome):
+     phases = workflow.steps_for(operation.kind)
+     steps = {step.phase: step for step in _steps(context, operation_id)}
+     # An executor's diagnostic code is not a cell cancellation proof.
+-    cancelled = (operation.kind == 'create' and not steps and
+-                 operation.state == 'failed' and
+-                 checkpoint.terminal_operation_id == operation_id and
+-                 operation.error_code == 'admission_cancelled')
++    cancelled = (
++        operation.kind == 'create' and
++        not steps and
++        operation.state == 'failed' and
++        checkpoint.terminal_operation_id == operation_id and
++        operation.error_code == 'admission_cancelled'
++    )
+     if not cancelled and any(
+         phase not in steps or steps[phase].status != 'succeeded'
+         for phase in phases
+@@ -953,10 +987,12 @@ def _budget_checkpoint(context, operation_id):
+     _instance(context, operation.instance_uuid, lock=True)
+     _guard(context, operation.instance_uuid)
+     checkpoint = _checkpoint(context, operation.checkpoint_id, lock=True)
+-    if (operation.kind != 'create' or
+-            checkpoint.create_operation_id != operation_id or
+-            checkpoint.terminal_operation_id or
+-            checkpoint.active_operation_id not in (None, operation_id)):
++    if (
++        operation.kind != 'create' or
++        checkpoint.create_operation_id != operation_id or
++        checkpoint.terminal_operation_id or
++        checkpoint.active_operation_id not in (None, operation_id)
++    ):
+         _conflict()
+     return checkpoint
+ 
+@@ -975,8 +1011,11 @@ def set_artifact_budget(context, operation_id, ticket_version, total_bytes):
+         return
+     if total_bytes < checkpoint.artifact_upper_bound:
+         _conflict()
+-    save = context.session.query(m.InstanceCheckpointStep).filter_by(
+-        operation_id=operation_id, phase='runtime_save').first()
++    save = (
++        context.session.query(m.InstanceCheckpointStep)
++        .filter_by(operation_id=operation_id, phase='runtime_save')
++        .first()
++    )
+     if save and save.status not in ('succeeded', 'failed_no_effect'):
+         _conflict('recovery_required')
+     checkpoint.artifact_upper_bound = total_bytes
+@@ -987,10 +1026,16 @@ def set_artifact_budget(context, operation_id, ticket_version, total_bytes):
+ @db.pick_context_manager_writer
+ def confirm_artifact_usage(context, operation_id, manifest):
+     checkpoint = _budget_checkpoint(context, operation_id)
+-    publish = context.session.query(m.InstanceCheckpointStep).filter_by(
+-        operation_id=operation_id, phase='artifact_publish').first()
+-    if (not publish or publish.status != 'succeeded' or
+-            manifest != jsonutils.loads(publish.result)['evidence']):
++    publish = (
++        context.session.query(m.InstanceCheckpointStep)
++        .filter_by(operation_id=operation_id, phase='artifact_publish')
++        .first()
++    )
++    if (
++        not publish or
++        publish.status != 'succeeded' or
++        manifest != jsonutils.loads(publish.result)['evidence']
++    ):
+         _conflict('resources_remaining')
+     artifacts = _artifacts(context, checkpoint.uuid)
+     if not artifacts or any(item.state != 'available' for item in artifacts):
+@@ -998,13 +1043,17 @@ def confirm_artifact_usage(context, operation_id, manifest):
+     byte_count = sum(item.actual_bytes for item in artifacts)
+     if byte_count > checkpoint.artifact_upper_bound:
+         _conflict()
+-    proof = dict(create_operation_id=operation_id,
+-                 checkpoint_id=checkpoint.uuid, cell_uuid=checkpoint.cell_uuid,
+-                 bytes=byte_count,
+-                 ticket_version=checkpoint.artifact_budget_version,
+-                 artifacts=[dict(id=item.uuid, checksum=item.checksum,
+-                                 bytes=item.actual_bytes)
+-                            for item in artifacts])
++    proof = dict(
++        create_operation_id=operation_id,
++        checkpoint_id=checkpoint.uuid,
++        cell_uuid=checkpoint.cell_uuid,
++        bytes=byte_count,
++        ticket_version=checkpoint.artifact_budget_version,
++        artifacts=[
++            dict(id=item.uuid, checksum=item.checksum, bytes=item.actual_bytes)
++            for item in artifacts
++        ],
++    )
+     if checkpoint.artifact_usage_proof:
+         previous = jsonutils.loads(checkpoint.artifact_usage_proof)
+         previous.pop('revision')
+@@ -1024,5 +1073,355 @@ def artifact_usage_proof(context, create_operation_id):
+     checkpoint = _checkpoint(context, operation.checkpoint_id)
+     if checkpoint.create_operation_id != create_operation_id:
+         _conflict()
+-    return (jsonutils.loads(checkpoint.artifact_usage_proof)
+-            if checkpoint.artifact_usage_proof else None)
++    return (
++        jsonutils.loads(checkpoint.artifact_usage_proof)
++        if checkpoint.artifact_usage_proof
++        else None
++    )
++
++
++# A closed allowlist: an unknown action cannot silently permit topology changes
++# while a checkpoint exists. Worker/API entrypoints use the same action names.
++NON_TOPOLOGY_ACTIONS = c.ORDINARY_NON_TOPOLOGY
++_INSTANCE_INFORMATION = frozenset(
++    (
++        'display_name',
++        'display_description',
++        'metadata',
++        'updated_at',
++        'progress',
++        'expected_task_state',
++        'expected_vm_state',
++    )
++)
++_INSTANCE_STATE = frozenset(
++    (
++        'vm_state',
++        'task_state',
++        'power_state',
++        'locked',
++        'locked_by',
++        'launched_at',
++        'terminated_at',
++        'shutdown_terminate',
++    )
++)
++_BDM_CONNECTION = frozenset(('connection_info', 'attachment_id', 'updated_at'))
++
++
++def _scope_matches(context, guard, instance_uuid):
++    value = getattr(context, 'checkpoint_scope', None)
++    if value is None:
++        return None
++    try:
++        scope = c.Scope.from_primitive(value)
++    except (ValueError, TypeError, KeyError):
++        _conflict('guard_busy')
++    if scope.instance_uuid != instance_uuid or guard is None:
++        _conflict('guard_busy')
++    if scope.kind == 'ordinary':
++        if (
++            scope.owner_uuid != guard.ordinary_claim_uuid or
++            scope.token != guard.ordinary_token or
++            scope.action != guard.ordinary_action or
++            guard.ordinary_state != 'running'
++        ):
++            _conflict('guard_busy')
++    else:
++        if (
++            scope.owner_uuid != guard.operation_id or
++            scope.token != guard.token or
++            scope.generation != guard.generation
++        ):
++            _conflict('guard_busy')
++        operation = _operation(context, scope.owner_uuid)
++        step = (
++            context.session.query(m.InstanceCheckpointStep)
++            .filter_by(
++                operation_id=operation.uuid,
++                phase=scope.action,
++                generation=scope.generation,
++            )
++            .first()
++        )
++        if (
++            operation.phase != scope.action or
++            step is None or
++            step.status not in ('dispatching', 'pending', 'unknown')
++        ):
++            _conflict('guard_busy')
++    return scope
++
++
++def _network_identity(value):
++    ports = jsonutils.loads(value or '[]')
++    return sorted(
++        (
++            port['id'],
++            port['address'],
++            port['network']['id'],
++            port.get('vnic_type'),
++            port.get('model'),
++        )
++        for port in ports
++    )
++
++
++def _image_identity(values):
++    return {
++        key: value
++        for key, value in values.items()
++        if key.startswith(('image_', 'instance_type_'))
++    }
++
++
++def guard_mutation(context, instance_uuid, action, values=None):
++    """Join the caller's writer transaction, always locking Instance first.
++
++    No facade/decorator here: separating this check from the mutation would
++    admit a checkpoint in the gap. Orphan legacy rows remain maintainable.
++    """
++    values = values or {}
++    try:
++        instance = _instance(
++            context, instance_uuid, lock=True, authorize=False
++        )
++    except exception.InstanceNotFound:
++        if context.session.get(m.InstanceCheckpointGuard, instance_uuid):
++            _conflict('guard_busy')
++        return
++    guard = context.session.get(m.InstanceCheckpointGuard, instance_uuid)
++    scope = _scope_matches(context, guard, instance_uuid)
++    if guard is None:
++        return
++    protected = (
++        guard.operation_id or
++        guard.ordinary_claim_uuid or
++        guard.checkpoint_count
++    )
++    if not protected:
++        return
++    topology = True
++    if action == 'instance':
++        changed = {
++            key
++            for key, value in values.items()
++            if key not in _INSTANCE_INFORMATION and
++            (
++                key == 'system_metadata' or
++                getattr(instance, key, object()) != value
++            )
++        }
++        if 'system_metadata' in changed:
++            old = {
++                row.key: row.value
++                for row in context.session.query(
++                    m.InstanceSystemMetadata
++                ).filter_by(instance_uuid=instance_uuid, deleted=0)
++            }
++            if _image_identity(old) == _image_identity(
++                values['system_metadata']
++            ):
++                changed.remove('system_metadata')
++        if not changed:
++            return
++        topology = bool(changed - _INSTANCE_STATE)
++    elif action == 'system_metadata':
++        old = {
++            row.key: row.value
++            for row in context.session.query(
++                m.InstanceSystemMetadata
++            ).filter_by(instance_uuid=instance_uuid, deleted=0)
++        }
++        new = (
++            values['metadata']
++            if values['delete']
++            else dict(old, **values['metadata'])
++        )
++        if _image_identity(old) == _image_identity(new):
++            return
++    elif action == 'info_cache':
++        if 'network_info' not in values:
++            return
++        row = (
++            context.session.query(m.InstanceInfoCache)
++            .filter_by(instance_uuid=instance_uuid, deleted=0)
++            .first()
++        )
++        try:
++            if _network_identity(row.network_info if row else None) == (
++                _network_identity(values['network_info'])
++            ):
++                return
++        except (ValueError, KeyError, TypeError):
++            pass
++    elif action == 'bdm_update':
++        topology = bool(set(values) - _BDM_CONNECTION)
++    elif action == 'extra':
++        if not set(values) - {'updated_at'}:
++            return
++    if guard.operation_id:
++        if scope is None or scope.kind != 'checkpoint' or topology:
++            _conflict('guard_busy')
++        if action == 'bdm_update' and scope.action not in (
++            'volume_disconnect',
++            'volume_reconnect',
++        ):
++            _conflict('guard_busy')
++        if action == 'instance' and scope.action not in (
++            'runtime_save',
++            'runtime_stop',
++            'runtime_restore_current',
++            'runtime_restore_checkpoint',
++            'cleanup_runtime_restore_current',
++        ):
++            _conflict('guard_busy')
++    else:
++        if guard.ordinary_claim_uuid and scope is None:
++            _conflict('guard_busy')
++        if guard.checkpoint_count:
++            if topology or scope is None:
++                _conflict('identity_changed' if topology else 'guard_busy')
++            if scope.action not in NON_TOPOLOGY_ACTIONS:
++                _conflict('identity_changed')
++
++
++def _check_guard(context, guard, instance_uuid, action):
++    scope = _scope_matches(context, guard, instance_uuid)
++    if guard is None:
++        return
++    if scope is not None and scope.kind == 'checkpoint':
++        if scope.action != action:
++            _conflict('guard_busy')
++        return
++    if guard.operation_id or guard.ordinary_claim_uuid:
++        if scope is None or scope.action != action:
++            _conflict('guard_busy')
++    if guard.checkpoint_count and action not in NON_TOPOLOGY_ACTIONS:
++        _conflict('identity_changed')
++
++
++@require_context
++@db.pick_context_manager_reader
++def guard_check(context, instance_uuid, action):
++    guard = context.session.get(m.InstanceCheckpointGuard, instance_uuid)
++    _check_guard(context, guard, instance_uuid, action)
++
++
++@require_context
++@oslo_db_api.wrap_db_retry(max_retries=5, retry_on_deadlock=True)
++@db.pick_context_manager_writer
++def guard_acquire(context, instance_uuid, action):
++    if not isinstance(action, str) or not action or len(action) > 64:
++        _conflict()
++    try:
++        _instance(context, instance_uuid, lock=True, authorize=False)
++    except exception.InstanceNotFound:
++        if context.session.get(m.InstanceCheckpointGuard, instance_uuid):
++            _conflict('guard_busy')
++        return None
++    existing = context.session.get(m.InstanceCheckpointGuard, instance_uuid)
++    if not CONF.checkpoint.enabled and (
++        existing is None or
++        not (
++            existing.operation_id or
++            existing.ordinary_claim_uuid or
++            existing.checkpoint_count
++        )
++    ):
++        # Disabled is not an unlock: any durable owner/checkpoint still takes
++        # the checked path below. The option is not runtime-mutable.
++        _scope_matches(context, existing, instance_uuid)
++        return None
++    guard = _guard(context, instance_uuid)
++    _check_guard(context, guard, instance_uuid, action)
++    if guard.operation_id:
++        _conflict('guard_busy')
++    if guard.ordinary_claim_uuid:
++        return c.Scope.from_primitive(context.checkpoint_scope)
++    guard.ordinary_claim_uuid = uuidutils.generate_uuid()
++    guard.ordinary_token = secrets.token_hex(32)
++    guard.ordinary_action = action
++    guard.ordinary_state = 'running'
++    guard.version += 1
++    return c.Scope(
++        instance_uuid,
++        'ordinary',
++        guard.ordinary_claim_uuid,
++        1,
++        action,
++        guard.ordinary_token,
++    )
++
++
++@require_context
++@db.pick_context_manager_writer
++def guard_release(context, scope):
++    # Successful delete may already have removed the Instance. No new
++    # admission can pass without it; keep token validation on the guard.
++    try:
++        _instance(context, scope.instance_uuid, lock=True)
++    except exception.InstanceNotFound:
++        pass
++    guard = _guard(context, scope.instance_uuid)
++    _validate_ordinary(guard, scope)
++    if guard.ordinary_state != 'running':
++        _conflict('guard_busy')
++    guard.ordinary_claim_uuid = None
++    guard.ordinary_token = None
++    guard.ordinary_action = None
++    guard.ordinary_state = None
++    guard.ordinary_target = None
++    guard.version += 1
++
++
++def _validate_ordinary(guard, scope):
++    if (
++        scope.kind != 'ordinary' or
++        scope.owner_uuid != guard.ordinary_claim_uuid or
++        scope.token != guard.ordinary_token or
++        scope.action != guard.ordinary_action
++    ):
++        _conflict('guard_busy')
++
++
++@require_context
++@db.pick_context_manager_writer
++def guard_handoff(context, scope, target):
++    _instance(context, scope.instance_uuid, lock=True)
++    guard = _guard(context, scope.instance_uuid)
++    _validate_ordinary(guard, scope)
++    if (
++        guard.ordinary_state != 'running' or
++        not isinstance(target, str) or
++        not target or
++        len(target) > 255
++    ):
++        _conflict('guard_busy')
++    guard.ordinary_state = 'queued'
++    guard.ordinary_target = target
++    guard.version += 1
++    return scope
++
++
++@require_context
++@db.pick_context_manager_writer
++def guard_adopt(context, scope, target):
++    _instance(context, scope.instance_uuid, lock=True)
++    guard = _guard(context, scope.instance_uuid)
++    _validate_ordinary(guard, scope)
++    if guard.ordinary_state != 'queued' or guard.ordinary_target != target:
++        _conflict('guard_busy')
++    guard.ordinary_state = 'running'
++    guard.ordinary_target = None
++    # A duplicate consumer has the old token, even when it races completion.
++    guard.ordinary_token = secrets.token_hex(32)
++    guard.version += 1
++    return c.Scope(
++        scope.instance_uuid,
++        'ordinary',
++        scope.owner_uuid,
++        1,
++        scope.action,
++        guard.ordinary_token,
++    )
+diff --git a/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py b/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py
+index bea577f..4b8e974 100644
+--- a/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py
++++ b/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py
+@@ -184,6 +184,7 @@ def upgrade():
+         sa.Column('ordinary_token', sa.String(64), nullable=True),
+         sa.Column('ordinary_action', sa.String(64), nullable=True),
+         sa.Column('ordinary_state', sa.String(32), nullable=True),
++        sa.Column('ordinary_target', sa.String(255), nullable=True),
+         sa.Column('version', sa.Integer, nullable=False),
+         sa.Column('created_at', sa.DateTime),
+         sa.Column('updated_at', sa.DateTime),
+diff --git a/nova/db/main/models.py b/nova/db/main/models.py
+index a58c830..92fa42b 100644
+--- a/nova/db/main/models.py
++++ b/nova/db/main/models.py
+@@ -1377,6 +1377,7 @@ class InstanceCheckpointGuard(BASE, NovaBase):
+     ordinary_token = sa.Column(sa.String(64), nullable=True)
+     ordinary_action = sa.Column(sa.String(64), nullable=True)
+     ordinary_state = sa.Column(sa.String(32), nullable=True)
++    ordinary_target = sa.Column(sa.String(255), nullable=True)
+     version = sa.Column(sa.Integer, nullable=False)
+ 
+ 
+diff --git a/nova/objects/checkpoint.py b/nova/objects/checkpoint.py
+index 781c738..047a550 100644
+--- a/nova/objects/checkpoint.py
++++ b/nova/objects/checkpoint.py
+@@ -283,6 +283,7 @@ class InstanceCheckpointGuard(_Projection):
+         'ordinary_token': fields.StringField(nullable=True),
+         'ordinary_action': fields.StringField(nullable=True),
+         'ordinary_state': fields.StringField(nullable=True),
++        'ordinary_target': fields.StringField(nullable=True),
+         'version': fields.IntegerField(),
+     }
+ 
+@@ -290,6 +291,31 @@ class InstanceCheckpointGuard(_Projection):
+     def get_by_instance_uuid(cls, context, instance_uuid):
+         return cls._from_row(context, db.guard_get(context, instance_uuid))
+ 
++    @base.remotable_classmethod
++    def check(cls, context, instance_uuid, action):
++        db.guard_check(context, instance_uuid, action)
++
++    @base.remotable_classmethod
++    def acquire(cls, context, instance_uuid, action):
++        scope = db.guard_acquire(context, instance_uuid, action)
++        return scope.to_primitive() if scope is not None else None
++
++    @base.remotable_classmethod
++    def release(cls, context, scope):
++        db.guard_release(context, contracts.Scope.from_primitive(scope))
++
++    @base.remotable_classmethod
++    def handoff(cls, context, scope, target):
++        return db.guard_handoff(
++            context, contracts.Scope.from_primitive(scope), target
++        ).to_primitive()
++
++    @base.remotable_classmethod
++    def adopt(cls, context, scope, target):
++        return db.guard_adopt(
++            context, contracts.Scope.from_primitive(scope), target
++        ).to_primitive()
++
+ 
+ @base.NovaObjectRegistry.register
+ class InstanceCheckpointList(
+diff --git a/nova/rpc.py b/nova/rpc.py
+index 7a92650..16c11f8 100644
+--- a/nova/rpc.py
++++ b/nova/rpc.py
+@@ -68,7 +68,7 @@ def init(conf):
+     TRANSPORT = create_transport(get_transport_url())
+     NOTIFICATION_TRANSPORT = messaging.get_notification_transport(
+         conf, allowed_remote_exmods=exmods)
+-    serializer = RequestContextSerializer(JsonPayloadSerializer())
++    serializer = NotificationContextSerializer(JsonPayloadSerializer())
+     if conf.notifications.notification_format == 'unversioned':
+         LEGACY_NOTIFIER = messaging.Notifier(NOTIFICATION_TRANSPORT,
+                                              serializer=serializer)
+@@ -164,6 +164,15 @@ class RequestContextSerializer(messaging.Serializer):
+         return nova.context.RequestContext.from_dict(context)
+ 
+ 
++class NotificationContextSerializer(RequestContextSerializer):
++    def serialize_context(self, context):
++        values = super().serialize_context(context)
++        for key in ('checkpoint_scope', 'checkpoint_borrowed_target',
++                    'checkpoint_scope_cell_uuid'):
++            values.pop(key, None)
++        return values
++
++
+ class ProfilerRequestContextSerializer(RequestContextSerializer):
+     def serialize_context(self, context):
+         _context = super(ProfilerRequestContextSerializer,
+diff --git a/nova/test.py b/nova/test.py
+index bd2a646..90ac1dd 100644
+--- a/nova/test.py
++++ b/nova/test.py
+@@ -837,6 +837,20 @@ class NoDBTestCase(TestCase):
+     should derive from this class.
+     """
+     USES_DB = False
++    STUB_CHECKPOINT_GUARDS = True
++
++    def setUp(self):
++        super().setUp()
++        if not self.USES_DB_SELF and self.STUB_CHECKPOINT_GUARDS:
++            # These tests intentionally supply fake/unpersisted instances and
++            # mock the persistence boundary. Checkpoint ownership has its own
++            # real-DB/API/worker tests, including DatabasePoison on compute.
++            self.useFixture(fixtures.MockPatch(
++                'nova.objects.InstanceCheckpointGuard.acquire',
++                return_value=None))
++            self.useFixture(fixtures.MockPatch(
++                'nova.objects.InstanceCheckpointGuard.check',
++                return_value=None))
+ 
+ 
+ class MatchType(object):
+diff --git a/nova/tests/unit/checkpoints/test_guard_races.py b/nova/tests/unit/checkpoints/test_guard_races.py
+new file mode 100644
+index 0000000..ab64087
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/test_guard_races.py
+@@ -0,0 +1,87 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import threading
++
++from oslo_db.sqlalchemy import test_fixtures
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova import context
++from nova.db.main import api as db
++from nova.db.main import checkpoints
++from nova import exception
++from nova import test
++from nova.tests.unit.checkpoints import test_cell_db
++
++
++class GuardRaceMixin(test_cell_db.CellDBRaceMixin):
++    def race(self, ordinary):
++        self.flags(enabled=True, group='checkpoint')
++        candidate = test_cell_db.admission(self.ctx)
++        barrier = threading.Barrier(2)
++        outcomes = []
++
++        def run(kind):
++            ctx = context.RequestContext('actor', 'project')
++            ctx.db_connection = self.manager
++            barrier.wait(timeout=10)
++            try:
++                if kind == 'checkpoint':
++                    checkpoints.admit(ctx, candidate, uuids.ticket)
++                else:
++                    ordinary(ctx)
++                outcomes.append(kind)
++            except exception.CheckpointConflict:
++                outcomes.append('denied')
++
++        threads = [
++            threading.Thread(target=run, args=(kind,))
++            for kind in ('checkpoint', 'ordinary')
++        ]
++        for thread in threads:
++            thread.start()
++        for thread in threads:
++            thread.join(timeout=20)
++            self.assertFalse(thread.is_alive())
++        self.assertEqual(2, len(outcomes))
++        self.assertEqual(1, outcomes.count('denied'))
++
++    def test_delayed_worker_and_checkpoint_have_one_winner(self):
++        self.race(
++            lambda ctx: checkpoints.guard_acquire(
++                ctx, uuids.instance, 'reboot'
++            )
++        )
++
++    def test_runtime_key_cas_races_admission(self):
++        # Both operations enter the actual DB APIs and share the Instance lock.
++        keys = (
++            '{"nova_object.data":{"objects":[{"nova_object.data":'
++            '{"public_key":"new-key"}}]}}'
++        )
++        self.race(
++            lambda ctx: db.instance_extra_update_keypairs_if_current(
++                ctx, uuids.instance, None, keys
++            )
++        )
++
++
++class MySQLGuardRace(
++    GuardRaceMixin, test_fixtures.OpportunisticDBTestMixin, test.NoDBTestCase
++):
++    FIXTURE = test_fixtures.MySQLOpportunisticFixture
++
++
++class PostgreSQLGuardRace(
++    GuardRaceMixin, test_fixtures.OpportunisticDBTestMixin, test.NoDBTestCase
++):
++    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
+diff --git a/nova/tests/unit/checkpoints/test_guards.py b/nova/tests/unit/checkpoints/test_guards.py
+new file mode 100644
+index 0000000..77002b6
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/test_guards.py
+@@ -0,0 +1,641 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from dataclasses import replace
++from functools import partial
++from unittest import mock
++
++from oslo_serialization import jsonutils
++from oslo_utils.fixture import uuidsentinel as uuids
++from oslo_utils import timeutils
++
++from nova.checkpoints import workflow
++from nova import context
++from nova.db.main import api as db
++from nova.db.main import checkpoints
++from nova import exception
++from nova import test
++from nova.tests.unit.checkpoints import test_cell_db
++
++
++class GuardMutationTest(test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.flags(enabled=True, group='checkpoint')
++        self.ctx = context.RequestContext('actor', 'project')
++        test_cell_db.make_instance(self.ctx)
++        self.admission = test_cell_db.admission(self.ctx)
++
++    def admit(self):
++        checkpoints.admit(self.ctx, self.admission, uuids.ticket)
++
++    def available(self):
++        self.admit()
++        checkpoints.mark_quota_ready(self.ctx, uuids.operation, uuids.ticket)
++        for phase in workflow.steps_for('create'):
++            step = checkpoints.claim_step(
++                self.ctx, uuids.operation, 1, phase, 'test-executor'
++            )
++            checkpoints.finish_step(
++                self.ctx,
++                step.id,
++                1,
++                test_cell_db.phase_result(phase, self.admission.fingerprint),
++            )
++        checkpoints.finalize(self.ctx, uuids.operation, 1, 'succeeded')
++
++    def mutations(self):
++        bdm = db.block_device_mapping_get_all_by_instance(
++            self.ctx, uuids.instance
++        )[0]
++        return {
++            'instance-host': partial(
++                db.instance_update,
++                self.ctx,
++                uuids.instance,
++                {'host': 'elsewhere'},
++            ),
++            'instance-destroy': partial(
++                db.instance_destroy, self.ctx, uuids.instance
++            ),
++            'bdm-update': partial(
++                db.block_device_mapping_update,
++                self.ctx,
++                bdm.id,
++                {'volume_id': uuids.other},
++                legacy=False,
++            ),
++            'bdm-create': partial(
++                db.block_device_mapping_create,
++                self.ctx,
++                dict(instance_uuid=uuids.instance, volume_id=uuids.other),
++                legacy=False,
++            ),
++            'bdm-destroy': partial(
++                db.block_device_mapping_destroy, self.ctx, bdm.id
++            ),
++            'bdm-destroy-volume': partial(
++                db.block_device_mapping_destroy_by_instance_and_volume,
++                self.ctx,
++                uuids.instance,
++                uuids.volume,
++            ),
++            'bdm-destroy-device': partial(
++                db.block_device_mapping_destroy_by_instance_and_device,
++                self.ctx,
++                uuids.instance,
++                '/dev/vda',
++            ),
++            'vif-create': partial(
++                db.virtual_interface_create,
++                self.ctx,
++                dict(
++                    instance_uuid=uuids.instance,
++                    uuid=uuids.port,
++                    address='00:00:00:00:00:01',
++                ),
++            ),
++            'vif-delete': partial(
++                db.virtual_interface_delete_by_instance,
++                self.ctx,
++                uuids.instance,
++            ),
++            'share-update': partial(
++                db.share_mapping_update,
++                self.ctx,
++                uuids.mapping,
++                uuids.instance,
++                uuids.share,
++                'attaching',
++                'tag',
++                'path',
++                'NFS',
++            ),
++            'share-delete': partial(
++                db.share_mapping_delete_by_instance_uuid_and_share_id,
++                self.ctx,
++                uuids.instance,
++                uuids.share,
++            ),
++            'extra-flavor': partial(
++                db.instance_extra_update_by_uuid,
++                self.ctx,
++                uuids.instance,
++                {'flavor': '{}'},
++            ),
++            'extra-keys-cas': partial(
++                db.instance_extra_update_keypairs_if_current,
++                self.ctx,
++                uuids.instance,
++                None,
++                '{}',
++            ),
++            'extra-keys-save': partial(
++                db.instance_extra_update_by_uuid,
++                self.ctx,
++                uuids.instance,
++                {'keypairs': '{}'},
++            ),
++            'cache-delete': partial(
++                db.instance_info_cache_delete, self.ctx, uuids.instance
++            ),
++            'cache-identity': partial(
++                db.instance_info_cache_update,
++                self.ctx,
++                uuids.instance,
++                {
++                    'network_info': jsonutils.dumps(
++                        [
++                            dict(
++                                id=uuids.port,
++                                address='00:00:00:00:00:01',
++                                network={'id': uuids.network},
++                                vnic_type='normal',
++                                model='virtio',
++                            )
++                        ]
++                    )
++                },
++            ),
++            'system-image': partial(
++                db.instance_system_metadata_update,
++                self.ctx,
++                uuids.instance,
++                {'image_hw_disk_bus': 'scsi'},
++                False,
++            ),
++        }
++
++    def test_active_checkpoint_denies_mutation_matrix(self):
++        self.admit()
++        for name, mutate in self.mutations().items():
++            with self.subTest(path=name):
++                self.assertRaises(exception.CheckpointConflict, mutate)
++        self.assertEqual(
++            self.admission.fingerprint,
++            test_cell_db.admission(self.ctx).fingerprint,
++        )
++
++    def test_available_checkpoint_denies_topology_matrix(self):
++        self.available()
++        for name, mutate in self.mutations().items():
++            with self.subTest(path=name):
++                self.assertRaises(exception.CheckpointConflict, mutate)
++
++    def test_active_checkpoint_denies_reset_even_admin(self):
++        self.admit()
++        self.assertRaises(
++            exception.CheckpointConflict,
++            db.instance_update,
++            self.ctx.elevated(),
++            uuids.instance,
++            {'task_state': None, 'vm_state': 'active'},
++        )
++
++    def test_metadata_and_cache_observations_remain_current(self):
++        self.admit()
++        db.instance_update(
++            self.ctx,
++            uuids.instance,
++            {'display_name': 'new', 'metadata': {'x': 'y'}},
++        )
++        db.instance_system_metadata_update(
++            self.ctx, uuids.instance, {'ordinary': 'value'}, False
++        )
++        db.instance_info_cache_update(
++            self.ctx, uuids.instance, {'network_info': '[]'}
++        )
++        self.assertEqual(
++            'new',
++            db.instance_get_by_uuid(self.ctx, uuids.instance).display_name,
++        )
++
++    def test_unprotected_key_cas_preserves_optimistic_check(self):
++        self.assertEqual(
++            1,
++            db.instance_extra_update_keypairs_if_current(
++                self.ctx, uuids.instance, None, '{}'
++            ),
++        )
++        self.assertEqual(
++            0,
++            db.instance_extra_update_keypairs_if_current(
++                self.ctx, uuids.instance, None, '[]'
++            ),
++        )
++
++    def test_probe_becomes_stale_after_unprotected_mutation(self):
++        db.instance_update(self.ctx, uuids.instance, {'host': 'elsewhere'})
++        self.assertRaises(exception.CheckpointConflict, self.admit)
++
++    def test_changed_disk_bus_invalidates_probe(self):
++        bdm = db.block_device_mapping_get_all_by_instance(
++            self.ctx, uuids.instance
++        )[0]
++        db.block_device_mapping_update(
++            self.ctx, bdm.id, {'disk_bus': 'scsi'}, legacy=False
++        )
++        self.assertRaises(exception.CheckpointConflict, self.admit)
++
++    def test_ordinary_power_scope_cannot_replace_disk_serial(self):
++        from nova.checkpoints import guards
++
++        self.available()
++        bdm = db.block_device_mapping_get_all_by_instance(
++            self.ctx, uuids.instance
++        )[0]
++        with guards.worker(self.ctx, uuids.instance, 'reboot') as ctx:
++            self.assertRaises(
++                exception.CheckpointConflict,
++                db.block_device_mapping_update,
++                ctx,
++                bdm.id,
++                {'connection_info': '{"serial":"replacement"}'},
++                legacy=False,
++            )
++
++
++class GuardOwnershipTest(GuardMutationTest):
++    def test_volume_backed_image_snapshot_allowed_between_checkpoints(self):
++        from nova.compute import api
++        from nova.compute import utils
++        from nova import objects
++        db.instance_update(self.ctx, uuids.instance,
++                           {'launched_at': timeutils.utcnow()})
++        self.available()
++        instance = objects.Instance.get_by_uuid(self.ctx, uuids.instance)
++        # Stop before any external effect; the actual API must reach its
++        # snapshot body while retaining an ordinary claim, despite live CPs.
++        with mock.patch.object(
++                utils, 'initialize_instance_snapshot_metadata',
++                side_effect=RuntimeError('body reached')) as initialize:
++            self.assertRaises(RuntimeError, api.API().snapshot_volume_backed,
++                              self.ctx, instance, 'image')
++        initialize.assert_called_once()
++
++    def test_notifications_do_not_publish_scope_tokens(self):
++        from nova.checkpoints import guards
++        from nova import rpc
++
++        with guards.worker(self.ctx, uuids.instance, 'reboot') as ctx:
++            value = rpc.NOTIFIER._serializer.serialize_context(ctx)
++            self.assertNotIn('checkpoint_scope', value)
++            self.assertNotIn('checkpoint_borrowed_target', value)
++            self.assertNotIn('checkpoint_scope_cell_uuid', value)
++            self.assertEqual(
++                ctx.checkpoint_scope,
++                rpc.RequestContextSerializer(None).serialize_context(ctx)[
++                    'checkpoint_scope'
++                ],
++            )
++
++    def test_local_nested_power_scope_cannot_authorize_attach(self):
++        from nova.checkpoints import guards
++
++        self.available()
++        with guards.worker(self.ctx, uuids.instance, 'reboot') as ctx:
++
++            def attach():
++                with guards.worker(ctx, uuids.instance, 'attach_volume'):
++                    self.fail('topology I/O allowed by a power scope')
++
++            self.assertRaises(exception.CheckpointConflict, attach)
++
++    def test_borrowed_call_supports_local_nested_helpers(self):
++        from nova.checkpoints import guards
++        from nova import rpc
++
++        serializer = rpc.RequestContextSerializer(None)
++        with guards.worker(self.ctx, uuids.instance, 'reboot') as ctx:
++            borrowed = context.RequestContext.from_dict(ctx.to_dict())
++            borrowed.checkpoint_borrowed_target = 'compute:reboot:compute'
++            remote = serializer.deserialize_context(
++                serializer.serialize_context(borrowed)
++            )
++            with guards.worker(
++                remote,
++                uuids.instance,
++                'reboot',
++                target='compute:reboot:compute',
++            ) as owned:
++                with guards.worker(owned, uuids.instance, 'stop') as nested:
++                    db.instance_update(
++                        nested, uuids.instance, {'power_state': 4}
++                    )
++        self.admit()
++
++    def test_scope_survives_same_cell_retarget_only(self):
++        from nova.checkpoints import guards
++
++        cell = self.cell_mappings['cell1']
++        with context.target_cell(self.ctx, cell) as original:
++            test_cell_db.make_instance(
++                original,
++                uuids.cell_instance,
++                uuids.cell_bdm,
++                uuids.cell_volume,
++            )
++            with guards.worker(original, uuids.cell_instance, 'reboot') as ctx:
++                with context.target_cell(ctx, cell) as remote:
++                    self.assertEqual(
++                        ctx.checkpoint_scope, remote.checkpoint_scope
++                    )
++                    guards.check(remote, uuids.cell_instance, 'reboot')
++                with context.target_cell(ctx, None) as remote:
++                    self.assertIsNone(remote.checkpoint_scope)
++
++    def test_disabled_without_checkpoint_keeps_legacy_path(self):
++        from nova.checkpoints import guards
++
++        self.flags(enabled=False, group='checkpoint')
++        with guards.worker(self.ctx, uuids.instance, 'reboot') as ctx:
++            self.assertIs(self.ctx, ctx)
++            self.assertIsNone(ctx.checkpoint_scope)
++        self.assertIsNone(checkpoints.guard_get(self.ctx, uuids.instance))
++
++    def test_rpc_cast_serializes_scope_and_rejects_duplicate_consumer(self):
++        from nova.checkpoints import guards
++        from nova import rpc
++
++        serializer = rpc.RequestContextSerializer(None)
++        client = mock.Mock()
++        calls = []
++        client.cast.side_effect = lambda ctx, method, **kw: calls.append(
++            (serializer.serialize_context(ctx), method)
++        )
++        transport = guards.RPCClient(client, 'compute', 'compute')
++        with guards.worker(self.ctx, uuids.instance, 'reboot') as ctx:
++            transport.cast(ctx, 'reboot_instance')
++        wire, method = calls[0]
++        remote = serializer.deserialize_context(wire)
++        self.assertRaises(exception.CheckpointConflict, self.admit)
++        with guards.worker(
++            remote,
++            uuids.instance,
++            'reboot',
++            target='compute:reboot_instance:compute',
++        ):
++            pass
++
++        def duplicate():
++            with guards.worker(
++                remote,
++                uuids.instance,
++                'reboot',
++                target='compute:reboot_instance:compute',
++            ):
++                self.fail('duplicate effect')
++
++        self.assertRaises(exception.CheckpointConflict, duplicate)
++        self.admit()
++
++    def test_rpc_call_borrows_claim_until_caller_finishes(self):
++        from nova.checkpoints import guards
++        from nova import rpc
++
++        serializer = rpc.RequestContextSerializer(None)
++
++        def consume(ctx, method, **kw):
++            ctx = serializer.deserialize_context(
++                serializer.serialize_context(ctx)
++            )
++            with guards.worker(
++                ctx,
++                uuids.instance,
++                'reboot',
++                target='compute:reboot_instance:compute',
++            ) as owned:
++                db.instance_update(owned, uuids.instance, {'power_state': 4})
++                self.assertRaises(exception.CheckpointConflict, self.admit)
++
++        client = mock.Mock(call=mock.Mock(side_effect=consume))
++        transport = guards.RPCClient(client, 'compute', 'compute')
++        with guards.worker(self.ctx, uuids.instance, 'reboot') as ctx:
++            transport.call(ctx, 'reboot_instance')
++            self.assertRaises(exception.CheckpointConflict, self.admit)
++        self.admit()
++
++    def test_api_guard_precedes_validation_and_external_io(self):
++        from nova.compute import api
++        from nova import objects
++
++        self.admit()
++        instance = objects.Instance.get_by_uuid(self.ctx, uuids.instance)
++        compute = api.API()
++        cases = (
++            ('reboot', ('HARD',)),
++            ('attach_interface', (None, uuids.port, None)),
++            ('attach_volume', (uuids.other,)),
++            ('add_runtime_ssh_key', ('ssh-rsa test',)),
++            ('delete', ()),
++            ('resize', ()),
++            ('shelve', ()),
++        )
++        for method, args in cases:
++            with self.subTest(method=method):
++                self.assertRaises(
++                    exception.CheckpointConflict,
++                    getattr(compute, method),
++                    self.ctx,
++                    instance,
++                    *args
++                )
++
++    def test_worker_guard_precedes_driver(self):
++        from nova.compute import manager
++        from nova import objects
++
++        self.admit()
++        instance = objects.Instance.get_by_uuid(self.ctx, uuids.instance)
++        compute = manager.ComputeManager()
++        with mock.patch.object(compute, '_reboot_instance') as effect:
++            self.assertRaises(
++                exception.CheckpointConflict,
++                compute.reboot_instance,
++                self.ctx,
++                instance,
++                {},
++                'HARD',
++            )
++        effect.assert_not_called()
++
++    def test_delayed_worker_and_checkpoint_have_one_winner(self):
++        from nova.checkpoints import guards
++
++        self.admit()
++        called = []
++
++        def worker():
++            with guards.worker(self.ctx, uuids.instance, 'reboot'):
++                called.append(True)
++
++        self.assertRaises(exception.CheckpointConflict, worker)
++        self.assertEqual([], called)
++
++    def test_other_worker_cannot_clear_claim(self):
++        from nova.checkpoints import guards
++        from nova import objects
++
++        with guards.worker(self.ctx, uuids.instance, 'reboot') as ctx:
++            forged = dict(ctx.checkpoint_scope, token='f' * 64)
++            self.assertRaises(
++                exception.CheckpointConflict,
++                objects.InstanceCheckpointGuard.release,
++                self.ctx,
++                forged,
++            )
++            self.assertRaises(exception.CheckpointConflict, self.admit)
++        self.admit()
++
++    def test_nested_remoted_save_uses_current_scope(self):
++        from nova.checkpoints import guards
++        from nova import objects
++        from nova import rpc
++        from nova.tests import fixtures
++
++        self.available()
++        from nova.tests.unit.objects import test_objects
++
++        self.useFixture(
++            fixtures.IndirectionAPIFixture(
++                test_objects.FakeIndirectionHack(
++                    serializer=objects.base.NovaObjectSerializer()
++                )
++            )
++        )
++        serializer = rpc.RequestContextSerializer(
++            objects.base.NovaObjectSerializer()
++        )
++        with guards.worker(self.ctx, uuids.instance, 'reboot') as ctx:
++            wire = serializer.serialize_context(ctx)
++            remote = serializer.deserialize_context(wire)
++            instance = objects.Instance.get_by_uuid(remote, uuids.instance)
++            instance.power_state = 4
++            instance.save()
++        self.assertEqual(
++            4, db.instance_get_by_uuid(self.ctx, uuids.instance).power_state
++        )
++
++    def test_api_io_claim_handoff_blocks_checkpoint(self):
++        from nova.checkpoints import guards
++        from nova import objects
++        from nova import rpc
++
++        serializer = rpc.RequestContextSerializer(None)
++        with guards.worker(self.ctx, uuids.instance, 'reboot') as api_ctx:
++            queued = guards.handoff(api_ctx, 'compute:reboot:compute')
++            wire = serializer.serialize_context(queued)
++        self.assertRaises(exception.CheckpointConflict, self.admit)
++        remote = serializer.deserialize_context(wire)
++        with guards.worker(
++            remote, uuids.instance, 'reboot', target='compute:reboot:compute'
++        ) as worker_ctx:
++            self.assertNotEqual(
++                api_ctx.checkpoint_scope['token'],
++                worker_ctx.checkpoint_scope['token'],
++            )
++            self.assertRaises(
++                exception.CheckpointConflict,
++                objects.InstanceCheckpointGuard.adopt,
++                remote,
++                remote.checkpoint_scope,
++                'compute:reboot:compute',
++            )
++        self.admit()
++
++    def test_forged_scope_admin_cannot_bypass(self):
++        from nova.checkpoints import contracts
++        from nova.checkpoints import guards
++
++        self.admit()
++        fake = contracts.Scope(
++            uuids.instance,
++            'checkpoint',
++            uuids.operation,
++            1,
++            'runtime_save',
++            'f' * 64,
++        )
++
++        def mutate():
++            with guards.scope(self.ctx.elevated(), fake) as ctx:
++                db.instance_update(ctx, uuids.instance, {'power_state': 4})
++
++        self.assertRaises(exception.CheckpointConflict, mutate)
++
++    def test_worker_exception_keeps_claim_when_feature_disabled(self):
++        from nova.checkpoints import guards
++
++        def worker():
++            with guards.worker(self.ctx, uuids.instance, 'reboot'):
++                raise RuntimeError('unknown effect')
++
++        self.assertRaises(RuntimeError, worker)
++        self.flags(enabled=False, group='checkpoint')
++        self.assertRaises(exception.CheckpointConflict, self.admit)
++        self.assertRaises(
++            exception.CheckpointConflict,
++            guards.check,
++            self.ctx,
++            uuids.instance,
++            'reset',
++        )
++
++    def test_reboot_allowed_between_checkpoints(self):
++        from nova.checkpoints import guards
++
++        self.available()
++        with guards.worker(self.ctx, uuids.instance, 'reboot') as ctx:
++            with guards.worker(ctx, uuids.instance, 'reboot') as nested:
++                db.instance_update(nested, uuids.instance, {'power_state': 4})
++            db.instance_update(ctx, uuids.instance, {'power_state': 1})
++        self.assertEqual(
++            1,
++            checkpoints.guard_get(self.ctx, uuids.instance)[
++                'checkpoint_count'
++            ],
++        )
++
++    def test_topology_denied_until_last_checkpoint_deleted(self):
++        self.available()
++        delete = replace(
++            self.admission,
++            operation_id=uuids.delete,
++            key=replace(
++                self.admission.key,
++                kind='delete',
++                request_id=uuids.delete_request,
++            ),
++        )
++        checkpoints.admit(self.ctx, delete, uuids.ticket)
++        checkpoints.mark_quota_ready(self.ctx, uuids.delete, uuids.ticket)
++        for phase in workflow.steps_for('delete'):
++            step = checkpoints.claim_step(
++                self.ctx, uuids.delete, 1, phase, 'test-executor'
++            )
++            checkpoints.finish_step(
++                self.ctx,
++                step.id,
++                1,
++                test_cell_db.phase_result(phase, delete.fingerprint),
++            )
++        checkpoints.finalize(self.ctx, uuids.delete, 1, 'succeeded')
++        self.assertRaises(
++            exception.CheckpointConflict,
++            db.instance_update,
++            self.ctx,
++            uuids.instance,
++            {'host': 'elsewhere'},
++        )
++        checkpoints.mark_quota_released(self.ctx, uuids.delete, uuids.ticket)
++        checkpoints.finalize(self.ctx, uuids.delete, 1, 'succeeded')
++        db.instance_update(self.ctx, uuids.instance, {'host': 'elsewhere'})
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 7c6a0b8..204d7a4 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -5071,7 +5071,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase,
+             mock_post_claim_migrate_data.assert_not_called()
+ 
+     def test_drop_move_claim_at_destination(self):
+-        instance = objects.Instance(flavor=objects.Flavor())
++        instance = objects.Instance(uuid=uuids.instance,
++                                    flavor=objects.Flavor())
+         with test.nested(
+             mock.patch.object(self.compute.rt, 'drop_move_claim'),
+             mock.patch.object(self.compute, '_get_nodename',
+diff --git a/nova/tests/unit/conductor/tasks/test_cross_cell_migrate.py b/nova/tests/unit/conductor/tasks/test_cross_cell_migrate.py
+index c4b6c21..2c90cff 100644
+--- a/nova/tests/unit/conductor/tasks/test_cross_cell_migrate.py
++++ b/nova/tests/unit/conductor/tasks/test_cross_cell_migrate.py
+@@ -388,7 +388,7 @@ class CrossCellMigrationTaskTestCase(test.NoDBTestCase):
+             service_host='target.host.com', cell_uuid=uuids.cell_uuid)
+         migration = objects.Migration(
+             id=1, cross_cell_move=False, source_compute='source.host.com')
+-        instance = objects.Instance()
++        instance = objects.Instance(uuid=uuids.instance)
+         self.task = cross_cell_migrate.CrossCellMigrationTask(
+             source_context,
+             instance,
+diff --git a/nova/tests/unit/db/main/test_api.py b/nova/tests/unit/db/main/test_api.py
+index d75ec0b..fd73e71 100644
+--- a/nova/tests/unit/db/main/test_api.py
++++ b/nova/tests/unit/db/main/test_api.py
+@@ -6247,6 +6247,8 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
+         # NOTE(cdent): migration 314 adds the resource_providers
+         # table with a uuid column that does not archive, so skip.
+         skip_tables = ['resource_providers', 'share_mapping']
++        skip_tables.extend(name for name in models.BASE.metadata.tables
++                           if name.startswith('instance_checkpoint'))
+         if tablename in skip_tables:
+             return 1
+         main_table = sqlalchemyutils.get_table(self.engine, tablename)
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index d6e210e..0ba4faa 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1084,7 +1084,7 @@ object_data = {
+     'InstanceCheckpointArtifactList': '1.0-980a2e851b91058a2b688bee649202ef',
+     'InstanceCheckpointDisk': '1.0-32b4b8527364c69b5b047d3534dc2f26',
+     'InstanceCheckpointDiskList': '1.0-980a2e851b91058a2b688bee649202ef',
+-    'InstanceCheckpointGuard': '1.0-e82f95884bbb1b0d0d33d3da46211154',
++    'InstanceCheckpointGuard': '1.0-22f31584562ef5abe04060939ddd4914',
+     'InstanceCheckpointList': '1.0-df8bec672e55a3a45b40eaded98ec218',
+     'InstanceCheckpointOperation': '1.0-6c6013918c1bbadc5b1a96574e975d11',
+     'InstanceCheckpointStep': '1.0-c93b4ee2e9176e4e97356aab8ea3dd0a',
+@@ -1229,6 +1229,8 @@ def get_nova_objects():
+ 
+ 
+ class TestObjectVersions(test.NoDBTestCase):
++    STUB_CHECKPOINT_GUARDS = False
++
+     def test_versions(self):
+         checker = fixture.ObjectVersionChecker(
+             get_nova_objects())
+diff --git a/nova/tests/unit/test_rpc.py b/nova/tests/unit/test_rpc.py
+index 40a914b..129413d 100644
+--- a/nova/tests/unit/test_rpc.py
++++ b/nova/tests/unit/test_rpc.py
+@@ -36,7 +36,7 @@ class TestRPC(test.NoDBTestCase):
+     @mock.patch.object(rpc, 'LEGACY_NOTIFIER')
+     @mock.patch.object(rpc, 'NOTIFIER')
+     @mock.patch.object(rpc, 'get_allowed_exmods')
+-    @mock.patch.object(rpc, 'RequestContextSerializer')
++    @mock.patch.object(rpc, 'NotificationContextSerializer')
+     @mock.patch.object(messaging, 'get_notification_transport')
+     @mock.patch.object(messaging, 'Notifier')
+     def _test_init(self, notification_format, expected_driver_topic_kwargs,

@@ -1,0 +1,3085 @@
+From a686dabb673b9cdef91002143ad09bd98af9ebf8 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 21:35:44 +0300
+Subject: [PATCH 04/10] feat: add shared checkpoint artifacts and bounded
+ staging
+
+---
+ nova/checkpoints/contracts_v2.py              |  16 +
+ nova/checkpoints/workflow_v2.py               |   7 +-
+ nova/db/main/checkpoint_effects.py            |   9 +-
+ nova/objects/checkpoint_effect.py             |   4 +
+ nova/privsep/checkpoint.py                    | 341 +++++++++++
+ .../tests/functional/test_checkpoint_store.py |  92 +++
+ nova/tests/unit/objects/test_objects.py       |   2 +-
+ nova/tests/unit/privsep/test_checkpoint.py    | 184 ++++++
+ .../unit/virt/libvirt/checkpoints/__init__.py |   0
+ .../unit/virt/libvirt/checkpoints/fixtures.py | 357 +++++++++++
+ .../virt/libvirt/checkpoints/test_staging.py  | 142 +++++
+ .../virt/libvirt/checkpoints/test_store.py    | 291 +++++++++
+ nova/virt/libvirt/checkpoints/files.py        | 392 ++++++++++++
+ nova/virt/libvirt/checkpoints/journal.py      | 115 ++++
+ nova/virt/libvirt/checkpoints/staging.py      | 572 ++++++++++++++++++
+ nova/virt/libvirt/checkpoints/store.py        | 375 ++++++++++++
+ 16 files changed, 2892 insertions(+), 7 deletions(-)
+ create mode 100644 nova/privsep/checkpoint.py
+ create mode 100644 nova/tests/functional/test_checkpoint_store.py
+ create mode 100644 nova/tests/unit/privsep/test_checkpoint.py
+ create mode 100644 nova/tests/unit/virt/libvirt/checkpoints/__init__.py
+ create mode 100644 nova/tests/unit/virt/libvirt/checkpoints/fixtures.py
+ create mode 100644 nova/tests/unit/virt/libvirt/checkpoints/test_staging.py
+ create mode 100644 nova/tests/unit/virt/libvirt/checkpoints/test_store.py
+ create mode 100644 nova/virt/libvirt/checkpoints/files.py
+ create mode 100644 nova/virt/libvirt/checkpoints/journal.py
+ create mode 100644 nova/virt/libvirt/checkpoints/staging.py
+ create mode 100644 nova/virt/libvirt/checkpoints/store.py
+
+diff --git a/nova/checkpoints/contracts_v2.py b/nova/checkpoints/contracts_v2.py
+index 647b97551faf7dc9cdce5e11f10f5cc27b3579bb..c8aeb1c62709087e80627a9e9157196ee55e3208 100644
+--- a/nova/checkpoints/contracts_v2.py
++++ b/nova/checkpoints/contracts_v2.py
+@@ -377,6 +377,12 @@ def _child_success(action, evidence):
+         v1._keys(evidence, ('workspace_id', 'limit_bytes'))
+         v1._uuid(evidence['workspace_id'])
+         v1._integer(evidence['limit_bytes'], minimum=1)
++    elif action == 'release_staging':
++        v1._keys(evidence, (
++            'workspace_id', 'deleted', 'late_effect_impossible'))
++        v1._uuid(evidence['workspace_id'])
++        v1._require(evidence['deleted'] is True and
++                    evidence['late_effect_impossible'] is True)
+     elif action == 'delete':
+         v1._keys(evidence, (
+             'artifact_id', 'deleted', 'late_effect_impossible'))
+@@ -424,3 +430,13 @@ def temporary_identity(operation, total_bytes):
+                 cell_uuid=operation.cell_uuid, reserved_bytes=total_bytes,
+                 version=1, admission_hash=v1.canonical_payload_hash(
+                     operation.admission))
++
++
++def artifact_logical_id(binding, artifact_id):
++    v1._uuid(artifact_id)
++    value = (binding.to_primitive() if isinstance(binding, Binding)
++             else binding)
++    return v1.canonical_payload_hash({
++        name: value[name] for name in ('deployment_id', 'cell_uuid',
++        'project_id', 'instance_uuid', 'checkpoint_id')} |
++        {'artifact_id': artifact_id})
+diff --git a/nova/checkpoints/workflow_v2.py b/nova/checkpoints/workflow_v2.py
+index ea344bc2c8423ee0a6d7b899725857e758ce9162..03bfc41bbba3292bb52babd4070881173ffa876f 100644
+--- a/nova/checkpoints/workflow_v2.py
++++ b/nova/checkpoints/workflow_v2.py
+@@ -27,7 +27,8 @@ DELETE = ('cinder_reserve', 'disk_snapshot_delete', 'artifact_delete',
+ CLEANUP = ('cleanup_runtime_restore_current', 'cleanup_disk_snapshots',
+            'cleanup_artifacts', 'staging_cleanup', 'cleanup_cinder_release')
+ PHASES = frozenset(CREATE + REVERT + DELETE + CLEANUP)
+-ACTIONS = frozenset(('inspect', 'reserve', 'reserve_staging', 'copy_config',
++ACTIONS = frozenset(('inspect', 'reserve', 'reserve_staging',
++                     'release_staging', 'copy_config',
+                      'save', 'submit_disk_operation', 'publish', 'download',
+                      'delete', 'stop', 'restore_paused', 'unpause',
+                      'host_disconnect', 'attachment_delete',
+@@ -84,6 +85,8 @@ def child_plan(kind, phase, resources):
+     elif phase in ('artifact_publish_shared', 'artifact_stage',
+                    'artifact_delete', 'cleanup_artifacts',
+                    'staging_cleanup'):
++        if phase == 'artifact_stage':
++            add('reserve_staging', operation)
+         action = {'artifact_publish_shared': 'publish',
+                   'artifact_stage': 'download'}.get(phase, 'delete')
+         for item in artifacts:
+@@ -91,6 +94,8 @@ def child_plan(kind, phase, resources):
+                 continue
+             add(action, item['id'], artifact_ids=[item['id']],
+                 source_id=item.get('source_id'))
++        if phase == 'staging_cleanup':
++            add('release_staging', operation)
+     elif phase == 'runtime_stop':
+         add('stop', checkpoint)
+     elif phase in ('runtime_restore_current', 'runtime_restore_checkpoint',
+diff --git a/nova/db/main/checkpoint_effects.py b/nova/db/main/checkpoint_effects.py
+index 3156b39158b06dbf72560fb296288ea370932a11..71494a6e5750da7172988dbd2d320d47889e953e 100644
+--- a/nova/db/main/checkpoint_effects.py
++++ b/nova/db/main/checkpoint_effects.py
+@@ -91,10 +91,7 @@ def _reservations(context, checkpoint_id):
+ 
+ 
+ def _logical(binding, artifact_id):
+-    return c.canonical_payload_hash({
+-        name: binding[name] for name in ('deployment_id', 'cell_uuid',
+-        'project_id', 'instance_uuid', 'checkpoint_id')} |
+-        {'artifact_id': artifact_id})
++    return v2.artifact_logical_id(binding, artifact_id)
+ 
+ 
+ def _artifact_plan(context, operation, checkpoint, phase):
+@@ -263,6 +260,8 @@ def _bind_child(context, checkpoint, operation, child, result):
+         if 'host' in evidence:
+             valid &= (evidence['host'], evidence['node']) == (
+                 operation.host, operation.node)
++        if child.action == 'release_staging':
++            valid &= evidence['workspace_id'] == operation.uuid
+         if child.action == 'reserve_staging':
+             admission = v2.decode_admission(
+                 jsonutils.loads(operation.admission))
+@@ -490,7 +489,7 @@ def _parent_success(parent, children, evidence):
+     if parent.phase in ('staging_cleanup', 'artifact_delete',
+                         'cleanup_artifacts'):
+         return set(evidence['artifact_ids']) == {
+-            row.resource_id for row in children}
++            row.resource_id for row in children if row.action == 'delete'}
+     # Other multi-resource adapters add their closed aggregation here when
+     # their success evidence is implemented. Empty graphs never imply success.
+     return len(proofs) == 1 and proofs[0] == evidence
+diff --git a/nova/objects/checkpoint_effect.py b/nova/objects/checkpoint_effect.py
+index bf6bece4892eea43b9f648043da511a8d8e14fa6..4f4e730ac82dd102c2fe41de497be5093ff051e6 100644
+--- a/nova/objects/checkpoint_effect.py
++++ b/nova/objects/checkpoint_effect.py
+@@ -48,6 +48,10 @@ class CheckpointEffect(base.NovaObject):
+ class CheckpointArtifactReservation(base.NovaObject):
+     VERSION = '1.0'
+ 
++    @base.remotable_classmethod
++    def get_by_checkpoint(cls, context, checkpoint_id):
++        return db.get_reservations(context, checkpoint_id)
++
+     @base.remotable_classmethod
+     def reserve(cls, context, child_id, artifact_id, location, upper_bound):
+         return db.reserve(
+diff --git a/nova/privsep/checkpoint.py b/nova/privsep/checkpoint.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5bb4f0e6fd7651ef15465fb9d18e510d76fe398
+--- /dev/null
++++ b/nova/privsep/checkpoint.py
+@@ -0,0 +1,341 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Narrow read/quotactl/ioctl helpers; never mount, format or manage keys."""
++
++import contextlib
++import ctypes
++import fcntl
++import os
++from pathlib import Path
++import re
++import stat
++import struct
++
++from oslo_serialization import jsonutils
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova import conf
++import nova.privsep
++from nova.virt.libvirt.checkpoints import files
++from nova.virt.libvirt.checkpoints import profiles
++
++CONF = conf.CONF
++# Linux uapi fs.h: struct fsxattr is five uint32 fields plus eight pad bytes.
++FSGETXATTR = 0x801C581F
++FSSETXATTR = 0x401C5820
++PROJINHERIT = 0x200
++
++
++def _allowed(path, staging=False):
++    roots = (
++        (CONF.checkpoint.staging_root,)
++        if staging
++        else (CONF.checkpoint.staging_root, CONF.checkpoint.store_root)
++    )
++    c._require(
++        type(path) is str and
++        path in roots and
++        path != '/' and
++        re.fullmatch(r'/[A-Za-z0-9_./-]+', path) is not None and
++        os.path.normpath(path) == path and
++        '..' not in path.split('/')
++    )
++
++
++@contextlib.contextmanager
++def _root(path):
++    fd = os.open('/', files.OPEN_DIR)
++    try:
++        for part in path.split('/')[1:]:
++            new = os.open(part, files.OPEN_DIR, dir_fd=fd)
++            os.close(fd)
++            fd = new
++        yield fd
++    finally:
++        os.close(fd)
++
++
++def _marker(fd):
++    descriptor = os.open(
++        '.checkpoint-store', os.O_RDONLY | files.OPEN_FILE, dir_fd=fd
++    )
++    with os.fdopen(descriptor, 'rb') as stream:
++        info = os.fstat(stream.fileno())
++        c._require(
++            stat.S_ISREG(info.st_mode) and
++            info.st_uid == 0 and
++            info.st_nlink == 1 and
++            not info.st_mode & 0o022 and
++            info.st_size <= files.MAX_META
++        )
++        result = jsonutils.loads(stream.read(files.MAX_META + 1))
++    c._keys(
++        result,
++        (
++            'schema_version',
++            'store_uuid',
++            'kind',
++            'encryption_at_rest',
++            'server_policy_sha256',
++        ),
++    )
++    c._integer(result['schema_version'], minimum=1, maximum=1)
++    c._uuid(result['store_uuid'])
++    c._digest(result['server_policy_sha256'])
++    c._require(result['encryption_at_rest'] is True)
++    return result
++
++
++def _mount(path):
++    # Escaped mountinfo paths are decoded; callers' roots use the closed
++    # character set above, and no returned path is executed as a command.
++    entries = []
++    for line in Path('/proc/self/mountinfo').read_text().splitlines():
++        before, after = line.split(' - ', 1)
++        left, right = before.split(), after.split()
++        point = re.sub(
++            r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), left[4]
++        )
++        if path == point or path.startswith(point.rstrip('/') + '/'):
++            entries.append(
++                (
++                    len(point),
++                    dict(
++                        mount_id=int(left[0]),
++                        device=left[2],
++                        mountpoint=point,
++                        fstype=right[0],
++                        source=right[1],
++                        options=sorted(
++                            set(left[5].split(',') + right[2].split(','))
++                        ),
++                    ),
++                )
++            )
++    c._require(bool(entries))
++    return max(entries, key=lambda item: item[0])[1]
++
++
++def _quota_call(source, number, project_id, buffer):
++    # QCMD(XQM_CMD(number), XQM_PRJQUOTA), Linux uapi dqblk_xfs.h.
++    library = ctypes.CDLL(None, use_errno=True)
++    call = library.quotactl
++    call.argtypes = [
++        ctypes.c_int,
++        ctypes.c_char_p,
++        ctypes.c_int,
++        ctypes.c_void_p,
++    ]
++    call.restype = ctypes.c_int
++    command = (((ord('X') << 8) + number) << 8) | 2
++    result = call(
++        command, os.fsencode(source), project_id, ctypes.byref(buffer)
++    )
++    if result != 0:
++        raise OSError(
++            ctypes.get_errno(), 'Checkpoint quota inspection failed'
++        )
++
++
++def _quota_flags(source):
++    buffer = ctypes.create_string_buffer(512)
++    buffer[0] = b'\x01'  # FS_QSTATV_VERSION1
++    _quota_call(source, 8, 0, buffer)
++    version, unused, flags = struct.unpack_from('=BBH', buffer.raw)
++    return version == 1 and flags & 0x30 == 0x30
++
++
++def _quota_limit(source, project_id):
++    buffer = ctypes.create_string_buffer(512)
++    _quota_call(source, 3, project_id, buffer)
++    version, flags, mask, ident, hard, soft = struct.unpack_from(
++        '=bbHIQQ', buffer.raw
++    )
++    c._require(version == 1 and flags & 2 and ident == project_id)
++    return hard * 512, soft * 512
++
++
++def _encrypted_device(device, seen=None):
++    seen = set() if seen is None else seen
++    c._require(
++        re.fullmatch(r'\d+:\d+', device) is not None and device not in seen
++    )
++    seen.add(device)
++    node = Path('/sys/dev/block') / device
++    uuid = node / 'dm' / 'uuid'
++    if uuid.exists() and uuid.read_text().strip().startswith('CRYPT-LUKS'):
++        return True
++    children = list((node / 'slaves').iterdir())
++    return bool(children) and all(
++        _encrypted_device((child / 'dev').read_text().strip(), set(seen))
++        for child in children
++    )
++
++
++def _inspect(path, staging=False):
++    _allowed(path, staging=staging)
++    mount = _mount(path)
++    with _root(path) as fd:
++        marker = _marker(fd)
++        info = os.fstat(fd)
++        c._require(
++            mount['device'] ==
++            '%s:%s' % (os.major(info.st_dev), os.minor(info.st_dev))
++        )
++        fsid = os.fstatvfs(fd).f_fsid
++    expected_kind = 'staging' if staging else 'store'
++    c._require(marker['kind'] == expected_kind)
++    common = dict(
++        kind=expected_kind,
++        mount_id=mount['mount_id'],
++        device=mount['device'],
++        source=mount['source'],
++        fstype=mount['fstype'],
++        store_uuid=marker['store_uuid'],
++        fsid=fsid,
++        server_policy_sha256=marker['server_policy_sha256'],
++        options=mount['options'],
++        encrypted_at_rest=True,
++    )
++    if staging:
++        c._require(
++            mount['fstype'] == 'xfs' and _encrypted_device(mount['device'])
++        )
++        # This initial profile supports an internal log and data device only.
++        # An encrypted data device proves nothing about external log/realtime.
++        c._require(
++            not any(
++                option.startswith(('logdev=', 'rtdev='))
++                for option in mount['options']
++            )
++        )
++        c._require(
++            stat.S_ISBLK(os.stat(mount['source']).st_mode) and
++            os.stat(mount['source']).st_rdev ==
++            os.makedev(*map(int, mount['device'].split(':')))
++        )
++        common['project_quota'] = _quota_flags(mount['source'])
++    else:
++        c._require(mount['fstype'] in ('nfs', 'nfs4'))
++        options = set(mount['options'])
++        common['encrypted_transport'] = bool(
++            options & {'xprtsec=tls', 'xprtsec=mtls', 'sec=krb5p'}
++        )
++    return common
++
++
++@nova.privsep.sys_admin_pctxt.entrypoint
++def inspect_mount(path):
++    return _inspect(path)
++
++
++@nova.privsep.sys_admin_pctxt.entrypoint
++def inspect_staging(path):
++    return _inspect(path, staging=True)
++
++
++@contextlib.contextmanager
++def _workspace(root, workspace_id, project_id):
++    _allowed(root, staging=True)
++    c._uuid(workspace_id)
++    c._integer(project_id, minimum=1, maximum=2**31 - 1)
++    observed = _inspect(root, staging=True)
++    profile = profiles.load(CONF.checkpoint.profile_file).match(observed)
++    c._require(
++        profile is not None and
++        profile.kind == 'staging' and
++        observed['project_quota'] is True and
++        profile.limits['project_id_min'] <=
++        project_id <=
++        profile.limits['project_id_max']
++    )
++    safe = files.Root(
++        root, profile, lambda path: _inspect(path, staging=True)
++    )
++    with safe.directory() as directory:
++        registry = files.read_json(directory, 'registry')
++    entry = registry['entries'][workspace_id]
++    binding = v2.Binding.from_primitive(entry['binding'])
++    c._require(
++        entry['project_id'] == project_id and
++        binding.staging_profile_id == profile.id
++    )
++    with safe.directory(files.components(binding, workspace_id)) as fd:
++        info = os.fstat(fd)
++        c._require(
++            (info.st_dev, info.st_ino) == (entry['device'], entry['inode'])
++        )
++        yield fd, observed, entry
++
++
++def _attributes(fd):
++    value = bytearray(28)
++    fcntl.ioctl(fd, FSGETXATTR, value, True)
++    return list(struct.unpack('=IIIII8s', value))
++
++
++@nova.privsep.sys_admin_pctxt.entrypoint
++def set_project_limit(root, workspace_id, project_id, bytes_limit):
++    c._integer(bytes_limit, minimum=4096)
++    c._require(bytes_limit % 4096 == 0)
++    with _workspace(root, workspace_id, project_id) as (fd, mount, entry):
++        c._require(
++            entry['limit_bytes'] == bytes_limit and not os.listdir(fd)
++        )
++        attributes = _attributes(fd)
++        c._require(
++            attributes[3] in (0, project_id) and not attributes[0] & 0x100
++        )  # FS_XFLAG_RTINHERIT
++        buffer = ctypes.create_string_buffer(512)
++        # FS_DQ_BHARD | FS_DQ_BSOFT only: no global enforcement or key changes.
++        struct.pack_into(
++            '=bbHIQQ',
++            buffer,
++            0,
++            1,
++            2,
++            0x0C,
++            project_id,
++            bytes_limit // 512,
++            bytes_limit // 512,
++        )
++        _quota_call(mount['source'], 4, project_id, buffer)
++        attributes[0] |= PROJINHERIT
++        attributes[3] = project_id
++        fcntl.ioctl(fd, FSSETXATTR, struct.pack('=IIIII8s', *attributes))
++        os.fsync(fd)
++        checked = _attributes(fd)
++        hard, soft = _quota_limit(mount['source'], project_id)
++        c._require(
++            checked[3] == project_id and
++            checked[0] & PROJINHERIT and
++            hard == soft == bytes_limit and
++            _quota_flags(mount['source'])
++        )
++    return dict(
++        project_id=project_id, limit_bytes=bytes_limit, enforced=True
++    )
++
++
++@nova.privsep.sys_admin_pctxt.entrypoint
++def get_project_limit(root, workspace_id, project_id):
++    with _workspace(root, workspace_id, project_id) as (fd, mount, entry):
++        attributes = _attributes(fd)
++        hard, soft = _quota_limit(mount['source'], project_id)
++        c._require(
++            attributes[3] == project_id and
++            attributes[0] & PROJINHERIT and
++            hard == soft == entry['limit_bytes']
++        )
++    return dict(project_id=project_id, limit_bytes=hard, enforced=True)
+diff --git a/nova/tests/functional/test_checkpoint_store.py b/nova/tests/functional/test_checkpoint_store.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bbf48799a59a118b3475f05ab734e42ad179d31d
+--- /dev/null
++++ b/nova/tests/functional/test_checkpoint_store.py
+@@ -0,0 +1,92 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Local process-crash checks, without NAS power-loss qualification."""
++
++import os
++import sqlite3
++import traceback
++from unittest import mock
++
++from oslo_db.sqlalchemy import enginefacade
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.db.main import api as db
++from nova import objects
++from nova.tests.unit.virt.libvirt.checkpoints import fixtures
++
++
++class ArtifactProcessCrashTest(fixtures.StoreTestBase):
++    def test_process_exit_after_link_retains_owned_partial_copy(self):
++        # oslo.db discards inherited connections after fork. Persist the real
++        # fixture journal so the child reconnects to the same committed rows.
++        path = self.root / 'cell.sqlite'
++        source = db.get_engine(context=self.ctx).raw_connection()
++        try:
++            with sqlite3.connect(str(path)) as target:
++                source.driver_connection.backup(target)
++        finally:
++            source.close()
++        manager = enginefacade.transaction_context()
++        manager.configure(connection='sqlite:///' + str(path))
++        self.addCleanup(manager.dispose_pool)
++        self.ctx.db_connection = manager
++        pid = os.fork()
++        if pid == 0:
++            unlink = os.unlink
++
++            def crash(name, *args, **kwargs):
++                if name == 'part':
++                    os._exit(42)
++                return unlink(name, *args, **kwargs)
++
++            try:
++                with mock.patch('os.unlink', side_effect=crash):
++                    self.publish()
++            except BaseException:
++                (self.root / 'child-error').write_text(
++                    traceback.format_exc()
++                )
++            finally:
++                os._exit(99)
++        child_pid, status = os.waitpid(pid, 0)
++        self.assertEqual(pid, child_pid)
++        error = self.root / 'child-error'
++        self.assertEqual(
++            42,
++            os.waitstatus_to_exitcode(status),
++            error.read_text() if error.exists() else '',
++        )
++        result = self.store.query(
++            self.ctx, self.binding, self.publish_child
++        )
++        self.assertEqual('failed_with_effects', result.status)
++        objects.CheckpointEffect.observe(
++            self.ctx, self.publish_child.id, 1, result.to_primitive()
++        )
++        parent = self.parent(
++            'cleanup_artifacts',
++            [
++                dict(
++                    id=uuids.shared,
++                    kind='ram',
++                    location='shared',
++                    upper_bound=fixtures.LIMIT,
++                )
++            ],
++        )
++        cleanup = self.claim(parent, 'delete')
++        self.assertEqual(
++            'succeeded',
++            self.store.delete(self.ctx, self.binding, cleanup, ()).status,
++        )
++        self.assertTrue(os.path.exists(self.workspace['path']))
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index b5e3a3c3fb53c899aa467a8db4349ff0de909b9b..13ea059c51224fe32174f60e1e39dc9d68697c01 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1078,7 +1078,7 @@ class TestRegistry(test.NoDBTestCase):
+ # objects
+ object_data = {
+     'CheckpointQuotaTicketList': '1.0-9eef9c15e15020a0109f01c50e13d512',
+-    'CheckpointArtifactReservation': '1.0-9f6b8a6916e0371c680d06dd63981f96',
++    'CheckpointArtifactReservation': '1.0-7a94e95482357b5fdc12f71a13ef2db9',
+     'CheckpointEffect': '1.0-13cf039b4ec72f2f3ed688650759d4bb',
+     'CheckpointTemporaryTicket': '1.0-675a7eb2102718702736bbda431c1c5e',
+     'CheckpointQuotaTicket': '1.0-123c9a95dc1d0bcfc8aa604d0b84f236',
+diff --git a/nova/tests/unit/privsep/test_checkpoint.py b/nova/tests/unit/privsep/test_checkpoint.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1387ecf60334a9cc5157e12378106549be13fbe4
+--- /dev/null
++++ b/nova/tests/unit/privsep/test_checkpoint.py
+@@ -0,0 +1,184 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import contextlib
++import os
++import struct
++import tempfile
++from unittest import mock
++
++from oslo_utils.fixture import uuidsentinel as uuids
++
++import nova.privsep.checkpoint
++from nova import test
++from nova.tests import fixtures
++
++
++class CheckpointPrivsepTest(test.NoDBTestCase):
++    def setUp(self):
++        super().setUp()
++        self.useFixture(fixtures.PrivsepFixture())
++
++    def test_unconfigured_root_rejected_before_privileged_io(self):
++        with mock.patch.object(
++            nova.privsep.checkpoint, '_quota_call'
++        ) as call:
++            self.assertRaises(
++                ValueError,
++                nova.privsep.checkpoint.set_project_limit,
++                '/tmp/foreign',
++                uuids.workspace,
++                100000,
++                4096,
++            )
++        call.assert_not_called()
++
++    def test_accounting_without_enforcement_is_not_supported(self):
++        for flags, expected in ((0x10, False), (0x30, True)):
++
++            def reply(source, command, project, buffer):
++                struct.pack_into('=BBH', buffer, 0, 1, 0, flags)
++
++            with mock.patch.object(
++                nova.privsep.checkpoint, '_quota_call', side_effect=reply
++            ):
++                self.assertEqual(
++                    expected,
++                    nova.privsep.checkpoint._quota_flags('/dev/test'),
++                )
++
++    def test_quota_limits_are_512_byte_basic_blocks(self):
++        def reply(source, command, project, buffer):
++            struct.pack_into('=bbHIQQ', buffer, 0, 1, 2, 0, project, 16, 8)
++
++        with mock.patch.object(
++            nova.privsep.checkpoint, '_quota_call', side_effect=reply
++        ):
++            self.assertEqual(
++                (8192, 4096),
++                nova.privsep.checkpoint._quota_limit('/dev/test', 45),
++            )
++
++    def test_set_only_owned_directory_and_exact_bound(self):
++        with tempfile.TemporaryDirectory() as path:
++            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
++            self.addCleanup(os.close, fd)
++
++            @contextlib.contextmanager
++            def workspace(root, ident, project):
++                yield fd, dict(source='/dev/test'), dict(limit_bytes=4096)
++
++            before = [0, 0, 0, 0, 0, b'\x00' * 8]
++            after = [
++                nova.privsep.checkpoint.PROJINHERIT,
++                0,
++                0,
++                45,
++                0,
++                b'\x00' * 8,
++            ]
++            with (
++                mock.patch.object(
++                    nova.privsep.checkpoint, '_workspace', workspace
++                ),
++                mock.patch.object(
++                    nova.privsep.checkpoint,
++                    '_attributes',
++                    side_effect=[before, after],
++                ),
++                mock.patch.object(
++                    nova.privsep.checkpoint, '_quota_call'
++                ) as call,
++                mock.patch.object(
++                    nova.privsep.checkpoint,
++                    '_quota_limit',
++                    return_value=(4096, 4096),
++                ),
++                mock.patch.object(
++                    nova.privsep.checkpoint,
++                    '_quota_flags',
++                    return_value=True,
++                ),
++                mock.patch.object(
++                    nova.privsep.checkpoint.fcntl, 'ioctl'
++                ) as ioctl,
++            ):
++                result = nova.privsep.checkpoint.set_project_limit(
++                    path, uuids.workspace, 45, 4096
++                )
++                self.assertEqual(
++                    dict(project_id=45, limit_bytes=4096, enforced=True),
++                    result,
++                )
++                source, command, ident, buffer = call.call_args.args
++                self.assertEqual(
++                    ('/dev/test', 4, 45), (source, command, ident)
++                )
++                self.assertEqual(
++                    (1, 2, 12, 45, 8, 8),
++                    struct.unpack_from('=bbHIQQ', buffer.raw),
++                )
++                self.assertEqual(fd, ioctl.call_args.args[0])
++                self.assertEqual(
++                    nova.privsep.checkpoint.FSSETXATTR,
++                    ioctl.call_args.args[1],
++                )
++
++    def test_unaligned_limit_rejected_without_rounding_up(self):
++        with mock.patch.object(
++            nova.privsep.checkpoint, '_workspace'
++        ) as workspace:
++            self.assertRaises(
++                ValueError,
++                nova.privsep.checkpoint.set_project_limit,
++                '/configured',
++                uuids.workspace,
++                45,
++                4097,
++            )
++        workspace.assert_not_called()
++
++    def test_external_xfs_device_is_not_implicitly_encrypted(self):
++        with tempfile.TemporaryDirectory() as path:
++            info = os.stat(path)
++            mount = dict(
++                device='%s:%s'
++                % (os.major(info.st_dev), os.minor(info.st_dev)),
++                mount_id=21,
++                source='/dev/test',
++                fstype='xfs',
++                options=['logdev=/dev/unencrypted'],
++            )
++            marker = dict(
++                kind='staging',
++                store_uuid=uuids.store,
++                server_policy_sha256='a' * 64,
++            )
++            self.flags(staging_root=path, group='checkpoint')
++            with (
++                mock.patch.object(
++                    nova.privsep.checkpoint, '_mount', return_value=mount
++                ),
++                mock.patch.object(
++                    nova.privsep.checkpoint, '_marker', return_value=marker
++                ),
++                mock.patch.object(
++                    nova.privsep.checkpoint,
++                    '_encrypted_device',
++                    return_value=True,
++                ),
++            ):
++                self.assertRaises(
++                    ValueError,
++                    nova.privsep.checkpoint.inspect_staging,
++                    path,
++                )
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/__init__.py b/nova/tests/unit/virt/libvirt/checkpoints/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/fixtures.py b/nova/tests/unit/virt/libvirt/checkpoints/fixtures.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..93447d031dc88ca586feab35abdb4a1b98bf074a
+--- /dev/null
++++ b/nova/tests/unit/virt/libvirt/checkpoints/fixtures.py
+@@ -0,0 +1,357 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import dataclasses
++import os
++from pathlib import Path
++import tempfile
++from unittest import mock
++
++from oslo_utils.fixture import uuidsentinel as uuids
++from oslo_utils import uuidutils
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova.checkpoints import workflow_v2
++from nova import context
++from nova.db.main import api as db
++from nova.db.main import checkpoints as journal
++from nova.db.main import models
++from nova import objects
++from nova import test
++from nova.tests.unit.checkpoints import test_cell_db
++from nova.virt.libvirt.checkpoints import profiles
++from nova.virt.libvirt.checkpoints import staging
++from nova.virt.libvirt.checkpoints import store
++
++LIMIT = 1024 * 1024
++
++
++class StoreTestBase(test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.flags(
++            enabled=True,
++            deployment_id=uuids.deployment,
++            group='checkpoint',
++        )
++        temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(temporary.cleanup)
++        self.root = Path(temporary.name)
++        self.shared_root, self.staging_root = (
++            self.root / 'shared',
++            self.root / 'staging',
++        )
++        self.shared_root.mkdir(mode=0o700)
++        self.staging_root.mkdir(mode=0o700)
++        self.ctx = context.RequestContext('actor', 'project')
++        test_cell_db.make_instance(self.ctx)
++        old = test_cell_db.admission(self.ctx)
++        self.admission = v2.AdmissionV2(
++            **dict(
++                {
++                    f.name: getattr(old, f.name)
++                    for f in dataclasses.fields(old)
++                },
++                artifact_upper_bound=4 * LIMIT,
++            ),
++            runtime_fingerprint='b' * 64,
++            runtime_profile_id=uuids.runtime,
++            store_profile_id=uuids.store,
++            staging_profile_id=uuids.staging,
++            save_bytes_limit=LIMIT,
++            restore_bytes_limit=LIMIT,
++        )
++        self.operation = objects.InstanceCheckpointOperation.admit(
++            self.ctx, self.admission.to_primitive(), uuids.ticket
++        )
++        journal.mark_quota_ready(self.ctx, uuids.operation, uuids.ticket)
++        self.binding = v2.Binding.from_primitive(self.operation.binding)
++        self.shared_observed = dict(
++            kind='store',
++            fstype='nfs4',
++            mount_id=21,
++            device='0:77',
++            source='test-server:/ram',
++            store_uuid=uuids.storefs,
++            encrypted_at_rest=True,
++            encrypted_transport=True,
++        )
++        self.staging_observed = dict(
++            kind='staging',
++            fstype='xfs',
++            mount_id=22,
++            device='253:2',
++            source='/dev/mapper/test-staging',
++            store_uuid=uuids.stagingfs,
++            encrypted_at_rest=True,
++            project_quota=True,
++        )
++        for root, observed in (
++            (self.shared_root, self.shared_observed),
++            (self.staging_root, self.staging_observed),
++        ):
++            device = root.stat().st_dev
++            observed.update(
++                device='%s:%s' % (os.major(device), os.minor(device)),
++                fsid=os.statvfs(root).f_fsid,
++            )
++        self.shared_observer = mock.Mock(
++            side_effect=lambda path: dict(self.shared_observed)
++        )
++        self.staging_observer = mock.Mock(
++            side_effect=lambda path: dict(self.staging_observed)
++        )
++        self.quota_helper = mock.Mock(
++            side_effect=lambda root, workspace, project, limit: dict(
++                project_id=project, limit_bytes=limit, enforced=True
++            )
++        )
++        self.staging = staging.StagingStore(
++            str(self.staging_root),
++            self.profile('staging', self.staging_observed),
++            observer=self.staging_observer,
++            quota_helper=self.quota_helper,
++            quota_observer=lambda root, workspace, project: dict(
++                project_id=project, limit_bytes=LIMIT, enforced=True
++            ),
++        )
++        self.store = store.ArtifactStore(
++            str(self.shared_root),
++            self.profile('store', self.shared_observed),
++            staging=self.staging,
++            observer=self.shared_observer,
++        )
++        self.save_parent = self.parent(
++            'runtime_save',
++            [
++                dict(
++                    id=uuids.ram,
++                    kind='ram',
++                    location='staging',
++                    upper_bound=LIMIT,
++                )
++            ],
++        )
++        reserve = self.claim(self.save_parent, 'reserve_staging')
++        self.reserve_child = reserve
++        self.workspace = self.staging.reserve(
++            self.ctx, self.binding, reserve, LIMIT
++        )
++        objects.CheckpointEffect.observe(
++            self.ctx,
++            reserve.id,
++            1,
++            v2.EffectResult(
++                'succeeded',
++                dict(workspace_id=uuids.operation, limit_bytes=LIMIT),
++                None,
++            ).to_primitive(),
++        )
++        self.save_child = self.claim(self.save_parent, 'save')
++        with self.staging.writer(
++            self.ctx, self.binding, self.save_child
++        ) as writer:
++            Path(writer.path).write_bytes(b'private-ram-state')
++            self.source = writer.finish()
++        objects.CheckpointEffect.observe(
++            self.ctx,
++            self.save_child.id,
++            1,
++            v2.EffectResult(
++                'succeeded',
++                dict(
++                    writes_stopped=True,
++                    artifacts=[self.source.to_primitive()],
++                ),
++                None,
++            ).to_primitive(),
++        )
++        self.publish_parent = self.parent(
++            'artifact_publish_shared',
++            [
++                dict(
++                    id=uuids.shared,
++                    kind='ram',
++                    location='shared',
++                    upper_bound=LIMIT,
++                    source_id=uuids.ram,
++                )
++            ],
++        )
++        self.publish_child = self.claim(self.publish_parent, 'publish')
++
++    def profile(self, kind, observed):
++        return profiles.ProfileMatch(
++            getattr(uuids, kind),
++            kind,
++            c.canonical_payload_hash(observed),
++            'a' * 64,
++            observed,
++            dict(
++                max_bytes=4 * LIMIT,
++                metadata_bytes=262144,
++                allocation_unit=4096,
++                max_workspaces=128,
++                project_id_min=100000,
++                project_id_max=2147483647,
++            ),
++        )
++
++    def parent(self, phase, artifacts):
++        ident = uuidutils.generate_uuid()
++        resources = dict(
++            parent_step_id=ident,
++            operation_id=uuids.operation,
++            checkpoint_id=uuids.checkpoint,
++            volume_ids=[uuids.volume],
++            artifacts=artifacts,
++        )
++        kind = (
++            'revert'
++            if phase == 'artifact_stage'
++            else 'cleanup' if phase.startswith('cleanup_') else 'create'
++        )
++        graph = workflow_v2.child_plan(kind, phase, resources)
++        payload = dict(
++            binding=self.binding.to_primitive(),
++            kind='create',
++            generation=1,
++            budgets=dict(total_bytes=4 * LIMIT, version=1),
++            children=[r['id'] for r in graph],
++            prior={},
++            resources=resources,
++        )
++
++        @db.pick_context_manager_writer
++        def insert(ctx):
++            # Seed this phase independently from the not-yet-wired adapters;
++            # real OVO reservation/claim below remains mandatory before I/O.
++            ctx.session.add(
++                models.InstanceCheckpointStep(
++                    uuid=ident,
++                    operation_id=uuids.operation,
++                    generation=1,
++                    phase=phase,
++                    executor_id='test-executor',
++                    payload_hash=c.canonical_payload_hash(payload),
++                    payload=journal._encode(payload),
++                    status='dispatching',
++                    version=1,
++                    contract_version=2,
++                    child_plan_count=len(graph),
++                    child_plan_hash=c.canonical_payload_hash(
++                        {'children': graph}
++                    ),
++                )
++            )
++            ctx.session.flush()
++            for index, child in enumerate(graph):
++                ctx.session.add(
++                    models.InstanceCheckpointEffect(
++                        id=child['id'],
++                        parent_step_id=ident,
++                        operation_id=uuids.operation,
++                        generation=1,
++                        action=child['action'],
++                        resource_id=child['resource_id'],
++                        executor_id='test-executor',
++                        payload=journal._encode(child['payload']),
++                        payload_hash=c.canonical_payload_hash(
++                            child['payload']
++                        ),
++                        status='prepared',
++                        revision=1,
++                        sequence=index,
++                    )
++                )
++
++        insert(self.ctx)
++        for child in objects.CheckpointEffect.get_children(
++            self.ctx, ident
++        ):
++            if child['action'] in (
++                'save',
++                'publish',
++                'download',
++                'copy_config',
++            ):
++                descriptor = next(
++                    r for r in artifacts if r['id'] == child['resource_id']
++                )
++                objects.CheckpointArtifactReservation.reserve(
++                    self.ctx,
++                    child['id'],
++                    descriptor['id'],
++                    descriptor['location'],
++                    descriptor['upper_bound'],
++                )
++        return ident
++
++    def claim(self, parent_id, action):
++        row = next(
++            r
++            for r in objects.CheckpointEffect.get_children(
++                self.ctx, parent_id
++            )
++            if r['action'] == action
++        )
++        row = objects.CheckpointEffect.claim(
++            self.ctx, row['id'], 1, 'test-executor', row['revision']
++        )
++        self.assertIsNotNone(row)
++        return v2.ChildIntent(
++            **{
++                f.name: row[f.name]
++                for f in dataclasses.fields(v2.ChildIntent)
++            }
++        )
++
++    def publish(self):
++        return self.store.publish(
++            self.ctx, self.binding, self.publish_child, self.source, LIMIT
++        )
++
++    def downloaded_child(self):
++        result = self.publish()
++        self.assertEqual('succeeded', result.status)
++        shared = v2.ArtifactRef.from_primitive(result.evidence['artifact'])
++        objects.CheckpointEffect.observe(
++            self.ctx, self.publish_child.id, 1, result.to_primitive()
++        )
++        parent = self.parent(
++            'artifact_stage',
++            [
++                dict(
++                    id=uuids.download,
++                    kind='ram',
++                    location='staging',
++                    upper_bound=LIMIT,
++                    source_id=shared.id,
++                )
++            ],
++        )
++        reserved = self.claim(parent, 'reserve_staging')
++        workspace = self.staging.reserve(
++            self.ctx, self.binding, reserved, LIMIT
++        )
++        objects.CheckpointEffect.observe(
++            self.ctx,
++            reserved.id,
++            1,
++            v2.EffectResult(
++                'succeeded',
++                dict(workspace_id=uuids.operation, limit_bytes=LIMIT),
++                None,
++            ).to_primitive(),
++        )
++        return self.claim(parent, 'download'), shared, workspace
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/test_staging.py b/nova/tests/unit/virt/libvirt/checkpoints/test_staging.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..60ba7c6f4e8d5a191f67552dfa2e21eab3039249
+--- /dev/null
++++ b/nova/tests/unit/virt/libvirt/checkpoints/test_staging.py
+@@ -0,0 +1,142 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import ctypes
++from pathlib import Path
++
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import contracts_v2 as v2
++from nova import objects
++
++from nova.tests.unit.virt.libvirt.checkpoints import fixtures
++
++
++class StagingStoreTest(fixtures.StoreTestBase):
++    def test_workspace_has_enforced_bound_and_namespace(self):
++        self.assertEqual(fixtures.LIMIT, self.workspace['limit_bytes'])
++        self.assertGreater(self.workspace['project_id'], 0)
++        self.assertTrue(Path(self.workspace['path']).is_dir())
++        self.quota_helper.assert_called_once()
++
++    def test_missing_encryption_or_quota_disables_probe(self):
++        self.staging_observed['encrypted_at_rest'] = False
++        self.assertFalse(self.staging.probe()['supported'])
++        self.staging_observed['encrypted_at_rest'] = True
++        self.staging_observed['project_quota'] = False
++        self.assertFalse(self.staging.probe()['supported'])
++
++    def test_unknown_writer_cannot_be_cleaned(self):
++        # A successful local file alone does not replace the journal's writer
++        # fence. The destination publisher remains dispatching in this fixture.
++        result = self.staging.cleanup(
++            self.ctx, self.binding, self.publish_child
++        )
++        self.assertNotEqual('succeeded', result.status)
++        self.assertTrue(Path(self.workspace['path']).is_dir())
++
++    def test_lost_registry_is_not_treated_as_new_storage(self):
++        (self.staging_root / 'registry').unlink()
++        self.assertFalse(self.staging.probe()['supported'])
++        self.assertEqual(
++            'unknown',
++            self.staging.observe(
++                self.ctx, self.binding, self.reserve_child
++            ).status,
++        )
++
++    def test_unknown_peer_writer_blocks_artifact_cleanup(self):
++        child, shared, workspace = self.downloaded_child()
++        with self.staging.writer(self.ctx, self.binding, child) as writer:
++            Path(writer.path).write_bytes(b'partial')
++        objects.CheckpointEffect.observe(
++            self.ctx,
++            child.id,
++            1,
++            v2.EffectResult(
++                'unknown', {}, 'recovery_required'
++            ).to_primitive(),
++        )
++        parent = self.parent(
++            'cleanup_artifacts',
++            [
++                dict(
++                    id=uuids.ram,
++                    kind='ram',
++                    location='staging',
++                    upper_bound=fixtures.LIMIT,
++                )
++            ],
++        )
++        cleanup = self.claim(parent, 'delete')
++        self.assertNotEqual(
++            'succeeded',
++            self.staging.cleanup(self.ctx, self.binding, cleanup).status,
++        )
++        self.assertTrue(
++            (
++                Path(self.workspace['path']) /
++                'artifacts' /
++                uuids.ram /
++                'data'
++            ).exists()
++        )
++
++    def test_workspace_released_after_all_delete_children(self):
++        parent = self.parent(
++            'staging_cleanup',
++            [
++                dict(
++                    id=uuids.ram,
++                    kind='ram',
++                    location='staging',
++                    upper_bound=fixtures.LIMIT,
++                )
++            ],
++        )
++        child = self.claim(parent, 'delete')
++        result = self.staging.cleanup(self.ctx, self.binding, child)
++        self.assertEqual('succeeded', result.status)
++        objects.CheckpointEffect.observe(
++            self.ctx, child.id, 1, result.to_primitive()
++        )
++        release = self.claim(parent, 'release_staging')
++        result = self.staging.cleanup(self.ctx, self.binding, release)
++        self.assertEqual('succeeded', result.status)
++        self.assertFalse(Path(self.workspace['path']).exists())
++        self.assertEqual(
++            result, self.staging.observe(self.ctx, self.binding, release)
++        )
++
++    def test_sparse_logical_size_is_charged(self):
++        child, shared, workspace = self.downloaded_child()
++        with self.staging.writer(self.ctx, self.binding, child) as writer:
++            with open(writer.path, 'wb') as stream:
++                stream.truncate(fixtures.LIMIT // 2)
++            artifact = writer.finish()
++        self.assertGreater(artifact.bytes, fixtures.LIMIT // 2)
++
++    def test_allocated_space_beyond_bound_is_not_confirmed(self):
++        child, shared, workspace = self.downloaded_child()
++        with self.staging.writer(self.ctx, self.binding, child) as writer:
++            allocate = ctypes.CDLL(None, use_errno=True).fallocate
++            allocate.argtypes = [
++                ctypes.c_int,
++                ctypes.c_int,
++                ctypes.c_longlong,
++                ctypes.c_longlong,
++            ]
++            allocate.restype = ctypes.c_int
++            # KEEP_SIZE allocates extents without increasing logical length.
++            self.assertEqual(0, allocate(writer.fd, 1, 0, fixtures.LIMIT))
++            self.assertEqual(0, Path(writer.path).stat().st_size)
++            self.assertRaises(ValueError, writer.finish)
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/test_store.py b/nova/tests/unit/virt/libvirt/checkpoints/test_store.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..84821daffa1bde9e3e6d2b76c8667fa3ac4d30a9
+--- /dev/null
++++ b/nova/tests/unit/virt/libvirt/checkpoints/test_store.py
+@@ -0,0 +1,291 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import dataclasses
++import os
++from pathlib import Path
++from unittest import mock
++
++from oslo_utils.fixture import uuidsentinel as uuids
++import testtools
++
++from nova.checkpoints import contracts_v2 as v2
++from nova import objects
++from nova.tests.unit.virt.libvirt.checkpoints import fixtures
++from nova.virt.libvirt.checkpoints import files
++
++
++class ArtifactStoreTest(fixtures.StoreTestBase):
++    def test_cleanup_never_deletes_replaced_payload(self):
++        result = self.publish()
++        ref = v2.ArtifactRef.from_primitive(result.evidence['artifact'])
++        objects.CheckpointEffect.observe(
++            self.ctx, self.publish_child.id, 1, result.to_primitive()
++        )
++        parent = self.parent(
++            'cleanup_artifacts',
++            [
++                dict(
++                    id=ref.id,
++                    kind='ram',
++                    location='shared',
++                    upper_bound=fixtures.LIMIT,
++                )
++            ],
++        )
++        child = self.claim(parent, 'delete')
++        path = Path(self.store.artifact_path(self.binding, ref.id))
++        # Keep the old inode allocated so this is certainly a replacement.
++        descriptor = os.open(path, os.O_RDONLY)
++        self.addCleanup(os.close, descriptor)
++        path.unlink()
++        path.write_bytes(b'foreign')
++        path.chmod(0o600)
++        self.assertNotEqual(
++            'succeeded',
++            self.store.delete(
++                self.ctx, self.binding, child, (ref,)
++            ).status,
++        )
++        self.assertEqual(b'foreign', path.read_bytes())
++
++    def test_lost_mount_never_writes_to_local_fallback(self):
++        self.shared_observed['mount_id'] += 1
++        result = self.publish()
++        self.assertEqual('unknown', result.status)
++        self.assertEqual([], list(self.shared_root.iterdir()))
++
++    def test_publish_and_query_are_bound_and_query_does_not_write(self):
++        result = self.publish()
++        self.assertEqual('succeeded', result.status)
++        artifact = v2.ArtifactRef.from_primitive(
++            result.evidence['artifact']
++        )
++        before = {
++            str(p): (p.stat().st_ino, p.stat().st_mtime_ns)
++            for p in self.shared_root.rglob('*')
++        }
++        again = self.store.query(
++            self.ctx, self.binding, self.publish_child
++        )
++        self.assertEqual(result, again)
++        self.assertEqual(
++            before,
++            {
++                str(p): (p.stat().st_ino, p.stat().st_mtime_ns)
++                for p in self.shared_root.rglob('*')
++            },
++        )
++        self.assertEqual(
++            b'private-ram-state',
++            Path(
++                self.store.artifact_path(self.binding, artifact.id)
++            ).read_bytes(),
++        )
++        self.assertGreater(artifact.bytes, len(b'private-ram-state'))
++
++    def test_foreign_final_is_never_replaced(self):
++        path = Path(self.store.artifact_path(self.binding, uuids.shared))
++        path.parent.mkdir(parents=True)
++        path.write_bytes(b'foreign')
++        self.assertNotEqual('succeeded', self.publish().status)
++        self.assertEqual(b'foreign', path.read_bytes())
++
++    def test_duplicate_publish_preserves_inode(self):
++        first = self.publish()
++        path = Path(self.store.artifact_path(self.binding, uuids.shared))
++        inode = path.stat().st_ino
++        self.assertEqual(first, self.publish())
++        self.assertEqual(inode, path.stat().st_ino)
++
++    def test_cross_cell_binding_is_rejected_before_write(self):
++        other = dataclasses.replace(
++            self.binding, cell_uuid=uuids.othercell
++        )
++        result = self.store.publish(
++            self.ctx,
++            other,
++            self.publish_child,
++            self.source,
++            fixtures.LIMIT,
++        )
++        self.assertNotEqual('succeeded', result.status)
++        self.assertEqual([], list(self.shared_root.iterdir()))
++
++    def test_symlink_is_never_followed(self):
++        target = self.root / 'foreign'
++        target.mkdir()
++        os.symlink(target, self.shared_root / self.binding.deployment_id)
++        self.assertNotEqual('succeeded', self.publish().status)
++        self.assertEqual([], list(target.iterdir()))
++
++    def test_checksum_and_inode_changes_are_rejected(self):
++        self.assertEqual('succeeded', self.publish().status)
++        path = Path(self.store.artifact_path(self.binding, uuids.shared))
++        original = path.read_bytes()
++        path.unlink()
++        path.write_bytes(original)
++        result = self.store.query(
++            self.ctx, self.binding, self.publish_child
++        )
++        self.assertNotEqual('succeeded', result.status)
++
++    def test_fsync_failure_never_claims_success(self):
++        with mock.patch('os.fsync', side_effect=OSError('fsync failed')):
++            result = self.publish()
++        self.assertNotEqual('succeeded', result.status)
++
++    def test_copy_limit_is_checked_before_payload_write(self):
++        result = self.store.publish(
++            self.ctx, self.binding, self.publish_child, self.source, 1
++        )
++        self.assertNotEqual('succeeded', result.status)
++        self.assertEqual([], list(self.shared_root.iterdir()))
++
++    def test_missing_owner_does_not_prove_deletion(self):
++        result = self.publish()
++        self.assertEqual('succeeded', result.status)
++        ref = v2.ArtifactRef.from_primitive(result.evidence['artifact'])
++        objects.CheckpointEffect.observe(
++            self.ctx, self.publish_child.id, 1, result.to_primitive()
++        )
++        parent = self.parent(
++            'cleanup_artifacts',
++            [
++                dict(
++                    id=ref.id,
++                    kind='ram',
++                    location='shared',
++                    upper_bound=fixtures.LIMIT,
++                )
++            ],
++        )
++        child = self.claim(parent, 'delete')
++        path = Path(self.store.artifact_path(self.binding, ref.id))
++        (path.parent / 'owner').unlink()
++        deleted = self.store.delete(self.ctx, self.binding, child, (ref,))
++        self.assertNotEqual('succeeded', deleted.status)
++        self.assertTrue(path.exists())
++
++    def test_interrupted_link_publish_is_observed_without_mutation(self):
++        unlink = os.unlink
++
++        def fail_part(name, *args, **kwargs):
++            if name == 'part':
++                raise OSError('copy interrupted after link')
++            return unlink(name, *args, **kwargs)
++
++        with mock.patch('os.unlink', side_effect=fail_part):
++            self.assertNotEqual('succeeded', self.publish().status)
++        before = {
++            str(p): (p.stat().st_ino, p.stat().st_nlink)
++            for p in self.shared_root.rglob('*')
++        }
++        result = self.store.query(
++            self.ctx, self.binding, self.publish_child
++        )
++        self.assertEqual('failed_with_effects', result.status)
++        self.assertEqual((uuids.shared,), result.evidence['resource_ids'])
++        self.assertEqual(
++            before,
++            {
++                str(p): (p.stat().st_ino, p.stat().st_nlink)
++                for p in self.shared_root.rglob('*')
++            },
++        )
++
++    def test_download_keeps_shared_source_immutable(self):
++        child, shared, workspace = self.downloaded_child()
++        path = Path(self.store.artifact_path(self.binding, shared.id))
++        before = path.stat()
++        result = self.store.download(
++            self.ctx, self.binding, child, shared, workspace
++        )
++        self.assertEqual('succeeded', result.status)
++        self.assertEqual(
++            shared.checksum, result.evidence['artifact']['checksum']
++        )
++        self.assertEqual(before.st_ino, path.stat().st_ino)
++        self.assertEqual(before.st_mtime_ns, path.stat().st_mtime_ns)
++        self.assertEqual(b'private-ram-state', path.read_bytes())
++
++    def test_corrupt_source_is_not_downloaded(self):
++        child, shared, workspace = self.downloaded_child()
++        path = Path(self.store.artifact_path(self.binding, shared.id))
++        os.chmod(path, 0o600)
++        path.write_bytes(b'changed')
++        result = self.store.download(
++            self.ctx, self.binding, child, shared, workspace
++        )
++        self.assertNotEqual('succeeded', result.status)
++        self.assertFalse(
++            (
++                Path(workspace['path']) / 'artifacts' / child.resource_id
++            ).exists()
++        )
++
++    def test_download_reply_loss_is_observed_without_writes(self):
++        child, shared, workspace = self.downloaded_child()
++        result = self.store.download(
++            self.ctx, self.binding, child, shared, workspace
++        )
++        self.assertEqual('succeeded', result.status)
++        with mock.patch(
++            'os.write', side_effect=AssertionError('query wrote')
++        ):
++            self.assertEqual(
++                result, self.store.query(self.ctx, self.binding, child)
++            )
++
++    def test_unsealed_download_is_fenced_after_worker_exit(self):
++        child, shared, workspace = self.downloaded_child()
++        with mock.patch.object(self.store, '_copy', side_effect=OSError()):
++            self.assertEqual(
++                'unknown',
++                self.store.download(
++                    self.ctx, self.binding, child, shared, workspace
++                ).status,
++            )
++        result = self.store.query(self.ctx, self.binding, child)
++        self.assertEqual('failed_with_effects', result.status)
++        self.assertEqual(
++            (child.resource_id,), result.evidence['resource_ids']
++        )
++
++    def test_active_download_writer_is_not_terminal(self):
++        child, shared, workspace = self.downloaded_child()
++        with self.staging.writer(self.ctx, self.binding, child):
++            self.assertEqual(
++                'pending',
++                self.store.query(self.ctx, self.binding, child).status,
++            )
++
++    def test_opened_root_must_match_observed_mount_before_mkdir(self):
++        observed = dict(self.shared_observed, device='123:456')
++        root = files.Root(
++            str(self.shared_root),
++            self.profile('store', observed),
++            lambda path: observed,
++        )
++        with testtools.ExpectedException(ValueError):
++            with root.directory(('must-not-be-created',), create=True):
++                pass
++        self.assertEqual([], list(self.shared_root.iterdir()))
++
++    def test_traversal_root_is_rejected(self):
++        self.assertRaises(
++            ValueError,
++            files.Root,
++            str(self.shared_root) + '/../foreign',
++            self.store.profile,
++            self.shared_observer,
++        )
+diff --git a/nova/virt/libvirt/checkpoints/files.py b/nova/virt/libvirt/checkpoints/files.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..edf11a9d23083683a5158e3ffbe4389b71138b9c
+--- /dev/null
++++ b/nova/virt/libvirt/checkpoints/files.py
+@@ -0,0 +1,392 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Descriptor-relative private files and immutable publication primitives."""
++
++import contextlib
++import fcntl
++import hashlib
++import os
++from pathlib import PurePosixPath
++import stat
++
++from oslo_serialization import jsonutils
++
++from nova.checkpoints import contracts as c
++
++OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
++OPEN_FILE = os.O_NOFOLLOW | os.O_NONBLOCK
++MAX_META = 64 * 1024
++
++
++def components(binding, artifact_id):
++    c._uuid(artifact_id)
++    return (
++        binding.deployment_id,
++        binding.cell_uuid,
++        hashlib.sha256(binding.project_id.encode('utf-8')).hexdigest(),
++        binding.instance_uuid,
++        binding.checkpoint_id,
++        artifact_id,
++    )
++
++
++def private(info, directory=False):
++    c._require(
++        (
++            stat.S_ISDIR(info.st_mode)
++            if directory
++            else stat.S_ISREG(info.st_mode)
++        ) and
++        info.st_uid in (0, os.geteuid()) and
++        not info.st_mode & 0o007 and
++        (not info.st_mode & 0o020 or info.st_gid == os.getegid())
++    )
++
++
++def regular(fd, links=(1,)):
++    info = os.fstat(fd)
++    private(info)
++    c._require(info.st_nlink in links)
++    return info
++
++
++def read_json(directory, name):
++    fd = os.open(name, os.O_RDONLY | OPEN_FILE, dir_fd=directory)
++    with os.fdopen(fd, 'rb') as stream:
++        info = regular(stream.fileno())
++        c._require(info.st_size <= MAX_META)
++        value = jsonutils.loads(stream.read(MAX_META + 1))
++    c._require(type(value) is dict)
++    return value
++
++
++def write_all(fd, data):
++    offset = 0
++    while offset < len(data):
++        count = os.write(fd, data[offset:])
++        if count <= 0:
++            raise OSError('Short checkpoint write')
++        offset += count
++
++
++def create_json(directory, name, value):
++    raw = jsonutils.dump_as_bytes(
++        value, sort_keys=True, separators=(',', ':')
++    )
++    c._require(len(raw) <= MAX_META)
++    fd = os.open(
++        name,
++        os.O_WRONLY | os.O_CREAT | os.O_EXCL | OPEN_FILE,
++        0o600,
++        dir_fd=directory,
++    )
++    try:
++        write_all(fd, raw)
++        os.fsync(fd)
++    finally:
++        os.close(fd)
++    os.fsync(directory)
++
++
++def fingerprint(fd, metadata_bytes, links=(1,)):
++    before = regular(fd, links)
++    digest = hashlib.sha256()
++    os.lseek(fd, 0, os.SEEK_SET)
++    while True:
++        block = os.read(fd, 1024 * 1024)
++        if not block:
++            break
++        digest.update(block)
++    after = regular(fd, links)
++    fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
++    c._require(
++        all(getattr(before, f) == getattr(after, f) for f in fields)
++    )
++    return dict(
++        device=after.st_dev,
++        inode=after.st_ino,
++        logical_bytes=after.st_size,
++        allocated_bytes=after.st_blocks * 512,
++        mtime_ns=after.st_mtime_ns,
++        ctime_ns=after.st_ctime_ns,
++        bytes=max(after.st_size, after.st_blocks * 512) + metadata_bytes,
++        checksum=digest.hexdigest(),
++    )
++
++
++@contextlib.contextmanager
++def locked(directory, exclusive=True, create=False):
++    flags = os.O_RDWR | OPEN_FILE
++    if create:
++        flags |= os.O_CREAT | os.O_EXCL
++    fd = os.open('lock', flags, 0o600, dir_fd=directory)
++    try:
++        regular(fd)
++        fcntl.flock(
++            fd,
++            (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) |
++            fcntl.LOCK_NB,
++        )
++        yield fd
++    finally:
++        os.close(fd)
++
++
++class Root:
++    def __init__(self, path, profile, observer):
++        c._require(
++            type(path) is str and
++            path.startswith('/') and
++            str(PurePosixPath(path)) == path and
++            '..' not in path.split('/')
++        )
++        self.path, self.profile, self.observer = path, profile, observer
++        for key in ('metadata_bytes', 'allocation_unit', 'max_bytes'):
++            c._integer(profile.limits[key], minimum=1)
++        c._require(profile.limits['metadata_bytes'] >= 4 * MAX_META)
++
++    def check(self):
++        value = self.observer(self.path)
++        c._require(value == c._json(self.profile.observed))
++        c._require(value['encrypted_at_rest'] is True)
++        if self.profile.kind == 'store':
++            c._require(
++                value['fstype'] in ('nfs', 'nfs4') and
++                value['encrypted_transport'] is True
++            )
++        else:
++            c._require(
++                value['fstype'] == 'xfs' and value['project_quota'] is True
++            )
++        return value
++
++    @contextlib.contextmanager
++    def directory(self, parts=(), create=False):
++        observed = self.check()
++        descriptor = os.open('/', OPEN_DIR)
++        try:
++            for part in PurePosixPath(self.path).parts[1:]:
++                new = os.open(part, OPEN_DIR, dir_fd=descriptor)
++                os.close(descriptor)
++                descriptor = new
++            root = os.fstat(descriptor)
++            private(root, directory=True)
++            c._require(
++                observed['device'] ==
++                '%s:%s' % (os.major(root.st_dev), os.minor(root.st_dev)) and
++                observed['fsid'] == os.fstatvfs(descriptor).f_fsid
++            )
++            for part in parts:
++                c._require(
++                    type(part) is str and
++                    part not in ('', '.', '..') and
++                    '/' not in part and
++                    '\\' not in part
++                )
++                if create:
++                    try:
++                        os.mkdir(part, 0o700, dir_fd=descriptor)
++                        os.fsync(descriptor)
++                    except FileExistsError:
++                        pass
++                new = os.open(part, OPEN_DIR, dir_fd=descriptor)
++                os.close(descriptor)
++                descriptor = new
++                info = os.fstat(descriptor)
++                private(info, directory=True)
++                c._require(info.st_dev == root.st_dev)
++            self.check()
++            yield descriptor
++        finally:
++            os.close(descriptor)
++
++    def artifact_path(self, binding, artifact_id):
++        return os.path.join(
++            self.path, *components(binding, artifact_id), 'data'
++        )
++
++    def budget(self, limit):
++        c._integer(limit, minimum=1)
++        c._require(
++            limit <= self.profile.limits['max_bytes'] and
++            limit > self.profile.limits['metadata_bytes']
++        )
++        return limit - self.profile.limits['metadata_bytes']
++
++
++def owner(binding, child, row, profile_id, data_fd):
++    info = regular(data_fd)
++    return dict(
++        format=2,
++        binding=binding.to_primitive(),
++        child=child.to_primitive(),
++        artifact_id=row['id'],
++        kind=row['kind'],
++        location=row['location'],
++        upper_bound=row['upper_bound'],
++        profile_id=profile_id,
++        device=info.st_dev,
++        inode=info.st_ino,
++    )
++
++
++def check_owner(value, binding, child, row, profile_id):
++    c._keys(
++        value,
++        (
++            'format',
++            'binding',
++            'child',
++            'artifact_id',
++            'kind',
++            'location',
++            'upper_bound',
++            'profile_id',
++            'device',
++            'inode',
++        ),
++    )
++    c._require(
++        value['format'] == 2 and
++        value['binding'] == binding.to_primitive() and
++        value['child'] == child.to_primitive() and
++        value['artifact_id'] == row['id'] and
++        value['profile_id'] == profile_id and
++        value['location'] == row['location'] and
++        value['kind'] == row['kind'] and
++        value['upper_bound'] == row['upper_bound']
++    )
++
++
++def seal(directory, fd, binding, child, row, metadata_bytes):
++    from nova.checkpoints import contracts_v2 as v2
++
++    os.fsync(fd)
++    os.fchmod(fd, 0o400)
++    os.fsync(fd)
++    observed = fingerprint(fd, metadata_bytes)
++    c._require(observed['bytes'] <= row['upper_bound'])
++    ref = v2.ArtifactRef(
++        row['id'],
++        row['kind'],
++        v2.artifact_logical_id(binding, row['id']),
++        observed['bytes'],
++        observed['checksum'],
++        row['location'],
++    )
++    value = dict(
++        format=2,
++        owner_sha256=c.canonical_payload_hash(
++            read_json(directory, 'owner')
++        ),
++        artifact=ref.to_primitive(),
++        file=observed,
++    )
++    create_json(directory, 'seal', value)
++    return ref
++
++
++def inspect(directory, metadata_bytes):
++    from nova.checkpoints import contracts_v2 as v2
++
++    recorded = read_json(directory, 'seal')
++    c._keys(recorded, ('format', 'owner_sha256', 'artifact', 'file'))
++    c._require(
++        recorded['format'] == 2 and
++        recorded['owner_sha256'] ==
++        c.canonical_payload_hash(read_json(directory, 'owner'))
++    )
++    fd = os.open('data', os.O_RDONLY | OPEN_FILE, dir_fd=directory)
++    try:
++        current = fingerprint(fd, metadata_bytes)
++        c._require(current == recorded['file'])
++        ref = v2.ArtifactRef.from_primitive(recorded['artifact'])
++        c._require(
++            ref.checksum == current['checksum'] and
++            ref.bytes == current['bytes']
++        )
++        return ref, current
++    finally:
++        os.close(fd)
++
++
++def erase(directory, expected_owner):
++    value = read_json(directory, 'owner')
++    c._require(value == expected_owner)
++    names = set(os.listdir(directory))
++    c._require(names <= {'data', 'part', 'owner', 'seal', 'lock'})
++    # A two-link inode is allowed only for this intent's interrupted publish.
++    stats = {
++        n: os.stat(n, dir_fd=directory, follow_symlinks=False)
++        for n in names
++    }
++    for name, info in stats.items():
++        private(info)
++        if name in ('data', 'part'):
++            c._require((info.st_dev, info.st_ino) ==
++                       (value['device'], value['inode']))
++        if info.st_nlink != 1:
++            c._require(
++                name in ('data', 'part') and
++                info.st_nlink == 2 and
++                {'data', 'part'} <= names and
++                (stats['data'].st_dev, stats['data'].st_ino) ==
++                (stats['part'].st_dev, stats['part'].st_ino)
++            )
++    for name in sorted(names - {'lock', 'owner'}):
++        os.unlink(name, dir_fd=directory)
++        os.fsync(directory)
++    os.unlink('lock', dir_fd=directory)
++    os.fsync(directory)
++    os.unlink('owner', dir_fd=directory)
++    os.fsync(directory)
++
++
++def replace_json(directory, name, value):
++    temporary = name + '.new'
++    if temporary in os.listdir(directory):
++        # A prior registry write is ambiguous; no ID is silently recycled.
++        raise ValueError('Interrupted checkpoint registry update')
++    create_json(directory, temporary, value)
++    if name in os.listdir(directory):
++        fd = os.open(name, os.O_RDONLY | OPEN_FILE, dir_fd=directory)
++        try:
++            regular(fd)
++        finally:
++            os.close(fd)
++    os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
++    os.fsync(directory)
++
++
++@contextlib.contextmanager
++def control_lock(directory, name):
++    fd = os.open(
++        name, os.O_RDWR | os.O_CREAT | OPEN_FILE, 0o600, dir_fd=directory
++    )
++    try:
++        regular(fd)
++        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        yield fd
++    finally:
++        os.close(fd)
++
++
++def remove_empty(root, parts):
++    # Remove only empty private directories, preserving all foreign entries.
++    for length in range(len(parts), 0, -1):
++        with root.directory(parts[: length - 1]) as parent:
++            try:
++                os.rmdir(parts[length - 1], dir_fd=parent)
++                os.fsync(parent)
++            except OSError:
++                return
+diff --git a/nova/virt/libvirt/checkpoints/journal.py b/nova/virt/libvirt/checkpoints/journal.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..216b235ccb22f7755985a846165cc6ff94b5a33c
+--- /dev/null
++++ b/nova/virt/libvirt/checkpoints/journal.py
+@@ -0,0 +1,115 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Executor-side read checks use OVO indirection, never cell SQL."""
++
++import dataclasses
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova import objects
++
++
++def authorize(context, binding, child, write=False):
++    c._require(
++        type(binding) is v2.Binding and type(child) is v2.ChildIntent
++    )
++    parent = objects.InstanceCheckpointStep.get_by_uuid(
++        context, child.parent_step_id
++    )
++    operation = objects.InstanceCheckpointOperation.get_by_uuid(
++        context, child.operation_id
++    )
++    checkpoint = objects.InstanceCheckpoint.get_by_uuid(
++        context, binding.checkpoint_id
++    )
++    rows = objects.CheckpointEffect.get_children(context, parent.uuid)
++    row = next((r for r in rows if r['id'] == child.id), None)
++    c._require(row is not None)
++    actual = {
++        f.name: row[f.name] for f in dataclasses.fields(v2.ChildIntent)
++    }
++    c._require(v2.ChildIntent(**actual) == child)
++    c._require(
++        operation.contract_version == 2 and parent.contract_version == 2
++    )
++    c._require(
++        operation.binding == binding.to_primitive() and
++        parent.payload['binding'] == binding.to_primitive() and
++        parent.operation_id == operation.uuid and
++        operation.checkpoint_id == checkpoint.uuid and
++        operation.executor_id == binding.executor_id
++    )
++    if write:
++        c._require(
++            checkpoint.active_operation_id == operation.uuid and
++            row['status'] == 'dispatching' and
++            operation.quota_ready
++        )
++    return row
++
++
++def reservations(context, binding):
++    return objects.CheckpointArtifactReservation.get_by_checkpoint(
++        context, binding.checkpoint_id
++    )
++
++
++def reservation(context, binding, artifact_id):
++    row = next(
++        (
++            r
++            for r in reservations(context, binding)
++            if r['id'] == artifact_id
++        ),
++        None,
++    )
++    c._require(
++        row is not None and
++        row['logical_id'] ==
++        v2.artifact_logical_id(binding, artifact_id)
++    )
++    return row
++
++
++def writer(context, binding, child, location):
++    authorize(context, binding, child, write=True)
++    row = reservation(context, binding, child.resource_id)
++    c._require(
++        row['child_id'] == child.id and
++        row['operation_id'] == child.operation_id and
++        row['location'] == location and
++        row['writer_state'] == 'dispatching'
++    )
++    return row
++
++
++def readable(context, binding, artifact):
++    row = reservation(context, binding, artifact.id)
++    c._require(
++        row['writer_state'] == 'closed' and
++        (
++            row['kind'],
++            row['logical_id'],
++            row['actual_bytes'],
++            row['checksum'],
++            row['location'],
++        ) ==
++        (
++            artifact.kind,
++            artifact.logical_id,
++            artifact.bytes,
++            artifact.checksum,
++            artifact.location,
++        )
++    )
++    return row
+diff --git a/nova/virt/libvirt/checkpoints/staging.py b/nova/virt/libvirt/checkpoints/staging.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..092698931afcf8f63d9632bf0755a7150e49a986
+--- /dev/null
++++ b/nova/virt/libvirt/checkpoints/staging.py
+@@ -0,0 +1,572 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Encrypted, qualified, project-quota-bounded local staging workspaces."""
++
++import contextlib
++import os
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova import exception
++import nova.privsep.checkpoint
++from nova.virt.libvirt.checkpoints import files
++from nova.virt.libvirt.checkpoints import journal
++
++ERRORS = (
++    OSError,
++    ValueError,
++    KeyError,
++    TypeError,
++    exception.NovaException,
++)
++
++
++def unknown(reason='store_unavailable'):
++    return v2.EffectResult('unknown', {}, reason)
++
++
++class Writer:
++    """Private writer, sealed only after the backend writer ends."""
++
++    def __init__(
++        self, directory, descriptor, path, binding, child, row, metadata
++    ):
++        self.directory, self.fd, self.path = directory, descriptor, path
++        self.binding, self.child, self.row = binding, child, row
++        self.metadata = metadata
++
++    def finish(self):
++        return files.seal(
++            self.directory,
++            self.fd,
++            self.binding,
++            self.child,
++            self.row,
++            self.metadata,
++        )
++
++
++class StagingStore:
++    def __init__(
++        self,
++        root,
++        profile,
++        observer=None,
++        quota_helper=None,
++        quota_observer=None,
++    ):
++        c._require(profile.kind == 'staging')
++        self.root, self.profile = root, profile
++        self.fs = files.Root(
++            root,
++            profile,
++            observer or nova.privsep.checkpoint.inspect_staging,
++        )
++        self.set_quota = (
++            quota_helper or nova.privsep.checkpoint.set_project_limit
++        )
++        self.get_quota = (
++            quota_observer or nova.privsep.checkpoint.get_project_limit
++        )
++
++    def probe(self):
++        try:
++            self.fs.check()
++            with self.fs.directory() as root:
++                self._registry(root)
++            return dict(supported=True, profile_id=self.profile.id)
++        except ERRORS:
++            return dict(supported=False, reason='profile_unverified')
++
++    @staticmethod
++    def _parts(binding, operation_id):
++        return files.components(binding, operation_id)
++
++    def _registry(self, directory):
++        try:
++            result = files.read_json(directory, 'registry')
++        except FileNotFoundError:
++            c._require(
++                set(os.listdir(directory)) <=
++                {'.checkpoint-store', 'registry-lock'}
++            )
++            return dict(
++                next=self.profile.limits['project_id_min'], entries={}
++            )
++        c._keys(result, ('next', 'entries'))
++        c._integer(
++            result['next'], minimum=self.profile.limits['project_id_min']
++        )
++        c._require(type(result['entries']) is dict)
++        allocated = [r['project_id'] for r in result['entries'].values()]
++        c._require(
++            len(set(allocated)) == len(allocated) and
++            all(
++                type(ident) is int and 0 < ident < result['next']
++                for ident in allocated
++            )
++        )
++        return result
++
++    def _entry(self, binding, operation_id):
++        c._require(binding.staging_profile_id == self.profile.id)
++        with self.fs.directory() as root:
++            registry = self._registry(root)
++            entry = registry['entries'][operation_id]
++        c._require(
++            entry['binding'] == binding.to_primitive() and
++            entry['state'] == 'active'
++        )
++        quota = self.get_quota(
++            self.root, operation_id, entry['project_id']
++        )
++        c._require(
++            quota['enforced'] is True and
++            quota['project_id'] == entry['project_id'] and
++            quota['limit_bytes'] == entry['limit_bytes']
++        )
++        parts = self._parts(binding, operation_id)
++        with self.fs.directory(parts) as directory:
++            info = os.fstat(directory)
++            c._require(
++                (info.st_dev, info.st_ino) ==
++                (entry['device'], entry['inode'])
++            )
++        return dict(
++            entry,
++            path=os.path.join(self.root, *parts),
++            budget_version=1,
++            namespace_hash=c.canonical_payload_hash(
++                binding.to_primitive()
++            ),
++        )
++
++    def reserve(self, context, binding, child, limit_bytes):
++        journal.authorize(context, binding, child, write=True)
++        c._require(
++            child.action == 'reserve_staging' and
++            child.resource_id == child.operation_id and
++            binding.staging_profile_id == self.profile.id
++        )
++        self.fs.budget(limit_bytes)
++        c._require(
++            limit_bytes % self.profile.limits['allocation_unit'] == 0
++        )
++        parts = self._parts(binding, child.operation_id)
++        with (
++            self.fs.directory() as root,
++            files.control_lock(root, 'registry-lock'),
++        ):
++            registry = self._registry(root)
++            existing = registry['entries'].get(child.operation_id)
++            if existing:
++                c._require(
++                    existing['binding'] == binding.to_primitive() and
++                    existing['limit_bytes'] == limit_bytes
++                )
++            else:
++                c._require(
++                    len(registry['entries']) <
++                    self.profile.limits['max_workspaces'] and
++                    registry['next'] <=
++                    self.profile.limits['project_id_max']
++                )
++                with self.fs.directory(parts, create=True) as directory:
++                    c._require(not os.listdir(directory))
++                    info = os.fstat(directory)
++                    entry = dict(
++                        binding=binding.to_primitive(),
++                        project_id=registry['next'],
++                        limit_bytes=limit_bytes,
++                        device=info.st_dev,
++                        inode=info.st_ino,
++                        state='allocating',
++                    )
++                    registry['next'] += 1
++                    registry['entries'][child.operation_id] = entry
++                    files.replace_json(root, 'registry', registry)
++            entry = registry['entries'][child.operation_id]
++            if entry['state'] == 'allocating':
++                quota = self.set_quota(
++                    self.root,
++                    child.operation_id,
++                    entry['project_id'],
++                    limit_bytes,
++                )
++                c._require(
++                    quota ==
++                    dict(
++                        project_id=entry['project_id'],
++                        limit_bytes=limit_bytes,
++                        enforced=True,
++                    )
++                )
++                with self.fs.directory(parts) as directory:
++                    with files.control_lock(directory, 'io-lock'):
++                        os.fsync(directory)
++                entry['state'] = 'active'
++                files.replace_json(root, 'registry', registry)
++        return self._entry(binding, child.operation_id)
++
++    @contextlib.contextmanager
++    def writer(self, context, binding, child):
++        c._require(child.action in ('save', 'copy_config', 'download'))
++        row = journal.writer(context, binding, child, 'staging')
++        workspace = self._entry(binding, child.operation_id)
++        self.fs.budget(row['upper_bound'])
++        c._require(row['upper_bound'] <= workspace['limit_bytes'])
++        parts = self._parts(binding, child.operation_id)
++        with self.fs.directory(parts) as workspace_fd:
++            with self._io_lock(workspace_fd, exclusive=False):
++                artifact_parts = parts + ('artifacts', row['id'])
++                with self.fs.directory(
++                    artifact_parts, create=True
++                ) as directory:
++                    c._require(not os.listdir(directory))
++                    with files.locked(directory, create=True):
++                        fd = os.open(
++                            'data',
++                            os.O_RDWR |
++                            os.O_CREAT |
++                            os.O_EXCL |
++                            files.OPEN_FILE,
++                            0o600,
++                            dir_fd=directory,
++                        )
++                        try:
++                            files.create_json(
++                                directory,
++                                'owner',
++                                files.owner(
++                                    binding,
++                                    child,
++                                    row,
++                                    self.profile.id,
++                                    fd,
++                                ),
++                            )
++                            yield Writer(
++                                directory,
++                                fd,
++                                os.path.join(
++                                    workspace['path'],
++                                    'artifacts',
++                                    row['id'],
++                                    'data',
++                                ),
++                                binding,
++                                child,
++                                row,
++                                self.profile.limits['metadata_bytes'],
++                            )
++                        finally:
++                            os.close(fd)
++
++    @staticmethod
++    @contextlib.contextmanager
++    def _io_lock(directory, exclusive):
++        import fcntl
++
++        fd = os.open(
++            'io-lock', os.O_RDWR | files.OPEN_FILE, dir_fd=directory
++        )
++        try:
++            files.regular(fd)
++            fcntl.flock(
++                fd,
++                (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) |
++                fcntl.LOCK_NB,
++            )
++            yield fd
++        finally:
++            os.close(fd)
++
++    @contextlib.contextmanager
++    def reader(self, context, binding, artifact):
++        row = journal.readable(context, binding, artifact)
++        self._entry(binding, row['operation_id'])
++        parts = self._parts(binding, row['operation_id'])
++        with self.fs.directory(parts) as workspace_fd:
++            with self._io_lock(workspace_fd, exclusive=False):
++                with self.fs.directory(
++                    parts + ('artifacts', row['id'])
++                ) as directory:
++                    with files.locked(directory, exclusive=False):
++                        ref, info = files.inspect(
++                            directory,
++                            self.profile.limits['metadata_bytes'],
++                        )
++                        c._require(ref == artifact)
++                        fd = os.open(
++                            'data',
++                            os.O_RDONLY | files.OPEN_FILE,
++                            dir_fd=directory,
++                        )
++                        try:
++                            yield fd, info
++                            self.fs.check()
++                            c._require(
++                                files.fingerprint(
++                                    fd,
++                                    self.profile.limits['metadata_bytes'],
++                                ) ==
++                                info
++                            )
++                        finally:
++                            os.close(fd)
++
++    def observe(self, context, binding, child):
++        try:
++            journal.authorize(context, binding, child)
++            if child.action == 'reserve_staging':
++                workspace = self._entry(binding, child.operation_id)
++                return v2.EffectResult(
++                    'succeeded',
++                    dict(
++                        workspace_id=child.operation_id,
++                        limit_bytes=workspace['limit_bytes'],
++                    ),
++                    None,
++                )
++            if child.action == 'release_staging':
++                return self._release(context, binding, child, query=True)
++            return unknown('recovery_required')
++        except ERRORS:
++            return unknown()
++
++    def observe_copy(self, context, binding, child):
++        """Only synchronous Nova copy workers are fenced by the file lock.
++
++        A libvirt save writer needs an independent backend completion proof;
++        this method deliberately cannot observe a save child.
++        """
++        try:
++            journal.authorize(context, binding, child)
++            c._require(child.action in ('download', 'copy_config'))
++            row = journal.reservation(context, binding, child.resource_id)
++            c._require(
++                row['child_id'] == child.id and
++                row['location'] == 'staging'
++            )
++            self._entry(binding, child.operation_id)
++            parts = self._parts(binding, child.operation_id)
++            with self.fs.directory(parts) as workspace:
++                with self._io_lock(workspace, exclusive=False):
++                    with self.fs.directory(
++                        parts + ('artifacts', row['id'])
++                    ) as directory:
++                        with files.locked(directory, exclusive=False):
++                            owner = files.read_json(directory, 'owner')
++                            files.check_owner(
++                                owner, binding, child, row, self.profile.id
++                            )
++                            names = set(os.listdir(directory))
++                            c._require(
++                                names <= {'owner', 'lock', 'data', 'seal'}
++                            )
++                            if 'seal' in names:
++                                ref, info = files.inspect(
++                                    directory,
++                                    self.profile.limits['metadata_bytes'],
++                                )
++                                c._require(
++                                    ref.id == row['id'] and
++                                    ref.bytes <= row['upper_bound'] and
++                                    (info['device'], info['inode']) ==
++                                    (owner['device'], owner['inode'])
++                                )
++                                return v2.EffectResult(
++                                    'succeeded',
++                                    dict(artifact=ref.to_primitive()),
++                                    None,
++                                )
++                            info = os.stat(
++                                'data',
++                                dir_fd=directory,
++                                follow_symlinks=False,
++                            )
++                            files.private(info)
++                            c._require(
++                                info.st_nlink == 1 and
++                                (info.st_dev, info.st_ino) ==
++                                (owner['device'], owner['inode'])
++                            )
++                            return v2.EffectResult(
++                                'failed_with_effects',
++                                dict(
++                                    resource_ids=[row['id']],
++                                    terminal_child_ids=[child.id],
++                                    late_effect_impossible=True,
++                                ),
++                                'resources_remaining',
++                            )
++        except BlockingIOError:
++            return v2.EffectResult('pending', {}, None)
++        except ERRORS:
++            return unknown()
++
++    def _release(self, context, binding, child, query=False):
++        rows = [
++            r
++            for r in journal.reservations(context, binding)
++            if r['operation_id'] == child.operation_id and
++            r['location'] == 'staging'
++        ]
++        c._require(all(r['writer_state'] == 'deleted' for r in rows))
++        parts = self._parts(binding, child.operation_id)
++        with self.fs.directory() as root:
++            registry = self._registry(root)
++            if query:
++                c._require(child.operation_id not in registry['entries'])
++                try:
++                    with self.fs.directory(parts):
++                        return unknown('resources_remaining')
++                except FileNotFoundError:
++                    pass
++            else:
++                with files.control_lock(root, 'registry-lock'):
++                    registry = self._registry(root)
++                    entry = registry['entries'].get(child.operation_id)
++                    if entry:
++                        c._require(
++                            entry['binding'] == binding.to_primitive()
++                        )
++                        with self.fs.directory(parts) as directory:
++                            with self._io_lock(directory, exclusive=True):
++                                # Artifact delete children remove the leaves
++                                # before releasing this workspace.
++                                c._require(
++                                    set(os.listdir(directory)) <=
++                                    {'io-lock', 'artifacts'}
++                                )
++                                if 'artifacts' in os.listdir(directory):
++                                    os.rmdir('artifacts', dir_fd=directory)
++                                os.unlink('io-lock', dir_fd=directory)
++                                os.fsync(directory)
++                        files.remove_empty(self.fs, parts)
++                        del registry['entries'][child.operation_id]
++                        files.replace_json(root, 'registry', registry)
++        return v2.EffectResult(
++            'succeeded',
++            dict(
++                workspace_id=child.operation_id,
++                deleted=True,
++                late_effect_impossible=True,
++            ),
++            None,
++        )
++
++    def cleanup(self, context, binding, child):
++        try:
++            journal.authorize(context, binding, child, write=True)
++            if child.action == 'release_staging':
++                return self._release(context, binding, child)
++            c._require(child.action == 'delete')
++            row = journal.reservation(context, binding, child.resource_id)
++            c._require(row['location'] == 'staging')
++            peers = [
++                r
++                for r in journal.reservations(context, binding)
++                if r['operation_id'] == row['operation_id'] and
++                r['location'] == 'staging'
++            ]
++            c._require(
++                all(
++                    r['writer_state'] in ('closed', 'deleted')
++                    for r in peers
++                )
++            )
++            parts = self._parts(binding, row['operation_id'])
++            artifact_parts = parts + ('artifacts', row['id'])
++            self.fs.check()
++            with self.fs.directory(parts) as workspace_fd:
++                with self._io_lock(workspace_fd, exclusive=True):
++                    with contextlib.ExitStack() as stack:
++                        try:
++                            directory = stack.enter_context(
++                                self.fs.directory(artifact_parts)
++                            )
++                        except FileNotFoundError:
++                            self.fs.check()
++                        else:
++                            with files.locked(directory):
++                                owner = files.read_json(directory, 'owner')
++                                c._require(
++                                    owner['artifact_id'] == row['id'] and
++                                    owner['child']['id'] ==
++                                    row['child_id'] and
++                                    owner['binding'] ==
++                                    binding.to_primitive()
++                                )
++                                files.erase(directory, owner)
++                            with self.fs.directory(
++                                parts + ('artifacts',)
++                            ) as parent:
++                                os.rmdir(row['id'], dir_fd=parent)
++                                os.fsync(parent)
++            return v2.EffectResult(
++                'succeeded',
++                dict(
++                    artifact_id=row['id'],
++                    deleted=True,
++                    late_effect_impossible=True,
++                ),
++                None,
++            )
++        except ERRORS:
++            return unknown()
++
++    def query_delete(self, context, binding, child):
++        try:
++            journal.authorize(context, binding, child)
++            c._require(child.action == 'delete')
++            row = journal.reservation(context, binding, child.resource_id)
++            c._require(
++                row['location'] == 'staging' and
++                row['writer_state'] in ('closed', 'deleted')
++            )
++            parts = self._parts(binding, row['operation_id'])
++            if (
++                row['writer_state'] == 'deleted' and
++                row['cleanup_child_id'] == child.id
++            ):
++                self.fs.check()
++                return v2.EffectResult(
++                    'succeeded',
++                    dict(
++                        artifact_id=row['id'],
++                        deleted=True,
++                        late_effect_impossible=True,
++                    ),
++                    None,
++                )
++            with self.fs.directory(parts) as workspace_fd:
++                with self._io_lock(workspace_fd, exclusive=True):
++                    try:
++                        with self.fs.directory(
++                            parts + ('artifacts', row['id'])
++                        ):
++                            return unknown('resources_remaining')
++                    except FileNotFoundError:
++                        self.fs.check()
++            return v2.EffectResult(
++                'succeeded',
++                dict(
++                    artifact_id=row['id'],
++                    deleted=True,
++                    late_effect_impossible=True,
++                ),
++                None,
++            )
++        except ERRORS:
++            return unknown()
+diff --git a/nova/virt/libvirt/checkpoints/store.py b/nova/virt/libvirt/checkpoints/store.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f115a2a6c24c2a266d87570fb9a0ae25326e7e61
+--- /dev/null
++++ b/nova/virt/libvirt/checkpoints/store.py
+@@ -0,0 +1,375 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Immutable shared artifacts requiring a qualified NAS profile."""
++
++import contextlib
++import hashlib
++import os
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova import conf
++from nova import exception
++import nova.privsep.checkpoint
++from nova.virt.libvirt.checkpoints import files
++from nova.virt.libvirt.checkpoints import journal
++
++ERRORS = (
++    OSError,
++    ValueError,
++    KeyError,
++    TypeError,
++    exception.NovaException,
++)
++
++
++def unknown(reason='store_unavailable'):
++    return v2.EffectResult('unknown', {}, reason)
++
++
++class ArtifactStore:
++    def __init__(self, root, profile, staging=None, observer=None):
++        c._require(profile.kind == 'store')
++        self.root, self.profile, self.staging = root, profile, staging
++        self.fs = files.Root(
++            root,
++            profile,
++            observer or nova.privsep.checkpoint.inspect_mount,
++        )
++
++    def probe(self):
++        try:
++            with self.fs.directory():
++                pass
++            return dict(supported=True, profile_id=self.profile.id)
++        except ERRORS:
++            return dict(supported=False, reason='profile_unverified')
++
++    def artifact_path(self, binding, artifact_id):
++        return self.fs.artifact_path(binding, artifact_id)
++
++    @contextlib.contextmanager
++    def _transfer(self):
++        with self.fs.directory() as root:
++            count = conf.CONF.checkpoint.max_concurrent_transfers
++            c._integer(count, minimum=1, maximum=1024)
++            with contextlib.ExitStack() as stack:
++                for slot in range(count):
++                    try:
++                        stack.enter_context(
++                            files.control_lock(root, 'transfer-%d' % slot)
++                        )
++                        break
++                    except BlockingIOError:
++                        continue
++                else:
++                    raise BlockingIOError('Checkpoint transfers busy')
++                yield
++
++    def _copy(self, source_fd, target_fd, logical_bytes, checksum, limit):
++        maximum = self.fs.budget(limit)
++        c._require(logical_bytes <= maximum)
++        digest, total = hashlib.sha256(), 0
++        os.lseek(source_fd, 0, os.SEEK_SET)
++        while True:
++            self.fs.check()
++            block = os.read(
++                source_fd, min(1024 * 1024, maximum - total + 1)
++            )
++            if not block:
++                break
++            c._require(total + len(block) <= maximum)
++            files.write_all(target_fd, block)
++            digest.update(block)
++            total += len(block)
++        c._require(
++            total == logical_bytes and digest.hexdigest() == checksum
++        )
++        os.fsync(target_fd)
++        info = files.regular(target_fd)
++        c._require(max(info.st_size, info.st_blocks * 512) <= maximum)
++
++    def publish(self, context, binding, child, source, budget):
++        try:
++            c._require(
++                child.action == 'publish' and
++                binding.store_profile_id == self.profile.id and
++                child.payload['source_id'] == source.id
++            )
++            self.fs.budget(budget)
++            row = journal.writer(context, binding, child, 'shared')
++            c._require(
++                budget <= row['upper_bound'] and source.bytes <= budget
++            )
++            parts = files.components(binding, child.resource_id)
++            with self.staging.reader(context, binding, source) as (
++                src,
++                observed,
++            ):
++                with (
++                    self._transfer(),
++                    self.fs.directory(parts, create=True) as directory,
++                ):
++                    if os.listdir(directory):
++                        return self.query(context, binding, child)
++                    with files.locked(directory, create=True):
++                        fd = os.open(
++                            'part',
++                            os.O_RDWR |
++                            os.O_CREAT |
++                            os.O_EXCL |
++                            files.OPEN_FILE,
++                            0o600,
++                            dir_fd=directory,
++                        )
++                        try:
++                            files.create_json(
++                                directory,
++                                'owner',
++                                files.owner(
++                                    binding,
++                                    child,
++                                    row,
++                                    self.profile.id,
++                                    fd,
++                                ),
++                            )
++                            self._copy(
++                                src,
++                                fd,
++                                observed['logical_bytes'],
++                                source.checksum,
++                                budget,
++                            )
++                            self.fs.check()
++                            os.link(
++                                'part',
++                                'data',
++                                src_dir_fd=directory,
++                                dst_dir_fd=directory,
++                                follow_symlinks=False,
++                            )
++                            os.fsync(directory)
++                            os.unlink('part', dir_fd=directory)
++                            os.fsync(directory)
++                            ref = files.seal(
++                                directory,
++                                fd,
++                                binding,
++                                child,
++                                row,
++                                self.profile.limits['metadata_bytes'],
++                            )
++                        finally:
++                            os.close(fd)
++            return v2.EffectResult(
++                'succeeded', dict(artifact=ref.to_primitive()), None
++            )
++        except BlockingIOError:
++            return v2.EffectResult('pending', {}, None)
++        except ERRORS:
++            return unknown()
++
++    @contextlib.contextmanager
++    def reader(self, context, binding, artifact):
++        c._require(binding.store_profile_id == self.profile.id)
++        row = journal.readable(context, binding, artifact)
++        c._require(row['location'] == 'shared')
++        with self.fs.directory(
++            files.components(binding, row['id'])
++        ) as directory:
++            with files.locked(directory, exclusive=False):
++                ref, observed = files.inspect(
++                    directory, self.profile.limits['metadata_bytes']
++                )
++                c._require(ref == artifact)
++                owner = files.read_json(directory, 'owner')
++                c._require(
++                    owner['binding'] == binding.to_primitive() and
++                    owner['child']['id'] == row['child_id']
++                )
++                fd = os.open(
++                    'data', os.O_RDONLY | files.OPEN_FILE, dir_fd=directory
++                )
++                try:
++                    yield fd, observed
++                    self.fs.check()
++                    c._require(
++                        files.fingerprint(
++                            fd, self.profile.limits['metadata_bytes']
++                        ) ==
++                        observed
++                    )
++                finally:
++                    os.close(fd)
++
++    def download(self, context, binding, child, artifact, workspace):
++        try:
++            c._require(
++                child.action == 'download' and
++                child.payload['source_id'] == artifact.id
++            )
++            row = journal.writer(context, binding, child, 'staging')
++            c._require(row['upper_bound'] <= workspace['limit_bytes'])
++            with (
++                self._transfer(),
++                self.reader(context, binding, artifact) as (
++                    src,
++                    observed,
++                ),
++            ):
++                with self.staging.writer(
++                    context, binding, child
++                ) as writer:
++                    self._copy(
++                        src,
++                        writer.fd,
++                        observed['logical_bytes'],
++                        artifact.checksum,
++                        row['upper_bound'],
++                    )
++                    ref = writer.finish()
++            return v2.EffectResult(
++                'succeeded', dict(artifact=ref.to_primitive()), None
++            )
++        except BlockingIOError:
++            return v2.EffectResult('pending', {}, None)
++        except ERRORS:
++            return unknown()
++
++    def query(self, context, binding, child):
++        try:
++            journal.authorize(context, binding, child)
++            if child.action == 'download':
++                return self.staging.observe_copy(context, binding, child)
++            row = journal.reservation(context, binding, child.resource_id)
++            if child.action == 'delete':
++                return self._delete(
++                    context, binding, child, row, query=True
++                )
++            c._require(
++                child.action == 'publish' and
++                row['child_id'] == child.id and
++                binding.store_profile_id == self.profile.id
++            )
++            with self.fs.directory(
++                files.components(binding, row['id'])
++            ) as directory:
++                with files.locked(directory, exclusive=False):
++                    owner = files.read_json(directory, 'owner')
++                    files.check_owner(
++                        owner, binding, child, row, self.profile.id
++                    )
++                    names = set(os.listdir(directory))
++                    c._require(
++                        names <= {'owner', 'lock', 'data', 'part', 'seal'}
++                    )
++                    if 'seal' in names and 'part' not in names:
++                        ref, observed = files.inspect(
++                            directory,
++                            self.profile.limits['metadata_bytes'],
++                        )
++                        c._require(
++                            ref.id == row['id'] and
++                            ref.bytes <= row['upper_bound'] and
++                            (observed['device'], observed['inode']) ==
++                            (owner['device'], owner['inode'])
++                        )
++                        return v2.EffectResult(
++                            'succeeded',
++                            dict(artifact=ref.to_primitive()),
++                            None,
++                        )
++                    # The local copy worker has exited, and immutable owner
++                    # plus its one-shot file creation fences a late
++                    # reexecution.
++                    for name in names & {'data', 'part'}:
++                        info = os.stat(
++                            name, dir_fd=directory, follow_symlinks=False
++                        )
++                        files.private(info)
++                        c._require(
++                            (info.st_dev, info.st_ino) ==
++                            (owner['device'], owner['inode'])
++                        )
++                        c._require(
++                            info.st_nlink ==
++                            (2 if {'data', 'part'} <= names else 1)
++                        )
++                    return v2.EffectResult(
++                        'failed_with_effects',
++                        dict(
++                            resource_ids=[row['id']],
++                            terminal_child_ids=[child.id],
++                            late_effect_impossible=True,
++                        ),
++                        'resources_remaining',
++                    )
++        except BlockingIOError:
++            return v2.EffectResult('pending', {}, None)
++        except ERRORS:
++            return unknown('artifact_corrupt')
++
++    def _delete(self, context, binding, child, row, query=False):
++        c._require(row['writer_state'] in ('closed', 'deleted'))
++        if row['location'] == 'staging':
++            if query:
++                return self.staging.query_delete(context, binding, child)
++            return self.staging.cleanup(context, binding, child)
++        c._require(binding.store_profile_id == self.profile.id)
++        self.fs.check()
++        parts = files.components(binding, row['id'])
++        with contextlib.ExitStack() as stack:
++            try:
++                directory = stack.enter_context(self.fs.directory(parts))
++            except FileNotFoundError:
++                self.fs.check()
++            else:
++                if query:
++                    return unknown('resources_remaining')
++                with files.locked(directory):
++                    owner = files.read_json(directory, 'owner')
++                    c._require(
++                        owner['binding'] == binding.to_primitive() and
++                        owner['artifact_id'] == row['id'] and
++                        owner['child']['id'] == row['child_id']
++                    )
++                    files.erase(directory, owner)
++                files.remove_empty(self.fs, parts)
++        return v2.EffectResult(
++            'succeeded',
++            dict(
++                artifact_id=row['id'],
++                deleted=True,
++                late_effect_impossible=True,
++            ),
++            None,
++        )
++
++    def delete(self, context, binding, child, artifacts):
++        try:
++            journal.authorize(context, binding, child, write=True)
++            c._require(
++                child.action == 'delete' and type(artifacts) is tuple
++            )
++            row = journal.reservation(context, binding, child.resource_id)
++            if artifacts:
++                c._require(
++                    len(artifacts) == 1 and artifacts[0].id == row['id']
++                )
++                journal.readable(context, binding, artifacts[0])
++            return self._delete(context, binding, child, row)
++        except BlockingIOError:
++            return v2.EffectResult('pending', {}, None)
++        except ERRORS:
++            return unknown()

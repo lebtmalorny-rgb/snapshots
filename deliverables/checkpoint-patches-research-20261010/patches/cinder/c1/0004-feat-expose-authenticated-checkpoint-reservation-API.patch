@@ -1,0 +1,1094 @@
+From d2ad4208f0ea7cb75c6ad5f2d0c771160ba50346 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Tue, 6 Oct 2026 23:13:41 +0300
+Subject: [PATCH 04/10] feat: expose authenticated checkpoint reservation API
+
+---
+ cinder/api/microversions.py                   |   3 +
+ cinder/api/openstack/api_version_request.py   |   3 +-
+ .../openstack/rest_api_version_history.rst    |   9 +
+ cinder/api/schemas/checkpoints.py             |  57 ++++++
+ cinder/api/v3/checkpoints.py                  |  73 ++++++++
+ cinder/api/v3/router.py                       |  17 ++
+ cinder/api/v3/views/checkpoints.py            |  42 +++++
+ cinder/checkpoints/api.py                     | 167 ++++++++++++++++++
+ cinder/checkpoints/guards.py                  |  10 ++
+ cinder/context.py                             |   4 +
+ cinder/db/sqlalchemy/checkpoints.py           |  43 +++--
+ cinder/exception.py                           |  44 ++---
+ cinder/policies/__init__.py                   |   2 +
+ cinder/policies/checkpoints.py                |  41 +++++
+ cinder/tests/unit/api/v3/test_checkpoints.py  | 141 +++++++++++++++
+ cinder/tests/unit/checkpoints/test_api.py     | 139 +++++++++++++++
+ .../tests/unit/policies/test_checkpoints.py   |  33 ++++
+ 17 files changed, 795 insertions(+), 33 deletions(-)
+ create mode 100644 cinder/api/schemas/checkpoints.py
+ create mode 100644 cinder/api/v3/checkpoints.py
+ create mode 100644 cinder/api/v3/views/checkpoints.py
+ create mode 100644 cinder/checkpoints/api.py
+ create mode 100644 cinder/policies/checkpoints.py
+ create mode 100644 cinder/tests/unit/api/v3/test_checkpoints.py
+ create mode 100644 cinder/tests/unit/checkpoints/test_api.py
+ create mode 100644 cinder/tests/unit/policies/test_checkpoints.py
+
+diff --git a/cinder/api/microversions.py b/cinder/api/microversions.py
+index 6b942a2..07e4c02 100644
+--- a/cinder/api/microversions.py
++++ b/cinder/api/microversions.py
+@@ -181,6 +181,9 @@ TRANSFER_ENCRYPTED_VOLUME = '3.70'
+ 
+ EXTEND_VOLUME_COMPLETION = '3.71'
+ 
++# Private fork extension: not an upstream 3.72 compatibility claim.
++CHECKPOINT_CONTRACT = '3.72'
++
+ 
+ def get_mv_header(version):
+     """Gets a formatted HTTP microversion header.
+diff --git a/cinder/api/openstack/api_version_request.py b/cinder/api/openstack/api_version_request.py
+index 8e2d3a2..b363c39 100644
+--- a/cinder/api/openstack/api_version_request.py
++++ b/cinder/api/openstack/api_version_request.py
+@@ -157,13 +157,14 @@ REST_API_VERSION_HISTORY = """
+     * 3.69 - Allow null value for shared_targets
+     * 3.70 - Support encrypted volume transfers
+     * 3.71 - Support 'os-extend_volume_completion' volume action
++    * 3.72 - Private native checkpoint service contract (fork extension)
+ """
+ 
+ # The minimum and maximum versions of the API supported
+ # The default api version request is defined to be the
+ # minimum version of the API supported.
+ _MIN_API_VERSION = "3.0"
+-_MAX_API_VERSION = "3.71"
++_MAX_API_VERSION = "3.72"
+ UPDATED = "2023-08-31T00:00:00Z"
+ 
+ 
+diff --git a/cinder/api/openstack/rest_api_version_history.rst b/cinder/api/openstack/rest_api_version_history.rst
+index 5511f72..ac5ac08 100644
+--- a/cinder/api/openstack/rest_api_version_history.rst
++++ b/cinder/api/openstack/rest_api_version_history.rst
+@@ -541,3 +541,12 @@ API request and response schema are unchanged.
+ Add the ``os-extend_volume_completion`` volume action, which Nova can use
+ to notify Cinder of success and error when handling a ``volume-extended``
+ external server event.
++
++3.72 (private fork extension)
++-----------------------------
++
++Adds a project-scoped service API for native checkpoint reservations,
++capabilities and operation actions. Access requires a verified service token
++and an explicit Nova service-user allowlist, in addition to project policy.
++New checkpoint creation is disabled by default. This private version does
++not assert compatibility with an upstream OpenStack microversion.
+diff --git a/cinder/api/schemas/checkpoints.py b/cinder/api/schemas/checkpoints.py
+new file mode 100644
+index 0000000..fe53242
+--- /dev/null
++++ b/cinder/api/schemas/checkpoints.py
+@@ -0,0 +1,57 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Strict service API schemas for the private checkpoint extension."""
++
++from cinder.api.validation import parameter_types
++
++
++payload = {
++    'type': 'object',
++    'properties': {
++        'request_id': parameter_types.uuid,
++        'checkpoint_id': parameter_types.uuid,
++        'instance_uuid': parameter_types.uuid,
++        'kind': {'type': 'string', 'enum': ['create', 'revert', 'delete']},
++        'volume_ids': {'type': 'array', 'items': parameter_types.uuid,
++                       'minItems': 1, 'maxItems': 64, 'uniqueItems': True},
++    },
++    'required': ['request_id', 'checkpoint_id', 'instance_uuid', 'kind',
++                 'volume_ids'],
++    'additionalProperties': False,
++}
++create = {
++    'type': 'object',
++    'properties': {'checkpoint_operation': payload},
++    'required': ['checkpoint_operation'],
++    'additionalProperties': False,
++}
++generation = {'type': 'integer', 'minimum': 1}
++action = {
++    'type': 'object',
++    'minProperties': 1,
++    'maxProperties': 1,
++    'properties': {
++        name: {'type': 'object',
++               'properties': {'generation': generation},
++               'required': ['generation'], 'additionalProperties': False}
++        for name in ('execute', 'cleanup', 'reconcile')
++    },
++    'additionalProperties': False,
++}
++action['properties']['release'] = {
++    'type': 'object',
++    'properties': {'generation': generation,
++                   'outcome': {'enum': ['commit', 'abort']}},
++    'required': ['generation', 'outcome'],
++    'additionalProperties': False,
++}
+diff --git a/cinder/api/v3/checkpoints.py b/cinder/api/v3/checkpoints.py
+new file mode 100644
+index 0000000..51d8936
+--- /dev/null
++++ b/cinder/api/v3/checkpoints.py
+@@ -0,0 +1,73 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Private 3.72 checkpoint service API."""
++
++from http import HTTPStatus
++
++from cinder.api import common
++from cinder.api import microversions as mv
++from cinder.api.openstack import wsgi
++from cinder.api.schemas import checkpoints as schema
++from cinder.api.v3.views import checkpoints as views
++from cinder.api import validation
++from cinder.checkpoints import api
++from cinder import exception
++
++
++class CheckpointController(wsgi.Controller):
++    def __init__(self):
++        self.api = api.API()
++        self.view = views.ViewBuilder()
++        super().__init__()
++
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTRACT)
++    @wsgi.response(HTTPStatus.ACCEPTED)
++    @validation.schema(schema.create)
++    def create(self, req, body):
++        operation = self.api.reserve(req.environ['cinder.context'],
++                                     body['checkpoint_operation'])
++        return {'checkpoint_operation': self.view.detail(operation)}
++
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTRACT)
++    def show(self, req, id):
++        operation = self.api.get(req.environ['cinder.context'], id)
++        return {'checkpoint_operation': self.view.detail(operation)}
++
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTRACT)
++    def index(self, req):
++        params = dict(req.params)
++        if set(params) - {'checkpoint_id', 'instance_uuid', 'status',
++                          'marker', 'limit'}:
++            raise exception.InvalidInput(reason='invalid_checkpoint_filter')
++        marker, limit, unused_offset = common.get_pagination_params(params)
++        operations = self.api.list(req.environ['cinder.context'], params,
++                                   marker, limit)
++        return self.view.index(req, operations)
++
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTRACT)
++    def capabilities(self, req, id):
++        return {'checkpoint_capabilities': self.api.capabilities(
++            req.environ['cinder.context'], id)}
++
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTRACT)
++    @wsgi.response(HTTPStatus.ACCEPTED)
++    @validation.schema(schema.action)
++    def operate(self, req, id, body):
++        name, args = next(iter(body.items()))
++        operation = self.api.action(req.environ['cinder.context'], id,
++                                    name, **args)
++        return {'checkpoint_operation': self.view.detail(operation)}
++
++
++def create_resource():
++    return wsgi.Resource(CheckpointController())
+diff --git a/cinder/api/v3/router.py b/cinder/api/v3/router.py
+index 6c98b1a..8c6846c 100644
+--- a/cinder/api/v3/router.py
++++ b/cinder/api/v3/router.py
+@@ -23,6 +23,7 @@ from cinder.api import extensions
+ import cinder.api.openstack
+ from cinder.api.v3 import attachments
+ from cinder.api.v3 import backups
++from cinder.api.v3 import checkpoints
+ from cinder.api.v3 import clusters
+ from cinder.api.v3 import consistencygroups
+ from cinder.api.v3 import default_types
+@@ -63,6 +64,22 @@ class APIRouter(cinder.api.openstack.APIRouter):
+                         collection={'detail': 'GET', 'summary': 'GET'},
+                         member={'action': 'POST'})
+ 
++        checkpoint_controller = checkpoints.create_resource()
++        self.resources['checkpoint-operations'] = checkpoint_controller
++        mapper.resource('checkpoint_operation', 'checkpoint-operations',
++                        controller=checkpoint_controller)
++        for prefix in ['/{project_id}', '']:
++            mapper.connect(
++                'checkpoint_action',
++                prefix + '/checkpoint-operations/{id}/action',
++                controller=checkpoint_controller, action='operate',
++                conditions={'method': ['POST']})
++            mapper.connect(
++                'checkpoint_capabilities',
++                prefix + '/volumes/{id}/checkpoint-capabilities',
++                controller=checkpoint_controller, action='capabilities',
++                conditions={'method': ['GET']})
++
+         self.resources['messages'] = messages.create_resource(ext_mgr)
+         mapper.resource("message", "messages",
+                         controller=self.resources['messages'],
+diff --git a/cinder/api/v3/views/checkpoints.py b/cinder/api/v3/views/checkpoints.py
+new file mode 100644
+index 0000000..f536ccb
+--- /dev/null
++++ b/cinder/api/v3/views/checkpoints.py
+@@ -0,0 +1,42 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Allowlisted public fields without backend references or identities."""
++
++from cinder.api import common
++
++
++class ViewBuilder(common.ViewBuilder):
++    @staticmethod
++    def detail(operation):
++        result = {key: operation[key] for key in (
++            'id', 'request_id', 'checkpoint_id', 'instance_uuid', 'kind',
++            'generation', 'status', 'release_outcome', 'error_code')}
++        result['resources'] = [
++            {key: resource[key] for key in (
++                'id', 'volume_id', 'snapshot_id', 'volume_size', 'status')}
++            for resource in operation.resources]
++        result['steps'] = [
++            {key: step[key] for key in (
++                'id', 'resource_id', 'phase', 'generation', 'status',
++                'error_code')}
++            for step in operation.steps]
++        return result
++
++    def index(self, request, operations):
++        result = {'checkpoint_operations': [self.detail(op)
++                                            for op in operations]}
++        links = self._get_collection_links(request, operations,
++                                           'checkpoint-operations')
++        if links:
++            result['checkpoint_operations_links'] = links
++        return result
+diff --git a/cinder/checkpoints/api.py b/cinder/checkpoints/api.py
+new file mode 100644
+index 0000000..381c83e
+--- /dev/null
++++ b/cinder/checkpoints/api.py
+@@ -0,0 +1,167 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Project and service scoped API; the worker performs backend I/O."""
++
++import uuid
++
++from cinder.api.schemas import checkpoints as schema
++from cinder.api.validation import validators
++from cinder.checkpoints import config
++from cinder.checkpoints import contracts
++from cinder.checkpoints import guards
++from cinder import db
++from cinder import exception
++from cinder import objects
++from cinder.policies import checkpoints as policy
++from cinder import quota
++from cinder import quota_utils
++from cinder.volume import rpcapi as volume_rpcapi
++
++
++CONF = config.CONF
++QUOTAS = quota.QUOTAS
++
++
++class API:
++    def __init__(self, rpc=None):
++        self.rpc = rpc if rpc is not None else volume_rpcapi.VolumeAPI()
++
++    def _authorize(self, context, operate=False):
++        guards.require_service(context)
++        context.authorize(policy.OPERATE_POLICY if operate else
++                          policy.READ_POLICY)
++
++    def _volume(self, context, volume_id):
++        volume = objects.Volume.get_by_id(context, volume_id)
++        if volume.project_id != context.project_id:
++            raise exception.VolumeNotFound(volume_id=volume_id)
++        return volume
++
++    @staticmethod
++    def _object(context, row):
++        return objects.CheckpointOperation._from_db_object(
++            context, objects.CheckpointOperation(context), row)
++
++    def capabilities(self, context, volume_id):
++        self._authorize(context)
++        volume = self._volume(context, volume_id)
++        self.rpc.assert_checkpoint_ready(context, volume)
++        result = self.rpc.get_checkpoint_capabilities(
++            context, volume.id, volume.service_topic_queue)
++        try:
++            return contracts.validate_capabilities(result)
++        except exception.CheckpointNotSupported:
++            # Do not forward arbitrary driver data or exception messages.
++            return contracts.unsupported_capabilities(
++                'unverified_capabilities')
++
++    def reserve(self, context, payload):
++        self._authorize(context, operate=True)
++        validators._SchemaValidator(schema.payload).validate(payload)
++        identity = {key: getattr(context, key) for key in
++                    ('project_id', 'user_id', 'service_user_id')}
++        payload_hash = contracts.canonical_payload_hash(dict(payload,
++                                                             **identity))
++        values = {key: str(uuid.UUID(payload[key])) for key in
++                  ('request_id', 'checkpoint_id', 'instance_uuid')}
++        values['kind'] = payload['kind']
++        volume_ids = sorted(str(uuid.UUID(v)) for v in payload['volume_ids'])
++        existing = db.checkpoint_get_all(
++            context, {'request_id': values['request_id']})
++        if existing:
++            if existing[0]['payload_hash'] != payload_hash:
++                raise exception.CheckpointConflict(
++                    reason='request_payload_changed')
++            return self._object(context, existing[0])
++        if values['kind'] == 'create' and not CONF.checkpoint.enabled:
++            raise exception.CheckpointNotSupported(reason='feature_disabled')
++        if len(volume_ids) > CONF.checkpoint.max_volumes_per_operation:
++            raise exception.InvalidInput(reason='too_many_checkpoint_volumes')
++        # Check ownership of the whole set before querying any backend.
++        volumes = [self._volume(context, vid) for vid in volume_ids]
++        values['capabilities'] = {}
++        for volume in volumes:
++            self.rpc.assert_checkpoint_ready(context, volume)
++            result = self.rpc.get_checkpoint_capabilities(
++                context, volume.id, volume.service_topic_queue)
++            values['capabilities'][volume.id] = (
++                contracts.validate_capabilities(result))
++        reservations = []
++        values['quota_reservations'] = {}
++        try:
++            if values['kind'] == 'create':
++                for volume in volumes:
++                    deltas = {'snapshots': 1}
++                    if not CONF.no_snapshot_gb_quota:
++                        deltas['gigabytes'] = volume.size
++                    QUOTAS.add_volume_type_opts(context, deltas,
++                                                volume.volume_type_id)
++                    try:
++                        reserved = QUOTAS.reserve(context, **deltas)
++                    except exception.OverQuota as error:
++                        quota_utils.process_reserve_over_quota(
++                            context, error, resource='snapshots',
++                            size=volume.size)
++                    values['quota_reservations'][volume.id] = reserved
++                    reservations.extend(reserved)
++            row = db.checkpoint_reserve(context, values, volume_ids)
++        except Exception:
++            QUOTAS.rollback(context, reservations)
++            raise
++        # A concurrent exact replay returns its original journal. Any quota
++        # reservations made by this losing request have no matching journal.
++        # Rolling back already committed IDs is a no-op in the quota DB API.
++        QUOTAS.rollback(context, reservations)
++        return self._object(context, row)
++
++    def get(self, context, operation_id):
++        self._authorize(context)
++        return self._object(context, db.checkpoint_get(context, operation_id))
++
++    def list(self, context, filters, marker=None, limit=None):
++        self._authorize(context)
++        if set(filters) - {'checkpoint_id', 'instance_uuid', 'status'}:
++            raise exception.InvalidInput(reason='invalid_checkpoint_filter')
++        if limit == 0:
++            return []
++        return [self._object(context, row) for row in db.checkpoint_get_all(
++            context, filters, marker, limit)]
++
++    def action(self, context, operation_id, name, generation, outcome=None):
++        self._authorize(context, operate=True)
++        args = {'generation': generation}
++        if outcome is not None:
++            args['outcome'] = outcome
++        validators._SchemaValidator(schema.action).validate({name: args})
++        operation = self.get(context, operation_id)
++        if operation.generation != generation:
++            raise exception.CheckpointConflict(reason='stale_generation')
++        if name == 'release':
++            return self._object(context, db.checkpoint_release(
++                context, operation_id, generation, outcome))
++        if operation.status == 'released':
++            return operation
++        if name == 'cleanup':
++            raise exception.CheckpointConflict(reason='cleanup_not_prepared')
++        resources = {resource.id: resource for resource in operation.resources}
++        for step in operation.steps:
++            volume = self._volume(
++                context, resources[step.resource_id].volume_id)
++            self.rpc.assert_checkpoint_ready(context, volume)
++            if name == 'execute':
++                self.rpc.execute_checkpoint_step(context, step.id, generation,
++                                                 volume.service_topic_queue)
++            else:
++                self.rpc.reconcile_checkpoint_step(
++                    context, step.id, generation, volume.service_topic_queue)
++        return self.get(context, operation_id)
+diff --git a/cinder/checkpoints/guards.py b/cinder/checkpoints/guards.py
+index 5f3d998..8846342 100644
+--- a/cinder/checkpoints/guards.py
++++ b/cinder/checkpoints/guards.py
+@@ -17,6 +17,7 @@ import inspect
+ 
+ import decorator
+ 
++from cinder.checkpoints import config
+ from cinder import db
+ from cinder import exception
+ 
+@@ -62,3 +63,12 @@ def connection_worker(action, volume_arg, context_arg='context'):
+         with connection(bound[context_arg], bound[volume_arg], action):
+             return function(*args, **kwargs)
+     return guarded
++
++
++def require_service(context):
++    from cinder.volume import api as volume_api
++    if (not context.project_id or not context.user_id or
++            not volume_api.API.is_service_request(context) or
++            not context.service_user_id or context.service_user_id not in
++            config.CONF.checkpoint.nova_service_user_ids):
++        raise exception.CheckpointServiceForbidden()
+diff --git a/cinder/context.py b/cinder/context.py
+index ff544e5..1c42fc0 100644
+--- a/cinder/context.py
++++ b/cinder/context.py
+@@ -180,6 +180,8 @@ class RequestContext(context.RequestContext):
+         result['message_resource_id'] = self.message_resource_id
+         result['message_resource_type'] = self.message_resource_type
+         result['message_action'] = self.message_action
++        result['service_user_id'] = self.service_user_id
++        result['service_roles'] = self.service_roles
+         return result
+ 
+     @classmethod
+@@ -197,6 +199,8 @@ class RequestContext(context.RequestContext):
+                    global_request_id=values.get('global_request_id'),
+                    is_admin=values.get('is_admin'),
+                    roles=values.get('roles'),
++                   service_user_id=values.get('service_user_id'),
++                   service_roles=values.get('service_roles'),
+                    auth_token=values.get('auth_token'),
+                    user_domain_id=values.get('user_domain_id'),
+                    project_domain_id=values.get('project_domain_id'),
+diff --git a/cinder/db/sqlalchemy/checkpoints.py b/cinder/db/sqlalchemy/checkpoints.py
+index 7557445..6bfc77d 100644
+--- a/cinder/db/sqlalchemy/checkpoints.py
++++ b/cinder/db/sqlalchemy/checkpoints.py
+@@ -30,6 +30,7 @@ from cinder.checkpoints import contracts
+ from cinder.db.sqlalchemy import api
+ from cinder.db.sqlalchemy import models
+ from cinder import exception
++from cinder import objects
+ 
+ 
+ PHASES = {'create': 'snapshot', 'revert': 'revert',
+@@ -246,22 +247,22 @@ def reserve(context, values, volume_ids):
+         for volume in volumes:
+             caps = contracts.validate_capabilities(
+                 values.get('capabilities', {}).get(volume.id))
++            snapshot = objects.Snapshot(
++                context=context, volume_id=volume.id,
++                project_id=context.project_id, user_id=context.user_id,
++                status='creating', progress='0%', volume_size=volume.size,
++                volume_type_id=volume.volume_type_id,
++                encryption_key_id=volume.encryption_key_id)
++            snapshot.create()
+             resource = models.CheckpointResource(
+                 id=uuidutils.generate_uuid(), project_id=context.project_id,
+                 instance_uuid=instance.instance_uuid,
+                 checkpoint_id=checkpoint_id, volume_id=volume.id,
+-                snapshot_id=uuidutils.generate_uuid(), volume_size=volume.size,
++                snapshot_id=snapshot.id, volume_size=volume.size,
+                 backend_profile=caps['driver_identity']['profile'],
+                 capabilities_json=json.dumps(caps, sort_keys=True),
+                 status='creating')
+             context.session.add(resource)
+-            api.snapshot_create(context, {
+-                'id': resource.snapshot_id, 'volume_id': volume.id,
+-                'project_id': context.project_id, 'user_id': context.user_id,
+-                'status': 'creating', 'progress': '0%',
+-                'volume_size': volume.size,
+-                'volume_type_id': volume.volume_type_id,
+-                'encryption_key_id': volume.encryption_key_id})
+             resources.append(resource)
+     elif (not resources or
+           sorted(r.volume_id for r in resources) != volume_ids or
+@@ -283,15 +284,36 @@ def reserve(context, values, volume_ids):
+         context.session.add(models.CheckpointStep(
+             id=uuidutils.generate_uuid(), operation_id=operation.id,
+             resource_id=resource.id, phase=PHASES[kind], generation=1,
+-            status='prepared', quota_reservations_json='[]',
++            status='prepared', quota_reservations_json=json.dumps(
++                values.get('quota_reservations', {}).get(
++                    resource.volume_id, [])),
+             original_attachment_ids_json=json.dumps(
+                 attachments[resource.volume_id])))
+         context.session.add(models.CheckpointVolumeLock(
+             volume_id=resource.volume_id, operation_id=operation.id,
+             generation=1))
++    reservations = [item for items in values.get(
++        'quota_reservations', {}).values() for item in items]
++    if reservations:
++        _commit_quota(context, reservations)
+     return _as_dict(context, operation)
+ 
+ 
++def _commit_quota(context, reservations):
++    # Match stock quota lock order: usage, then reservation. Unlike public
++    # QUOTAS.commit, propagate errors so the complete journal transaction rolls
++    # back. Expired reservations must never admit unaccounted snapshots.
++    resources = api._get_reservation_resources(context, reservations)
++    api._get_quota_usages(context, context.project_id, resources=resources)
++    rows = api._quota_reservations(context, reservations)
++    if (len(rows) != len(set(reservations)) or
++            any(row.project_id != context.project_id or
++                row.expire <= timeutils.utcnow() for row in rows)):
++        _conflict('quota_reservation_expired')
++    api.reservation_commit(context, reservations,
++                           project_id=context.project_id)
++
++
+ @api.require_context
+ @api.main_context_manager.reader
+ def get(context, operation_id):
+@@ -304,7 +326,8 @@ def get_all(context, filters=None, marker=None, limit=None):
+     query = _query(context, models.CheckpointOperation).filter_by(
+         **_identity(context))
+     filters = filters or {}
+-    if set(filters) - {'checkpoint_id', 'instance_uuid', 'status'}:
++    allowed = {'checkpoint_id', 'instance_uuid', 'status', 'request_id'}
++    if set(filters) - allowed:
+         raise exception.InvalidInput(reason='invalid_checkpoint_filter')
+     query = query.filter_by(**filters)
+     if marker:
+diff --git a/cinder/exception.py b/cinder/exception.py
+index 62fcf52..d5dcfcb 100644
+--- a/cinder/exception.py
++++ b/cinder/exception.py
+@@ -132,28 +132,6 @@ class VolumeBackendAPIException(CinderException):
+                 "backend API: %(data)s")
+ 
+ 
+-class CheckpointConflict(CinderException):
+-    message = _("Checkpoint operation conflict: %(reason)s")
+-    code = 409
+-    safe = True
+-
+-
+-class CheckpointNotSupported(CheckpointConflict):
+-    message = _("Native checkpoint contract is not supported: %(reason)s")
+-
+-
+-class CheckpointOperationNotFound(CinderException):
+-    message = _("Checkpoint operation was not found.")
+-    code = 404
+-    safe = True
+-
+-
+-class CheckpointServiceForbidden(CinderException):
+-    message = _("A trusted checkpoint service identity is required.")
+-    code = 403
+-    safe = True
+-
+-
+ class VolumeDriverException(CinderException):
+     message = _("Volume driver reported an error: %(message)s")
+ 
+@@ -179,6 +157,12 @@ class NotAuthorized(CinderException):
+     code = 403
+ 
+ 
++class CheckpointServiceForbidden(NotAuthorized):
++    message = _("A trusted checkpoint service identity is required.")
++    code = 403
++    safe = True
++
++
+ class AdminRequired(NotAuthorized):
+     message = _("User does not have admin privileges")
+ 
+@@ -217,6 +201,16 @@ class InvalidResults(Invalid):
+     message = _("The results are invalid.")
+ 
+ 
++class CheckpointConflict(Invalid):
++    message = _("Checkpoint operation conflict: %(reason)s")
++    code = 409
++    safe = True
++
++
++class CheckpointNotSupported(CheckpointConflict):
++    message = _("Native checkpoint contract is not supported: %(reason)s")
++
++
+ class InvalidInput(Invalid):
+     message = _("Invalid input received: %(reason)s")
+ 
+@@ -354,6 +348,12 @@ class GlanceStoreReadOnly(Invalid):
+     message = _("Store %(store_id)s is read-only in glance.")
+ 
+ 
++class CheckpointOperationNotFound(NotFound):
++    message = _("Checkpoint operation was not found.")
++    code = 404
++    safe = True
++
++
+ class VolumeNotFound(NotFound):
+     message = _("Volume %(volume_id)s could not be found.")
+ 
+diff --git a/cinder/policies/__init__.py b/cinder/policies/__init__.py
+index 8e42933..453ca70 100644
+--- a/cinder/policies/__init__.py
++++ b/cinder/policies/__init__.py
+@@ -20,6 +20,7 @@ from cinder.policies import backup_actions
+ from cinder.policies import backups
+ from cinder.policies import base
+ from cinder.policies import capabilities
++from cinder.policies import checkpoints
+ from cinder.policies import clusters
+ from cinder.policies import default_types
+ from cinder.policies import group_actions
+@@ -55,6 +56,7 @@ def list_rules():
+         base.list_rules(),
+         attachments.list_rules(),
+         messages.list_rules(),
++        checkpoints.list_rules(),
+         clusters.list_rules(),
+         workers.list_rules(),
+         snapshot_metadata.list_rules(),
+diff --git a/cinder/policies/checkpoints.py b/cinder/policies/checkpoints.py
+new file mode 100644
+index 0000000..25ae6a0
+--- /dev/null
++++ b/cinder/policies/checkpoints.py
+@@ -0,0 +1,41 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Project policy complements mandatory verified Nova service identity."""
++
++from oslo_policy import policy
++
++
++READ_POLICY = 'checkpoint:read'
++OPERATE_POLICY = 'checkpoint:operate'
++_MEMBER = '(role:member or role:admin) and project_id:%(project_id)s'
++
++checkpoint_policies = [
++    policy.DocumentedRuleDefault(
++        name=READ_POLICY, check_str=_MEMBER,
++        description='Read native checkpoint operations and capabilities.',
++        operations=[
++            {'method': 'GET', 'path': '/checkpoint-operations'},
++            {'method': 'GET', 'path': '/checkpoint-operations/{id}'},
++            {'method': 'GET',
++             'path': '/volumes/{id}/checkpoint-capabilities'}]),
++    policy.DocumentedRuleDefault(
++        name=OPERATE_POLICY, check_str=_MEMBER,
++        description='Reserve and operate native volume checkpoints.',
++        operations=[
++            {'method': 'POST', 'path': '/checkpoint-operations'},
++            {'method': 'POST', 'path': '/checkpoint-operations/{id}/action'}]),
++]
++
++
++def list_rules():
++    return checkpoint_policies
+diff --git a/cinder/tests/unit/api/v3/test_checkpoints.py b/cinder/tests/unit/api/v3/test_checkpoints.py
+new file mode 100644
+index 0000000..731f5a7
+--- /dev/null
++++ b/cinder/tests/unit/api/v3/test_checkpoints.py
+@@ -0,0 +1,141 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import copy
++
++from oslo_serialization import jsonutils
++from oslo_utils import uuidutils
++import webob
++
++from cinder.api.middleware import fault
++from cinder.api.v3 import router
++from cinder.checkpoints import api
++from cinder import db
++from cinder.tests.unit.api import fakes
++from cinder.tests.unit.checkpoints import test_api
++from cinder.tests.unit import test
++
++
++class TestCheckpoints(test_api.APIHelpers, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_api()
++        self.mock_object(api, 'API', return_value=self.api)
++        self.application = fakes.urlmap.URLMap()
++        self.application['/v3'] = router.APIRouter()
++        self.application = fault.FaultWrapper(self.application)
++
++    def request(self, body=None, path='checkpoint-operations', method='POST',
++                version='3.72', ctxt=None):
++        request = webob.Request.blank(
++            '/v3/%s/%s' % ((ctxt or self.ctxt).project_id, path))
++        request.method = method
++        request.headers['Content-Type'] = 'application/json'
++        request.headers['OpenStack-API-Version'] = 'volume ' + version
++        request.environ['cinder.context'] = ctxt or self.ctxt
++        if body is not None:
++            request.body = jsonutils.dump_as_bytes(body)
++        return request.get_response(self.application)
++
++    def test_service_reserve_get_and_list_hide_backend_details(self):
++        response = self.request({'checkpoint_operation': self.payload})
++        self.assertEqual(202, response.status_int, response.text)
++        operation = response.json['checkpoint_operation']
++        self.assertEqual(1, operation['generation'])
++        self.assertEqual(2, len(operation['resources']))
++        for text in ('service_user_id', 'payload_hash', 'backend_reference',
++                     'capabilities_json', 'quota_reservations', 'provider'):
++            self.assertNotIn(text, response.text)
++        response = self.request(
++            path='checkpoint-operations/' + operation['id'], method='GET')
++        self.assertEqual(200, response.status_int, response.text)
++        response = self.request(path='checkpoint-operations', method='GET')
++        self.assertEqual(200, response.status_int, response.text)
++        self.assertEqual(operation['id'],
++                         response.json['checkpoint_operations'][0]['id'])
++
++    def test_tenant_service_role_is_not_service_token(self):
++        ctxt = self.ctxt.deepcopy()
++        ctxt.roles = ['admin', 'member', 'service']
++        ctxt.is_admin = True
++        ctxt.service_roles = None
++        ctxt.service_user_id = None
++        response = self.request({'checkpoint_operation': self.payload},
++                                ctxt=ctxt)
++        self.assertEqual(403, response.status_int, response.text)
++        self.assertEqual([], self.locks())
++
++    def test_unknown_fields_duplicate_and_invalid_volumes_rejected(self):
++        for key, value in (('snapshot_ids', []), ('volume_ids', []),
++                           ('volume_ids', self.volumes * 2),
++                           ('volume_ids', [uuidutils.generate_uuid()
++                                           for unused in range(65)]),
++                           ('volume_ids', ['not-a-uuid'])):
++            payload = copy.deepcopy(self.payload)
++            payload[key] = value
++            response = self.request({'checkpoint_operation': payload})
++            self.assertEqual(400, response.status_int, response.text)
++        self.rpc.get_checkpoint_capabilities.assert_not_called()
++        self.assertEqual([], self.locks())
++
++    def test_old_version_does_not_call_new_logic(self):
++        response = self.request({'checkpoint_operation': self.payload},
++                                version='3.71')
++        self.assertEqual(404, response.status_int, response.text)
++        self.assertEqual([], self.locks())
++        self.rpc.get_checkpoint_capabilities.assert_not_called()
++
++    def test_wrong_project_and_changed_request(self):
++        ctxt = self.ctxt.elevated()
++        ctxt.project_id = uuidutils.generate_uuid()
++        response = self.request({'checkpoint_operation': self.payload},
++                                ctxt=ctxt)
++        self.assertEqual(404, response.status_int, response.text)
++        self.assertEqual(202, self.request(
++            {'checkpoint_operation': self.payload}).status_int)
++        self.payload['volume_ids'] = self.volumes[:1]
++        response = self.request({'checkpoint_operation': self.payload})
++        self.assertEqual(409, response.status_int, response.text)
++
++    def test_capabilities_specific_volume_and_unknown_filters(self):
++        response = self.request(path='volumes/%s/checkpoint-capabilities' %
++                                self.volumes[0], method='GET')
++        self.assertEqual(200, response.status_int, response.text)
++        self.assertTrue(response.json['checkpoint_capabilities']['supported'])
++        response = self.request(path='checkpoint-operations?project_id=other',
++                                method='GET')
++        self.assertEqual(400, response.status_int, response.text)
++
++    def test_action_requires_exact_generation_and_one_action(self):
++        response = self.request({'checkpoint_operation': self.payload})
++        self.assertEqual(202, response.status_int, response.text)
++        opid = response.json['checkpoint_operation']['id']
++        for body in ({'execute': {'generation': True}},
++                     {'execute': {'generation': 0}},
++                     {'execute': {'generation': 1, 'force': True}},
++                     {'execute': {'generation': 1},
++                      'reconcile': {'generation': 1}}):
++            response = self.request(
++                body, path='checkpoint-operations/%s/action' % opid)
++            self.assertEqual(400, response.status_int, response.text)
++        response = self.request({'execute': {'generation': 2}},
++                                path='checkpoint-operations/%s/action' % opid)
++        self.assertEqual(409, response.status_int, response.text)
++        self.rpc.execute_checkpoint_step.assert_not_called()
++
++    def test_quota_failure_is_413_and_leaves_no_partial_reservation(self):
++        db.quota_create(self.ctxt.elevated(), self.ctxt.project_id,
++                        'snapshots', 1)
++        response = self.request({'checkpoint_operation': self.payload})
++        self.assertEqual(413, response.status_int, response.text)
++        self.assertEqual([], self.locks())
++        self.assertEqual(0, self.usage()['snapshots']['reserved'])
+diff --git a/cinder/tests/unit/checkpoints/test_api.py b/cinder/tests/unit/checkpoints/test_api.py
+new file mode 100644
+index 0000000..77813d4
+--- /dev/null
++++ b/cinder/tests/unit/checkpoints/test_api.py
+@@ -0,0 +1,139 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import copy
++import json
++from unittest import mock
++
++from oslo_utils import uuidutils
++
++from cinder.checkpoints import api
++from cinder.checkpoints import config
++from cinder import context
++from cinder import db
++from cinder import exception
++from cinder import objects
++from cinder.tests.unit.checkpoints import test_contracts
++from cinder.tests.unit.checkpoints import test_db
++from cinder.tests.unit import test
++from cinder.tests.unit import utils
++
++
++class APIHelpers(test_db.CheckpointDBHelpers):
++    def prepare_api(self):
++        self.prepare_volumes()
++        self.ctxt.roles = ['member']
++        self.ctxt.service_roles = ['service']
++        self.flags(enabled=True, nova_service_user_ids=[test_db.SERVICE_ID],
++                   group='checkpoint')
++        self.rpc = mock.Mock(spec=[
++            'assert_checkpoint_ready', 'get_checkpoint_capabilities',
++            'execute_checkpoint_step', 'reconcile_checkpoint_step'])
++        self.rpc.get_checkpoint_capabilities.return_value = (
++            test_contracts.supported_capabilities())
++        self.api = api.API(rpc=self.rpc)
++        self.payload = {key: value for key, value in self.values().items()
++                        if key != 'capabilities'}
++        self.payload['volume_ids'] = self.volumes
++
++    def usage(self):
++        return db.quota_usage_get_all_by_project(
++            self.ctxt.elevated(), self.ctxt.project_id)
++
++
++class TestCheckpointAPI(APIHelpers, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_api()
++
++    def test_reservation_creates_snapshots_and_accounts_quota_once(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.assertIsInstance(operation, objects.CheckpointOperation)
++        self.assertEqual(2, self.usage()['snapshots']['in_use'])
++        self.assertEqual(0, self.usage()['snapshots']['reserved'])
++        for resource in operation.resources:
++            snap = objects.Snapshot.get_by_id(self.ctxt, resource.snapshot_id)
++            self.assertEqual(resource.volume_id, snap.volume_id)
++            self.assertEqual('creating', snap.status)
++        self.assertTrue(all(json.loads(step.quota_reservations_json)
++                            for step in operation.steps))
++        again = self.api.reserve(self.ctxt, copy.deepcopy(self.payload))
++        self.assertEqual(operation.id, again.id)
++        self.assertEqual(2, self.usage()['snapshots']['in_use'])
++        self.assertEqual(0, self.usage()['snapshots']['reserved'])
++
++    def test_conflicting_reservation_leaves_no_quota_or_snapshots(self):
++        snap = utils.create_snapshot(self.ctxt, self.volumes[1],
++                                     status='creating')
++        self.assertRaises(exception.CheckpointConflict,
++                          self.api.reserve, self.ctxt, self.payload)
++        self.assertEqual([], self.locks())
++        self.assertEqual(0, self.usage()['snapshots']['reserved'])
++        snapshots = objects.SnapshotList.get_all_by_project(
++            self.ctxt, self.ctxt.project_id, {})
++        self.assertEqual([snap.id], [s.id for s in snapshots])
++
++    def test_policy_and_verified_service_both_required(self):
++        for attr, value in (('service_user_id', None),
++                            ('service_user_id', uuidutils.generate_uuid()),
++                            ('service_roles', []), ('roles', ['service'])):
++            ctxt = self.ctxt.deepcopy()
++            setattr(ctxt, attr, value)
++            self.assertRaises(exception.NotAuthorized, self.api.reserve,
++                              ctxt, self.payload)
++        self.assertEqual([], self.locks())
++        self.rpc.get_checkpoint_capabilities.assert_not_called()
++
++    def test_disabled_feature_allows_existing_read_and_exact_replay(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        config.CONF.set_override('enabled', False, group='checkpoint')
++        self.assertEqual(operation.id,
++                         self.api.get(self.ctxt, operation.id).id)
++        self.assertEqual(operation.id,
++                         self.api.reserve(self.ctxt, self.payload).id)
++        changed = copy.deepcopy(self.payload)
++        changed['request_id'] = uuidutils.generate_uuid()
++        self.assertRaises(exception.CheckpointNotSupported,
++                          self.api.reserve, self.ctxt, changed)
++
++    def test_foreign_project_denied_before_backend_detail(self):
++        ctxt = self.ctxt.elevated()
++        ctxt.project_id = uuidutils.generate_uuid()
++        self.assertRaises(exception.VolumeNotFound, self.api.reserve,
++                          ctxt, self.payload)
++        self.rpc.get_checkpoint_capabilities.assert_not_called()
++
++    def test_rpc_gate_before_any_reservation(self):
++        self.rpc.assert_checkpoint_ready.side_effect = (
++            exception.CheckpointNotSupported(reason='upgrade_required'))
++        self.assertRaises(exception.CheckpointNotSupported,
++                          self.api.reserve, self.ctxt, self.payload)
++        self.assertEqual([], self.locks())
++        self.assertNotIn('snapshots', self.usage())
++
++    def test_changed_request_conflicts_without_new_effects(self):
++        self.api.reserve(self.ctxt, self.payload)
++        self.payload['volume_ids'] = self.volumes[:1]
++        self.assertRaises(exception.CheckpointConflict,
++                          self.api.reserve, self.ctxt, self.payload)
++        self.assertEqual(2, self.usage()['snapshots']['in_use'])
++
++    def test_untrusted_driver_output_fails_before_db(self):
++        self.rpc.get_checkpoint_capabilities.return_value = {'supported': True}
++        self.assertRaises(exception.CheckpointNotSupported,
++                          self.api.reserve, self.ctxt, self.payload)
++        self.assertEqual([], self.locks())
++
++    def test_service_identity_survives_rpc_context_roundtrip(self):
++        restored = context.RequestContext.from_dict(self.ctxt.to_dict())
++        self.assertEqual(self.ctxt.service_user_id, restored.service_user_id)
++        self.assertEqual(self.ctxt.service_roles, restored.service_roles)
+diff --git a/cinder/tests/unit/policies/test_checkpoints.py b/cinder/tests/unit/policies/test_checkpoints.py
+new file mode 100644
+index 0000000..6684e8e
+--- /dev/null
++++ b/cinder/tests/unit/policies/test_checkpoints.py
+@@ -0,0 +1,33 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from cinder import context
++from cinder import exception
++from cinder.policies import checkpoints
++from cinder.tests.unit import fake_constants as fake
++from cinder.tests.unit import test
++
++
++class TestCheckpointPolicy(test.TestCase):
++    def test_project_members_and_admins_only(self):
++        for role in ('admin', 'member', 'reader', 'service'):
++            for rule in checkpoints.list_rules():
++                ctxt = context.RequestContext(fake.USER_ID, fake.PROJECT_ID,
++                                              roles=[role], is_admin=False)
++                if role in ('admin', 'member'):
++                    self.assertTrue(ctxt.authorize(rule.name))
++                else:
++                    self.assertRaises(exception.PolicyNotAuthorized,
++                                      ctxt.authorize, rule.name)
++                self.assertRaises(exception.PolicyNotAuthorized,
++                                  ctxt.authorize, rule.name,
++                                  target={'project_id': fake.PROJECT2_ID})

@@ -1,0 +1,690 @@
+From 8297827e6c7ed565af3c2debd01a1fdf3d90bee3 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 15:51:26 +0300
+Subject: [PATCH 1/7] feat: define scoped checkpoint continuation contract
+
+---
+ cinder/checkpoints/continuation.py            |  36 +++
+ cinder/checkpoints/continuation_contracts.py  | 248 +++++++++++++++
+ cinder/policies/checkpoints.py                |  27 ++
+ .../test_continuation_contracts.py            | 297 ++++++++++++++++++
+ .../tests/unit/policies/test_checkpoints.py   |  15 +
+ 5 files changed, 623 insertions(+)
+ create mode 100644 cinder/checkpoints/continuation.py
+ create mode 100644 cinder/checkpoints/continuation_contracts.py
+ create mode 100644 cinder/tests/unit/checkpoints/test_continuation_contracts.py
+
+diff --git a/cinder/checkpoints/continuation.py b/cinder/checkpoints/continuation.py
+new file mode 100644
+index 0000000..58230b0
+--- /dev/null
++++ b/cinder/checkpoints/continuation.py
+@@ -0,0 +1,36 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Authenticate the executor independently of the original operation actor."""
++
++from cinder.checkpoints import config
++from cinder import exception
++from cinder.policies import checkpoints as policies
++
++
++def require_executor(context) -> str:
++    """Policy cannot override mandatory token subject, role and allowlist.
++
++    Call only with a context produced by the authentication middleware or
++    the trusted RPC context serializer. Client-supplied scope fields do not
++    establish identity, and secondary service-token identity is not used.
++    Feature disablement does not prevent recovery of existing operations.
++    """
++    subject = context.user_id
++    if (not subject or not context.project_id or
++            'service' not in context.roles or subject not in
++            config.CONF.checkpoint.nova_service_user_ids):
++        raise exception.CheckpointServiceForbidden()
++    context.authorize(policies.CONTINUE_POLICY,
++                      target={'project_id': context.project_id,
++                              'user_id': subject})
++    return subject
+diff --git a/cinder/checkpoints/continuation_contracts.py b/cinder/checkpoints/continuation_contracts.py
+new file mode 100644
+index 0000000..1f10ec7
+--- /dev/null
++++ b/cinder/checkpoints/continuation_contracts.py
+@@ -0,0 +1,248 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Closed continuation envelopes; a serialized scope is never authority."""
++
++from collections.abc import Mapping
++import dataclasses
++import hashlib
++import json
++from types import MappingProxyType
++import uuid
++
++
++ACTIONS = ('create', 'update', 'complete', 'delete')
++STATUSES = ('prepared', 'dispatching', 'pending', 'succeeded',
++            'failed_no_effect', 'unknown')
++ERROR_CODES = frozenset((
++    'driver_exception', 'query_exception', 'invalid_driver_result',
++    'cancelled_before_dispatch', 'attachment_result_unknown',
++    'request_payload_changed', 'continuation_revoked',
++))
++_CONNECTOR_STRINGS = frozenset((
++    'host', 'ip', 'initiator', 'platform', 'os_type', 'nqn', 'uuid',
++    'system uuid',
++))
++_CONNECTOR_BOOLS = frozenset(('multipath', 'enforce_multipath',
++                             'nvme_native_multipath'))
++_CONNECTOR_LISTS = frozenset(('wwpns', 'wwnns'))
++_RESERVE_KEYS = frozenset(('request_id', 'checkpoint_id', 'instance_uuid',
++                           'kind', 'volume_ids'))
++_DELEGATION_KEYS = frozenset(('nova_operation_id',
++                              'allow_service_continuation'))
++
++
++def _uuid(value):
++    if not isinstance(value, str):
++        raise ValueError('invalid_uuid')
++    try:
++        if str(uuid.UUID(value)) == value:
++            return value
++    except (ValueError, AttributeError):
++        pass
++    raise ValueError('invalid_uuid')
++
++
++def _text(value, maximum=255):
++    if (not isinstance(value, str) or not value.strip() or
++            len(value) > maximum or '\x00' in value):
++        raise ValueError('invalid_string')
++    return value
++
++
++def _generation(value):
++    if type(value) is not int or value != 1:
++        raise ValueError('invalid_generation')
++
++
++def _volumes(values):
++    if not isinstance(values, (list, tuple)) or not 1 <= len(values) <= 64:
++        raise ValueError('invalid_volumes')
++    result = tuple(sorted(_uuid(value) for value in values))
++    if len(set(result)) != len(result):
++        raise ValueError('duplicate_volume')
++    return result
++
++
++def _kind(value):
++    if value not in ('create', 'revert', 'delete'):
++        raise ValueError('invalid_kind')
++
++
++def _connector(value):
++    if not isinstance(value, Mapping) or not value:
++        raise ValueError('invalid_connector')
++    if set(value) - _CONNECTOR_STRINGS - _CONNECTOR_BOOLS - _CONNECTOR_LISTS:
++        raise ValueError('invalid_connector_fields')
++    result = {}
++    for key, item in value.items():
++        if key in _CONNECTOR_STRINGS:
++            result[key] = _text(item, 1024)
++        elif key in _CONNECTOR_BOOLS:
++            if type(item) is not bool:
++                raise ValueError('invalid_connector_boolean')
++            result[key] = item
++        else:
++            if not isinstance(item, (list, tuple)) or not 1 <= len(item) <= 64:
++                raise ValueError('invalid_connector_list')
++            result[key] = tuple(_text(entry, 255) for entry in item)
++    return MappingProxyType(result)
++
++
++def _primitive(value):
++    if isinstance(value, Mapping):
++        return {key: _primitive(item) for key, item in value.items()}
++    if isinstance(value, (tuple, list)):
++        return [_primitive(item) for item in value]
++    return value
++
++
++class _Envelope:
++    def to_primitive(self):
++        return dict(schema_version=1, **{
++            field.name: _primitive(getattr(self, field.name))
++            for field in dataclasses.fields(self)})
++
++    @classmethod
++    def from_primitive(cls, value):
++        keys = {field.name for field in dataclasses.fields(cls)}
++        if (not isinstance(value, dict) or
++                set(value) != keys | {'schema_version'} or
++                type(value['schema_version']) is not int or
++                value['schema_version'] != 1):
++            raise ValueError('invalid_envelope')
++        return cls(**{key: value[key] for key in keys})
++
++
++@dataclasses.dataclass(frozen=True)
++class ContinuationScope(_Envelope):
++    grant_id: str
++    operation_id: str
++    nova_operation_id: str
++    owner_project_id: str
++    actor_user_id: str
++    executor_service_user_id: str
++    instance_uuid: str
++    checkpoint_id: str
++    kind: str
++    generation: int
++    volume_ids: tuple[str, ...]
++    grant_revision: int
++
++    def __post_init__(self):
++        for key in ('grant_id', 'operation_id', 'nova_operation_id',
++                    'instance_uuid', 'checkpoint_id'):
++            _uuid(getattr(self, key))
++        for key in ('owner_project_id', 'actor_user_id',
++                    'executor_service_user_id'):
++            _text(getattr(self, key))
++        _kind(self.kind)
++        _generation(self.generation)
++        if type(self.grant_revision) is not int or self.grant_revision < 0:
++            raise ValueError('invalid_grant_revision')
++        object.__setattr__(self, 'volume_ids', _volumes(self.volume_ids))
++
++
++@dataclasses.dataclass(frozen=True)
++class AttachmentRequest(_Envelope):
++    id: str
++    generation: int
++    volume_id: str
++    action: str
++    attachment_id: str | None
++    connector: dict | None
++    mountpoint: str | None
++
++    def __post_init__(self):
++        _uuid(self.id)
++        _uuid(self.volume_id)
++        _generation(self.generation)
++        if self.action not in ACTIONS:
++            raise ValueError('invalid_action')
++        if self.action == 'create':
++            if any(value is not None for value in (
++                    self.attachment_id, self.connector, self.mountpoint)):
++                raise ValueError('invalid_create_fields')
++        else:
++            _uuid(self.attachment_id)
++            if self.action == 'update':
++                object.__setattr__(self, 'connector',
++                                   _connector(self.connector))
++                if self.mountpoint is not None:
++                    _text(self.mountpoint)
++            elif self.connector is not None or self.mountpoint is not None:
++                raise ValueError('invalid_action_fields')
++
++
++@dataclasses.dataclass(frozen=True)
++class AttachmentResult(_Envelope):
++    id: str
++    operation_id: str
++    generation: int
++    volume_id: str
++    action: str
++    status: str
++    attachment_id: str | None
++    error_code: str | None
++
++    def __post_init__(self):
++        for key in ('id', 'operation_id', 'volume_id'):
++            _uuid(getattr(self, key))
++        _generation(self.generation)
++        if self.action not in ACTIONS or self.status not in STATUSES:
++            raise ValueError('invalid_result')
++        if self.attachment_id is not None or self.status == 'succeeded':
++            _uuid(self.attachment_id)
++        if (self.error_code is not None and
++                (self.error_code not in ERROR_CODES or
++                 self.status == 'succeeded')):
++            raise ValueError('invalid_error_code')
++
++
++def validate_attachment(value: dict) -> AttachmentRequest:
++    keys = {field.name for field in dataclasses.fields(AttachmentRequest)}
++    if not isinstance(value, dict) or set(value) != keys:
++        raise ValueError('invalid_attachment_request')
++    return AttachmentRequest(**value)
++
++
++def validate_reserve_373(payload: dict) -> dict:
++    if not isinstance(payload, dict):
++        raise ValueError('invalid_reserve')
++    keys = set(payload)
++    if keys not in (_RESERVE_KEYS, _RESERVE_KEYS | _DELEGATION_KEYS):
++        raise ValueError('invalid_reserve_fields')
++    for key in ('request_id', 'checkpoint_id', 'instance_uuid'):
++        _uuid(payload[key])
++    _kind(payload['kind'])
++    if 'nova_operation_id' in payload:
++        _uuid(payload['nova_operation_id'])
++        if payload['allow_service_continuation'] is not True:
++            raise ValueError('explicit_delegation_required')
++    if not isinstance(payload['volume_ids'], list):
++        raise ValueError('invalid_volumes')
++    return dict(payload, volume_ids=list(_volumes(payload['volume_ids'])))
++
++
++def body_hash(value: dict) -> str:
++    """Use the C1 JSON encoding for arbitrary closed continuation bodies."""
++    if not isinstance(value, dict):
++        raise ValueError('invalid_hash_body')
++    value = dict(value)
++    if 'volume_ids' in value:
++        value['volume_ids'] = list(_volumes(value['volume_ids']))
++    try:
++        encoded = json.dumps(value, sort_keys=True, separators=(',', ':'),
++                             ensure_ascii=True, allow_nan=False)
++    except (TypeError, ValueError):
++        raise ValueError('invalid_hash_body') from None
++    return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+diff --git a/cinder/policies/checkpoints.py b/cinder/policies/checkpoints.py
+index 25ae6a0..464691e 100644
+--- a/cinder/policies/checkpoints.py
++++ b/cinder/policies/checkpoints.py
+@@ -17,6 +17,8 @@ from oslo_policy import policy
+ 
+ READ_POLICY = 'checkpoint:read'
+ OPERATE_POLICY = 'checkpoint:operate'
++CONTINUE_POLICY = 'checkpoint:continue'
++CONTINUATION_READ_POLICY = 'checkpoint:continuation_read'
+ _MEMBER = '(role:member or role:admin) and project_id:%(project_id)s'
+ 
+ checkpoint_policies = [
+@@ -34,6 +36,31 @@ checkpoint_policies = [
+         operations=[
+             {'method': 'POST', 'path': '/checkpoint-operations'},
+             {'method': 'POST', 'path': '/checkpoint-operations/{id}/action'}]),
++    policy.DocumentedRuleDefault(
++        name=CONTINUE_POLICY, check_str='role:service',
++        description='Continue an explicitly delegated checkpoint operation. '
++                    'The service subject allowlist and grant are mandatory.',
++        operations=[
++            {'method': 'POST',
++             'path': '/checkpoint-service-operations/{id}/action'},
++            {'method': 'POST',
++             'path': '/checkpoint-service-operations/{id}/attachment-requests'}
++        ]),
++    policy.DocumentedRuleDefault(
++        name=CONTINUATION_READ_POLICY, check_str='role:service',
++        description='Read a checkpoint delegated to this service subject. '
++                    'The service subject allowlist and grant are mandatory.',
++        operations=[
++            {'method': 'GET', 'path': '/checkpoint-service-operations/{id}'},
++            {'method': 'GET',
++             'path': '/checkpoint-service-operations/{id}/volumes/{volume_id}'
++                     '/capabilities'},
++            {'method': 'GET',
++             'path': '/checkpoint-service-operations/{id}/attachment-requests'
++                     '/{child_id}'},
++            {'method': 'GET',
++             'path': '/checkpoint-service-operations/{id}/attachments'
++                     '/{attachment_id}'}]),
+ ]
+ 
+ 
+diff --git a/cinder/tests/unit/checkpoints/test_continuation_contracts.py b/cinder/tests/unit/checkpoints/test_continuation_contracts.py
+new file mode 100644
+index 0000000..6a7b3e9
+--- /dev/null
++++ b/cinder/tests/unit/checkpoints/test_continuation_contracts.py
+@@ -0,0 +1,297 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import copy
++import dataclasses
++import json
++import operator
++from unittest import mock
++
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from cinder.checkpoints import config
++from cinder.checkpoints import continuation
++from cinder.checkpoints import continuation_contracts as contracts
++from cinder.checkpoints import contracts as legacy_contracts
++from cinder import context
++from cinder import exception
++from cinder.policies import checkpoints as policies
++from cinder.tests.unit import test
++
++
++def attachment_request(**changes):
++    value = dict(id=uuids.child, generation=1, volume_id=uuids.volume,
++                 action='create', attachment_id=None, connector=None,
++                 mountpoint=None)
++    value.update(changes)
++    return value
++
++
++def reserve_payload(**changes):
++    value = dict(request_id=uuids.nova_operation,
++                 checkpoint_id=uuids.checkpoint, instance_uuid=uuids.instance,
++                 kind='create', volume_ids=[uuids.volume, uuids.volume2],
++                 nova_operation_id=uuids.nova_operation,
++                 allow_service_continuation=True)
++    value.update(changes)
++    return value
++
++
++def scope_payload(**changes):
++    value = dict(schema_version=1, grant_id=uuids.grant,
++                 operation_id=uuids.operation,
++                 nova_operation_id=uuids.nova_operation,
++                 owner_project_id=uuids.project, actor_user_id=uuids.actor,
++                 executor_service_user_id=uuids.service,
++                 instance_uuid=uuids.instance, checkpoint_id=uuids.checkpoint,
++                 kind='revert', generation=1,
++                 volume_ids=[uuids.volume, uuids.volume2], grant_revision=0)
++    value.update(changes)
++    return value
++
++
++class ContinuationContractTest(test.TestCase):
++    def test_boolean_generation_is_not_one(self):
++        self.assertRaises(ValueError, contracts.validate_attachment,
++                          attachment_request(generation=True))
++
++    def test_extra_fields_and_action_specific_shape_rejected(self):
++        invalid = [dict(untrusted='value'), dict(action='unknown'),
++                   dict(attachment_id=uuids.attachment),
++                   dict(connector={'host': 'compute-one'}),
++                   dict(mountpoint='/dev/vdb'), dict(action='update'),
++                   dict(action='complete'), dict(action='delete'),
++                   dict(action='update', attachment_id=uuids.attachment,
++                        connector={'host': 'compute-one', 'password': 'x'}),
++                   dict(action='update', attachment_id=uuids.attachment,
++                        connector={'host': 'compute-one', 'multipath': 1}),
++                   dict(action='update', attachment_id=uuids.attachment,
++                        connector={'wwpns': 'not-a-list'}),
++                   dict(action='delete', attachment_id=uuids.attachment,
++                        connector={})]
++        for fields in invalid:
++            with self.subTest(fields=fields):
++                self.assertRaises(ValueError, contracts.validate_attachment,
++                                  attachment_request(**fields))
++
++    def test_valid_actions_round_trip_as_json(self):
++        cases = [attachment_request(), attachment_request(
++            action='update', attachment_id=uuids.attachment,
++            connector={'host': 'compute-one', 'ip': '192.0.2.10',
++                       'multipath': True, 'enforce_multipath': False,
++                       'system uuid': uuids.system, 'wwpns': ['abc'],
++                       'wwnns': ['def'], 'platform': 'x86_64',
++                       'os_type': 'linux2', 'initiator': 'iqn.example',
++                       'nqn': 'nqn.example', 'uuid': uuids.system},
++            mountpoint='/dev/vdb')]
++        cases.extend(attachment_request(action=action,
++                                        attachment_id=uuids.attachment)
++                     for action in ('complete', 'delete'))
++        for value in cases:
++            with self.subTest(action=value['action']):
++                request = contracts.validate_attachment(value)
++                primitive = request.to_primitive()
++                self.assertEqual(dict(value, schema_version=1), primitive)
++                self.assertEqual(request, contracts.AttachmentRequest.
++                                 from_primitive(json.loads(
++                                     json.dumps(primitive))))
++
++    def test_immutable_request_cannot_change_connector_after_hash(self):
++        value = attachment_request(
++            action='update', attachment_id=uuids.attachment,
++            connector={'host': 'compute-one', 'wwpns': ['abc']})
++        request = contracts.validate_attachment(value)
++        expected = request.to_primitive()
++        value['connector']['wwpns'].append('def')
++        exported = request.to_primitive()
++        exported['connector']['host'] = 'other-compute'
++        self.assertEqual(expected, request.to_primitive())
++        self.assertRaises(TypeError, operator.setitem, request.connector,
++                          'host', 'other-compute')
++        self.assertRaises(AttributeError, getattr,
++                          request.connector['wwpns'], 'append')
++        self.assertRaises(dataclasses.FrozenInstanceError, setattr,
++                          request, 'action', 'delete')
++        changed = dataclasses.replace(request, connector={'host': 'other'})
++        self.assertNotEqual(request.to_primitive(), changed.to_primitive())
++
++    def test_noncanonical_uuid_and_missing_fields_rejected(self):
++        for value in ('not-a-uuid', uuids.child.upper(),
++                      uuids.child.replace('-', ''), None, 1):
++            with self.subTest(value=value):
++                self.assertRaises(ValueError, contracts.validate_attachment,
++                                  attachment_request(id=value))
++        body = attachment_request()
++        del body['mountpoint']
++        self.assertRaises(ValueError, contracts.validate_attachment, body)
++
++    def test_direct_constructor_also_validates(self):
++        self.assertRaises(ValueError, contracts.AttachmentRequest,
++                          **attachment_request(generation=2))
++
++    def test_versioned_envelopes_are_closed(self):
++        valid = dict(attachment_request(), schema_version=1)
++        for fields in ({'schema_version': True}, {'schema_version': 2},
++                       {'scope': {}}, {'connection_info': {}}):
++            with self.subTest(fields=fields):
++                self.assertRaises(ValueError,
++                                  contracts.AttachmentRequest.from_primitive,
++                                  dict(valid, **fields))
++        self.assertRaises(ValueError,
++                          contracts.AttachmentRequest.from_primitive,
++                          attachment_request())
++
++    def test_scope_preserves_actor_and_orders_volumes(self):
++        value = scope_payload()
++        scope = contracts.ContinuationScope.from_primitive(value)
++        self.assertEqual(uuids.actor, scope.actor_user_id)
++        self.assertEqual(uuids.service, scope.executor_service_user_id)
++        self.assertEqual(tuple(sorted(value['volume_ids'])), scope.volume_ids)
++        self.assertEqual(scope, contracts.ContinuationScope.from_primitive(
++            json.loads(json.dumps(scope.to_primitive()))))
++        value['volume_ids'].append(uuids.volume3)
++        self.assertEqual(2, len(scope.volume_ids))
++
++    def test_scope_invalid_generation_revision_identity_or_volume_set(self):
++        for fields in ({'generation': True}, {'grant_revision': True},
++                       {'grant_revision': -1}, {'actor_user_id': ''},
++                       {'owner_project_id': 'x' * 256}, {'volume_ids': []},
++                       {'volume_ids': [uuids.volume, uuids.volume]},
++                       {'schema_version': 2}, {'unexpected': 1}):
++            with self.subTest(fields=fields):
++                self.assertRaises(ValueError,
++                                  contracts.ContinuationScope.from_primitive,
++                                  scope_payload(**fields))
++
++    def test_reserve_delegation_is_explicit_and_paired(self):
++        valid = reserve_payload()
++        self.assertEqual(sorted(valid['volume_ids']),
++                         contracts.validate_reserve_373(valid)['volume_ids'])
++        legacy = {key: value for key, value in valid.items()
++                  if key not in ('nova_operation_id',
++                                 'allow_service_continuation')}
++        self.assertNotIn('nova_operation_id',
++                         contracts.validate_reserve_373(legacy))
++        for fields in ({'nova_operation_id': uuids.nova_operation},
++                       {'allow_service_continuation': True}):
++            self.assertRaises(ValueError, contracts.validate_reserve_373,
++                              dict(legacy, **fields))
++        for value in (False, 1, 'true', None):
++            self.assertRaises(ValueError, contracts.validate_reserve_373,
++                              dict(valid, allow_service_continuation=value))
++
++    def test_reserve_rejects_identity_injection_and_bad_volume_set(self):
++        for fields in ({'actor_user_id': uuids.other},
++                       {'service_user_id': uuids.service},
++                       {'volume_ids': [uuids.volume, uuids.volume]},
++                       {'volume_ids': []}, {'kind': 'attach'},
++                       {'instance_uuid': 'not-a-uuid'}):
++            with self.subTest(fields=fields):
++                self.assertRaises(ValueError, contracts.validate_reserve_373,
++                                  reserve_payload(**fields))
++
++    def test_body_hash_uses_c1_canonical_form_and_binds_delegation(self):
++        value = reserve_payload()
++        reordered = dict(reversed(list(value.items())))
++        reordered['volume_ids'] = list(reversed(value['volume_ids']))
++        expected = contracts.body_hash(value)
++        self.assertEqual(expected, contracts.body_hash(reordered))
++        self.assertEqual(expected,
++                         legacy_contracts.canonical_payload_hash(value))
++        changed = dict(value, nova_operation_id=uuids.other_operation)
++        self.assertNotEqual(expected, contracts.body_hash(changed))
++        self.assertEqual(reserve_payload(), value)
++        self.assertRaises(ValueError, contracts.body_hash,
++                          {'connector': {'number': float('nan')}})
++
++    def test_attachment_hash_binds_connector_and_target(self):
++        value = attachment_request(action='update',
++                                   attachment_id=uuids.attachment,
++                                   connector={'host': 'compute-one'})
++        expected = contracts.body_hash(value)
++        changed = copy.deepcopy(value)
++        changed['connector']['host'] = 'compute-two'
++        self.assertNotEqual(expected, contracts.body_hash(changed))
++        changed = dict(value, attachment_id=uuids.other_attachment)
++        self.assertNotEqual(expected, contracts.body_hash(changed))
++
++    def test_attachment_result_has_no_sensitive_fields(self):
++        value = dict(id=uuids.child, operation_id=uuids.operation,
++                     generation=1, volume_id=uuids.volume, action='update',
++                     status='unknown', attachment_id=uuids.attachment,
++                     error_code='attachment_result_unknown', schema_version=1)
++        result = contracts.AttachmentResult.from_primitive(value)
++        self.assertEqual(value, result.to_primitive())
++        for fields in ({'connection_info': {}}, {'status': 'ready'},
++                       {'error_code': 'sensitive_backend_exception'},
++                       {'generation': True}):
++            self.assertRaises(ValueError,
++                              contracts.AttachmentResult.from_primitive,
++                              dict(value, **fields))
++
++
++class ContinuationIdentityTest(test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.flags(nova_service_user_ids=[uuids.service], group='checkpoint')
++        self.ctx = context.RequestContext(uuids.service, uuids.service_project,
++                                          roles=['service'], is_admin=False)
++
++    def test_only_authenticated_subject_can_continue(self):
++        self.assertEqual(uuids.service,
++                         continuation.require_executor(self.ctx))
++        self.ctx.user_id = uuids.attacker
++        self.ctx.service_user_id = uuids.service
++        self.assertRaises(exception.CheckpointServiceForbidden,
++                          continuation.require_executor, self.ctx)
++
++    def test_role_without_allowlist_and_allowlist_without_role_denied(self):
++        for allowlist, roles in (([], ['service']), ([uuids.service], []),
++                                 ([uuids.service], ['admin'])):
++            with self.subTest(allowlist=allowlist, roles=roles):
++                self.flags(nova_service_user_ids=allowlist, group='checkpoint')
++                ctx = context.RequestContext(uuids.service,
++                                             uuids.service_project,
++                                             roles=roles, is_admin=False)
++                exc = self.assertRaises(exception.CheckpointServiceForbidden,
++                                        continuation.require_executor, ctx)
++                self.assertEqual(403, exc.code)
++        self.assertFalse(config.CONF.checkpoint.enabled)
++
++    def test_no_admin_bypass_or_unscoped_service(self):
++        for user, project in ((uuids.attacker, uuids.service_project),
++                              (uuids.service, None), (None, uuids.project)):
++            ctx = context.RequestContext(user, project, roles=['service'],
++                                         is_admin=True)
++            self.assertRaises(exception.CheckpointServiceForbidden,
++                              continuation.require_executor, ctx)
++
++    def test_allowlist_revocation_is_checked_on_every_call(self):
++        self.assertEqual(uuids.service,
++                         continuation.require_executor(self.ctx))
++        self.flags(nova_service_user_ids=[], group='checkpoint')
++        self.assertRaises(exception.CheckpointServiceForbidden,
++                          continuation.require_executor, self.ctx)
++
++    def test_service_policy_is_additional_and_actor_stays_unchanged(self):
++        before = (self.ctx.user_id, self.ctx.project_id, self.ctx.roles[:])
++        with mock.patch.object(self.ctx, 'authorize',
++                               side_effect=exception.PolicyNotAuthorized(
++                                   action=policies.CONTINUE_POLICY)) as check:
++            self.assertRaises(exception.PolicyNotAuthorized,
++                              continuation.require_executor, self.ctx)
++        check.assert_called_once_with(
++            policies.CONTINUE_POLICY,
++            target={'project_id': uuids.service_project,
++                    'user_id': uuids.service})
++        self.assertEqual(before, (self.ctx.user_id, self.ctx.project_id,
++                                  self.ctx.roles))
+diff --git a/cinder/tests/unit/policies/test_checkpoints.py b/cinder/tests/unit/policies/test_checkpoints.py
+index 6684e8e..4eeb08a 100644
+--- a/cinder/tests/unit/policies/test_checkpoints.py
++++ b/cinder/tests/unit/policies/test_checkpoints.py
+@@ -21,6 +21,9 @@ class TestCheckpointPolicy(test.TestCase):
+     def test_project_members_and_admins_only(self):
+         for role in ('admin', 'member', 'reader', 'service'):
+             for rule in checkpoints.list_rules():
++                if rule.name not in (checkpoints.READ_POLICY,
++                                     checkpoints.OPERATE_POLICY):
++                    continue
+                 ctxt = context.RequestContext(fake.USER_ID, fake.PROJECT_ID,
+                                               roles=[role], is_admin=False)
+                 if role in ('admin', 'member'):
+@@ -31,3 +34,15 @@ class TestCheckpointPolicy(test.TestCase):
+                 self.assertRaises(exception.PolicyNotAuthorized,
+                                   ctxt.authorize, rule.name,
+                                   target={'project_id': fake.PROJECT2_ID})
++
++    def test_continuation_policies_require_service_role(self):
++        for name in (checkpoints.CONTINUE_POLICY,
++                     checkpoints.CONTINUATION_READ_POLICY):
++            for role in ('admin', 'member', 'reader', 'service'):
++                ctxt = context.RequestContext(fake.USER_ID, fake.PROJECT_ID,
++                                              roles=[role], is_admin=False)
++                if role == 'service':
++                    self.assertTrue(ctxt.authorize(name))
++                else:
++                    self.assertRaises(exception.PolicyNotAuthorized,
++                                      ctxt.authorize, name)

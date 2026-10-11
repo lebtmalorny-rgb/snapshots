@@ -1,0 +1,594 @@
+From ce3c1c474b8fd04b6223cf8cf3af7079345d14b2 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 23:55:38 +0300
+Subject: [PATCH 10/10] fix: close checkpoint review gaps in capacity and
+ network binding
+
+---
+ .../admin/instance-checkpoint-executor.rst    |  14 ++
+ .../functional/test_checkpoint_executor.py    |  78 ++++++++
+ .../virt/libvirt/checkpoints/test_factory.py  | 171 ++++++++++++++++++
+ .../virt/libvirt/checkpoints/test_store.py    |  79 ++++++++
+ nova/virt/libvirt/checkpoints/executor.py     |  10 +
+ nova/virt/libvirt/checkpoints/factory.py      |  53 +++++-
+ nova/virt/libvirt/checkpoints/files.py        |  14 +-
+ nova/virt/libvirt/checkpoints/store.py        |  18 +-
+ 8 files changed, 433 insertions(+), 4 deletions(-)
+ create mode 100644 nova/tests/unit/virt/libvirt/checkpoints/test_factory.py
+
+diff --git a/doc/source/admin/instance-checkpoint-executor.rst b/doc/source/admin/instance-checkpoint-executor.rst
+index 03c7a521efc9fe33f5f8826a1c51bf60a7b0817a..31c83d5ecbabc8a2d639842d45ce02bca447ffc1 100644
+--- a/doc/source/admin/instance-checkpoint-executor.rst
++++ b/doc/source/admin/instance-checkpoint-executor.rst
+@@ -68,6 +68,15 @@ Generation остаётся 1; переноса ownership на другой host
+ и положительные limits. Allowlist перечитывается при каждом входе исполнителя.
+ Запись в конфигурации не заменяет совпадение с текущим mount/runtime.
+ 
++Admission нового create дополнительно проверяет доступные bytes shared/staging
++через descriptor открытого проверенного mount; revert проверяет staging.
++Это наблюдение свободного места, а не reservation: квоты и writer limits
++остаются обязательными. Заполненный filesystem не запрещает delete и
++продолжение уже принятой операции. Если все transfer slots заняты до открытия
++целевого artifact, child завершается failed_no_effect: create проходит
++компенсацию, а revert отменяется до stop. Ошибка после начала I/O таким
++доказательством отсутствия эффекта не считается.
++
+ Shared store требует NFS/NFS4 с наблюдаемым ``xprtsec=tls``, ``xprtsec=mtls``
+ или ``sec=krb5p`` и отдельно подтверждённым шифрованием NAS at rest. Staging
+ требует XFS на зашифрованном device-mapper block device с включёнными и
+@@ -144,6 +153,11 @@ request UUID/payload. После release остаётся только чтен
+ Операционная диагностика
+ ------------------------
+ 
++Host XML сетевых интерфейсов используется только после сервисной сверки
++Nova InfoCache с текущим Neutron binding: type/details/profile, IDs/MAC/host
++и производные bridge/devname/OVS interface ID. Stale cache или недоступный
++Neutron запрещает runtime-действие. Executor не обновляет сеть автоматически.
++
+ Сначала сохраните operation/checkpoint UUID, phase, safe error_code, host/node,
+ project/cell и quota usage. Чтение API::
+ 
+diff --git a/nova/tests/functional/test_checkpoint_executor.py b/nova/tests/functional/test_checkpoint_executor.py
+index 4b4158999d13c45d29d7a4e07199a9a2e8fe81ae..35bfeaac6390978caf4181942b99da7fc83c9a3f 100644
+--- a/nova/tests/functional/test_checkpoint_executor.py
++++ b/nova/tests/functional/test_checkpoint_executor.py
+@@ -13,6 +13,7 @@
+ import os
+ from pathlib import Path
+ import tempfile
++from types import SimpleNamespace
+ from unittest import mock
+ 
+ from lxml import etree
+@@ -34,6 +35,83 @@ from nova.volume import checkpoints as cinder
+ 
+ 
+ class ExecutorV2FunctionalTest(checkpoints_v2.CheckpointV2TestCase):
++    def test_busy_publish_restores_running_and_releases_all_resources(
++        self,
++    ):
++        driver = self.drivers[0]
++        self.flags(max_concurrent_transfers=1, group='checkpoint')
++        with driver.checkpoint_executor.store._transfer():
++            created = self.create()
++        self.assertEqual('released', self.operation(created)['state'])
++        self.assertEqual(1, driver.backend.state)
++        self.assertEqual(1, driver.backend.calls['save'])
++        self.assertEqual(0, self.usage()['artifact_bytes'])
++        self.assertEqual({}, driver.backend.snapshots)
++        before = dict(driver.backend.calls)
++        self.recover()
++        self.assertEqual(before, dict(driver.backend.calls))
++
++    def test_busy_download_aborts_before_stop_and_retains_checkpoint(self):
++        driver = self.drivers[0]
++        created = self.create()
++        retained = self.usage()['artifact_bytes']
++        self.flags(max_concurrent_transfers=1, group='checkpoint')
++        with driver.checkpoint_executor.store._transfer():
++            result = self.action(created['checkpoint']['id'], 'revert')
++        self.assertEqual('released', self.operation(result)['state'])
++        self.assertEqual(retained, self.usage()['artifact_bytes'])
++        self.assertEqual(0, driver.backend.calls['stop'])
++        self.assertEqual(0, driver.backend.calls['disconnect'])
++        self.assertEqual(1, driver.backend.state)
++        retried = self.action(created['checkpoint']['id'], 'revert')
++        self.assertEqual('succeeded', self.operation(retried)['state'])
++
++    def no_free_space(self):
++        original = os.fstatvfs
++        return mock.patch(
++            'os.fstatvfs',
++            side_effect=lambda fd: SimpleNamespace(
++                f_fsid=original(fd).f_fsid, f_frsize=4096, f_bavail=0
++            ),
++        )
++
++    def test_no_space_rejects_create_before_save_or_quota(self):
++        with self.no_free_space():
++            self.create(expected=409)
++        self.assertEqual(0, self.drivers[0].backend.calls['save'])
++        self.assertEqual(0, self.usage()['artifact_bytes'])
++
++    def test_no_space_rejects_new_revert_but_permits_delete(self):
++        created = self.create()
++        retained = self.usage()['artifact_bytes']
++        with self.no_free_space():
++            self.request(
++                'POST',
++                'checkpoints/%s/action' % created['checkpoint']['id'],
++                {'revert': {'request_id': uuids.no_space_revert}},
++                expected=409,
++            )
++            self.assertEqual(retained, self.usage()['artifact_bytes'])
++            result = self.action(created['checkpoint']['id'], 'delete')
++        self.assertEqual('released', self.operation(result)['state'])
++        self.assertEqual(0, self.usage()['artifact_bytes'])
++        self.assertEqual(0, self.drivers[0].backend.calls['stop'])
++
++    def test_full_storage_does_not_block_existing_create_recovery(self):
++        driver = self.drivers[0]
++        with mock.patch.object(
++            driver.checkpoint_executor.store,
++            '_copy',
++            side_effect=OSError('interrupted upload'),
++        ):
++            created = self.create()
++        self.assertGreater(self.usage()['artifact_bytes'], 0)
++        with self.no_free_space():
++            self.advance(created)
++        self.assertEqual('released', self.operation(created)['state'])
++        self.assertEqual(1, driver.backend.state)
++        self.assertEqual(0, self.usage()['artifact_bytes'])
++
+     def test_actual_executor_through_wsgi_and_serialized_rpc(self):
+         self.assertIsInstance(
+             self.drivers[0].checkpoint_executor,
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/test_factory.py b/nova/tests/unit/virt/libvirt/checkpoints/test_factory.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bcf8077ea3cfd466c8e66e3d0550b159c591b732
+--- /dev/null
++++ b/nova/tests/unit/virt/libvirt/checkpoints/test_factory.py
+@@ -0,0 +1,171 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import copy
++from types import SimpleNamespace
++from unittest import mock
++
++import ddt
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova import context
++from nova.network import model as network_model
++from nova.network import neutron
++import nova.privsep.checkpoint
++from nova import test
++from nova.virt.libvirt.checkpoints import factory
++from nova.virt.libvirt.checkpoints import profiles
++from nova.virt.libvirt.checkpoints import runtime
++from nova.virt.libvirt.checkpoints import staging
++from nova.virt.libvirt.checkpoints import store
++from nova.volume import checkpoints as cinder
++
++
++@ddt.ddt
++class FactoryInterfaceTest(test.NoDBTestCase):
++    def setUp(self):
++        super().setUp()
++        self.flags(deployment_id=uuids.deployment, group='checkpoint')
++        self.flags(virt_type='kvm', group='libvirt')
++        self.flags(ovs_bridge='br-current', group='neutron')
++        self.ctx = context.RequestContext('actor', 'project')
++        self.ctx.auth_token = None
++        self.vif = network_model.VIF(
++            id=uuids.port,
++            address='fa:16:3e:00:00:01',
++            type='ovs',
++            vnic_type='normal',
++            profile={},
++            details={'ovs_hybrid_plug': False},
++            devname=('tap' + uuids.port)[: network_model.NIC_NAME_LEN],
++            ovs_interfaceid=uuids.port,
++            network=network_model.Network(
++                id=uuids.network, bridge='br-current'
++            ),
++        )
++        self.instance = SimpleNamespace(
++            uuid=uuids.instance,
++            host='compute',
++            project_id='project',
++            image_meta=mock.sentinel.image,
++            flavor=mock.sentinel.flavor,
++            get_network_info=lambda: [self.vif],
++        )
++        self.port = dict(
++            uuid=uuids.port,
++            network_uuid=uuids.network,
++            mac=self.vif['address'],
++            vnic_type='normal',
++        )
++        self.current = {
++            'id': uuids.port,
++            'network_id': uuids.network,
++            'device_id': uuids.instance,
++            'project_id': 'project',
++            'mac_address': self.vif['address'],
++            'status': 'ACTIVE',
++            'binding:host_id': 'compute',
++            'binding:vnic_type': 'normal',
++            'binding:vif_type': 'ovs',
++            'binding:profile': {},
++            'binding:vif_details': {'ovs_hybrid_plug': False},
++        }
++        self.client = mock.Mock()
++        self.client.show_port.side_effect = lambda ident: {
++            'port': self.current
++        }
++        self.get_client = self.patch_mock(
++            neutron, 'get_client', return_value=self.client
++        )
++        self.driver = mock.Mock()
++        self.driver.vif_driver.get_config.return_value.to_xml.return_value = (
++            '<interface/>'
++        )
++        self.patch_mock(profiles, 'load')
++        self.patch_mock(nova.privsep.checkpoint, 'inspect_mount')
++        self.patch_mock(nova.privsep.checkpoint, 'inspect_staging')
++        self.patch_mock(staging, 'StagingStore')
++        self.patch_mock(store, 'ArtifactStore')
++        native = self.patch_mock(runtime, 'Runtime')
++        self.patch_mock(cinder, 'CheckpointClient')
++        factory.build(self.driver)
++        self.reader = native.call_args.args[2].interface_reader
++
++    def patch_mock(self, target, name, **kwargs):
++        patcher = mock.patch.object(target, name, **kwargs)
++        self.addCleanup(patcher.stop)
++        return patcher.start()
++
++    def read(self):
++        return self.reader(self.ctx, self.instance, self.port)
++
++    def test_matching_binding_is_read_with_service_authority_without_mutation(
++        self,
++    ):
++        before = copy.deepcopy(self.vif)
++        self.assertEqual('<interface/>', self.read())
++        self.get_client.assert_called_once_with(self.ctx, admin=True)
++        self.client.show_port.assert_called_once_with(uuids.port)
++        self.assertEqual(before, self.vif)
++        self.driver.vif_driver.get_config.assert_called_once_with(
++            self.instance,
++            self.vif,
++            self.instance.image_meta,
++            self.instance.flavor,
++            'kvm',
++        )
++
++    @ddt.data(
++        ('binding:vif_type', 'bridge'),
++        ('binding:vif_details', {'ovs_hybrid_plug': True}),
++        (
++            'binding:vif_details',
++            {'ovs_hybrid_plug': False, 'bridge_name': 'br-new'},
++        ),
++        ('binding:profile', {'allocation': 'new-provider'}),
++        ('binding:host_id', 'another-host'),
++        ('binding:vnic_type', 'direct'),
++        ('device_id', '00000000-0000-0000-0000-000000000001'),
++        ('project_id', 'foreign'),
++        ('network_id', '00000000-0000-0000-0000-000000000001'),
++        ('mac_address', 'fa:16:3e:00:00:02'),
++    )
++    @ddt.unpack
++    def test_live_binding_drift_rejects_stale_cache(self, key, value):
++        self.current[key] = value
++        self.assertRaises(ValueError, self.read)
++        self.driver.vif_driver.get_config.assert_not_called()
++
++    @ddt.data('bridge', 'devname', 'ovs_interfaceid')
++    def test_stale_derived_host_fields_are_rejected(self, field):
++        if field == 'bridge':
++            self.vif['network']['bridge'] = 'br-stale'
++        else:
++            self.vif[field] = 'stale'
++        self.assertRaises(ValueError, self.read)
++        self.driver.vif_driver.get_config.assert_not_called()
++
++    def test_changed_default_bridge_is_not_hidden_by_equal_details(self):
++        self.flags(ovs_bridge='br-new', group='neutron')
++        self.assertRaises(ValueError, self.read)
++        self.driver.vif_driver.get_config.assert_not_called()
++
++    def test_down_port_binding_can_be_checked_for_inactive_recovery(self):
++        self.current['status'] = 'DOWN'
++        self.assertEqual('<interface/>', self.read())
++
++    def test_service_read_failure_has_no_cached_fallback(self):
++        self.client.show_port.side_effect = RuntimeError(
++            'Neutron unavailable'
++        )
++        self.assertRaises(RuntimeError, self.read)
++        self.driver.vif_driver.get_config.assert_not_called()
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/test_store.py b/nova/tests/unit/virt/libvirt/checkpoints/test_store.py
+index 84821daffa1bde9e3e6d2b76c8667fa3ac4d30a9..e89a0e78b41d3b709c02c0e0994368c3c28b2da3 100644
+--- a/nova/tests/unit/virt/libvirt/checkpoints/test_store.py
++++ b/nova/tests/unit/virt/libvirt/checkpoints/test_store.py
+@@ -13,6 +13,7 @@
+ import dataclasses
+ import os
+ from pathlib import Path
++from types import SimpleNamespace
+ from unittest import mock
+ 
+ from oslo_utils.fixture import uuidsentinel as uuids
+@@ -25,6 +26,84 @@ from nova.virt.libvirt.checkpoints import files
+ 
+ 
+ class ArtifactStoreTest(fixtures.StoreTestBase):
++    def test_busy_publish_has_no_writer_and_is_terminal(self):
++        self.flags(max_concurrent_transfers=1, group='checkpoint')
++        with (
++            self.store._transfer(),
++            mock.patch.object(self.store, '_copy') as copy,
++        ):
++            result = self.publish()
++        self.assertEqual('failed_no_effect', result.status)
++        self.assertTrue(result.evidence['late_effect_impossible'])
++        copy.assert_not_called()
++        self.assertFalse(
++            Path(
++                self.store.artifact_path(
++                    self.binding, self.publish_child.resource_id
++                )
++            ).parent.exists()
++        )
++        objects.CheckpointEffect.observe(
++            self.ctx, self.publish_child.id, 1, result.to_primitive()
++        )
++
++    def test_busy_download_has_no_writer_and_is_terminal(self):
++        child, shared, workspace = self.downloaded_child()
++        self.flags(max_concurrent_transfers=1, group='checkpoint')
++        with (
++            self.store._transfer(),
++            mock.patch.object(self.store, '_copy') as copy,
++        ):
++            result = self.store.download(
++                self.ctx, self.binding, child, shared, workspace
++            )
++        self.assertEqual('failed_no_effect', result.status)
++        self.assertTrue(result.evidence['late_effect_impossible'])
++        copy.assert_not_called()
++        self.assertFalse(
++            (
++                Path(workspace['path']) / 'artifacts' / child.resource_id
++            ).exists()
++        )
++        objects.CheckpointEffect.observe(
++            self.ctx, child.id, 1, result.to_primitive()
++        )
++
++    def test_blocking_error_after_target_open_is_not_no_effect(self):
++        with mock.patch.object(
++            self.store, '_copy', side_effect=BlockingIOError
++        ):
++            result = self.publish()
++        self.assertEqual('pending', result.status)
++        self.assertEqual(
++            'failed_with_effects',
++            self.store.query(
++                self.ctx, self.binding, self.publish_child
++            ).status,
++        )
++
++    def test_available_space_uses_pinned_mount_and_unprivileged_blocks(
++        self,
++    ):
++        original = os.fstatvfs
++
++        def observed(fd):
++            result = original(fd)
++            self.assertEqual(
++                self.shared_root.stat().st_ino, os.fstat(fd).st_ino
++            )
++            return SimpleNamespace(
++                f_fsid=result.f_fsid,
++                f_frsize=4096,
++                f_bavail=0,
++                f_bfree=1000000,
++            )
++
++        with mock.patch('os.fstatvfs', side_effect=observed):
++            self.assertRaises(
++                ValueError, self.store.fs.require_space, fixtures.LIMIT
++            )
++
+     def test_cleanup_never_deletes_replaced_payload(self):
+         result = self.publish()
+         ref = v2.ArtifactRef.from_primitive(result.evidence['artifact'])
+diff --git a/nova/virt/libvirt/checkpoints/executor.py b/nova/virt/libvirt/checkpoints/executor.py
+index 910477af60bca5ea45d295d410166c966d2f9896..b13b76a108c9fdcd4bcba9f19494800b88eb2971 100644
+--- a/nova/virt/libvirt/checkpoints/executor.py
++++ b/nova/virt/libvirt/checkpoints/executor.py
+@@ -119,6 +119,16 @@ class LibvirtCheckpointExecutor:
+             maximum = observed['save_bytes_limit']
+             self.store.fs.budget(maximum)
+             self.staging.fs.budget(maximum)
++            # Capacity is checked only for new writers. Cleanup and recovery
++            # must remain possible on a full filesystem. Actual bounds still
++            # come from quota reservations and the enforced writer limits.
++            if operation_id is None and purpose == 'create':
++                self.store.fs.require_space(count * maximum)
++                self.staging.fs.require_space(maximum)
++            elif operation_id is None and purpose == 'revert':
++                self.staging.fs.require_space(
++                    observed['restore_bytes_limit']
++                )
+             return v2.ProbeV2(
+                 True,
+                 (),
+diff --git a/nova/virt/libvirt/checkpoints/factory.py b/nova/virt/libvirt/checkpoints/factory.py
+index 65d2d2ecc2a9e41e2b23a27f144f7824292ed23c..ef4b5bad47e3c9e2bf4bfe70efbc876e5b0cc8ba 100644
+--- a/nova/virt/libvirt/checkpoints/factory.py
++++ b/nova/virt/libvirt/checkpoints/factory.py
+@@ -17,6 +17,8 @@ from oslo_serialization import jsonutils
+ from nova.checkpoints import attachments
+ from nova.checkpoints import contracts as c
+ from nova import conf
++from nova.network import model as network_model
++from nova.network import neutron
+ from nova import objects
+ import nova.privsep.checkpoint
+ from nova.virt.libvirt import blockinfo
+@@ -77,7 +79,56 @@ def build(driver):
+ 
+     def interface_source(context, instance, port):
+         network = instance.get_network_info()
+-        vif = next(v for v in network if v['id'] == port['uuid'])
++        matches = [v for v in network if v['id'] == port['uuid']]
++        c._require(len(matches) == 1)
++        vif = matches[0]
++        current = neutron.get_client(context, admin=True).show_port(
++            port['uuid']
++        )['port']
++        details = current.get('binding:vif_details')
++        c._require(type(details) is dict)
++        vif_type = current['binding:vif_type']
++        c._require(
++            current['id'] == port['uuid'] and
++            current['device_id'] == instance.uuid and
++            current.get('project_id', current.get('tenant_id')) ==
++            instance.project_id and
++            current['binding:host_id'] == instance.host and
++            current['status'] in ('ACTIVE', 'DOWN') and
++            current['network_id'] ==
++            port['network_uuid'] ==
++            vif['network']['id'] and
++            current['mac_address'].lower() ==
++            port['mac'].lower() ==
++            vif['address'].lower() and
++            current['binding:vnic_type'] ==
++            vif['vnic_type'] ==
++            'normal' and
++            vif_type == vif['type'] and
++            vif_type in ('ovs', 'bridge') and
++            details == vif['details'] and
++            neutron.get_binding_profile(current) ==
++            (vif['profile'] or {})
++        )
++        # Match the normal Neutron network-model derivation. Cached details
++        # alone cannot detect a changed default integration bridge.
++        bridge = details.get(
++            network_model.VIF_DETAILS_BRIDGE_NAME,
++            (
++                conf.CONF.neutron.ovs_bridge
++                if vif_type == 'ovs'
++                else 'brq' + current['network_id']
++            ),
++        )
++        c._require(
++            type(bridge) is str and
++            vif['network']['bridge'] ==
++            bridge[: network_model.NIC_NAME_LEN] and
++            vif['devname'] ==
++            ('tap' + current['id'])[: network_model.NIC_NAME_LEN] and
++            vif['ovs_interfaceid'] ==
++            (current['id'] if vif_type == 'ovs' else None)
++        )
+         return driver.vif_driver.get_config(
+             instance, vif, instance.image_meta, instance.flavor, 'kvm'
+         ).to_xml()
+diff --git a/nova/virt/libvirt/checkpoints/files.py b/nova/virt/libvirt/checkpoints/files.py
+index edf11a9d23083683a5158e3ffbe4389b71138b9c..b0aa2b509bfa6d2ce5bbc11c4ad2722c972f98fe 100644
+--- a/nova/virt/libvirt/checkpoints/files.py
++++ b/nova/virt/libvirt/checkpoints/files.py
+@@ -223,6 +223,14 @@ class Root:
+         )
+         return limit - self.profile.limits['metadata_bytes']
+ 
++    def require_space(self, required_bytes):
++        """Additional admission observation; it does not reserve capacity."""
++        c._integer(required_bytes, minimum=1)
++        with self.directory() as root:
++            info = os.fstatvfs(root)
++            c._require(info.f_frsize > 0 and info.f_bavail >= 0)
++            c._require(info.f_bavail * info.f_frsize >= required_bytes)
++
+ 
+ def owner(binding, child, row, profile_id, data_fd):
+     info = regular(data_fd)
+@@ -333,8 +341,10 @@ def erase(directory, expected_owner):
+     for name, info in stats.items():
+         private(info)
+         if name in ('data', 'part'):
+-            c._require((info.st_dev, info.st_ino) ==
+-                       (value['device'], value['inode']))
++            c._require(
++                (info.st_dev, info.st_ino) ==
++                (value['device'], value['inode'])
++            )
+         if info.st_nlink != 1:
+             c._require(
+                 name in ('data', 'part') and
+diff --git a/nova/virt/libvirt/checkpoints/store.py b/nova/virt/libvirt/checkpoints/store.py
+index f115a2a6c24c2a266d87570fb9a0ae25326e7e61..71a3a8d48f7a1f76eb86cf99b78f0b4ddeb52baf 100644
+--- a/nova/virt/libvirt/checkpoints/store.py
++++ b/nova/virt/libvirt/checkpoints/store.py
+@@ -37,6 +37,10 @@ def unknown(reason='store_unavailable'):
+     return v2.EffectResult('unknown', {}, reason)
+ 
+ 
++class TransferBusy(BlockingIOError):
++    """Capacity refusal before opening or starting a target writer."""
++
++
+ class ArtifactStore:
+     def __init__(self, root, profile, staging=None, observer=None):
+         c._require(profile.kind == 'store')
+@@ -73,7 +77,7 @@ class ArtifactStore:
+                     except BlockingIOError:
+                         continue
+                 else:
+-                    raise BlockingIOError('Checkpoint transfers busy')
++                    raise TransferBusy('Checkpoint transfers busy')
+                 yield
+ 
+     def _copy(self, source_fd, target_fd, logical_bytes, checksum, limit):
+@@ -175,6 +179,12 @@ class ArtifactStore:
+             return v2.EffectResult(
+                 'succeeded', dict(artifact=ref.to_primitive()), None
+             )
++        except TransferBusy:
++            return v2.EffectResult(
++                'failed_no_effect',
++                dict(no_effect=True, late_effect_impossible=True),
++                'store_unavailable',
++            )
+         except BlockingIOError:
+             return v2.EffectResult('pending', {}, None)
+         except ERRORS:
+@@ -242,6 +252,12 @@ class ArtifactStore:
+             return v2.EffectResult(
+                 'succeeded', dict(artifact=ref.to_primitive()), None
+             )
++        except TransferBusy:
++            return v2.EffectResult(
++                'failed_no_effect',
++                dict(no_effect=True, late_effect_impossible=True),
++                'store_unavailable',
++            )
+         except BlockingIOError:
+             return v2.EffectResult('pending', {}, None)
+         except ERRORS:

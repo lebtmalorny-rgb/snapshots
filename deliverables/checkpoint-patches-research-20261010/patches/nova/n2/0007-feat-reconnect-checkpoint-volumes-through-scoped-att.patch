@@ -1,0 +1,1672 @@
+From c9c3feda0bf01a37c88c477d218beb21c9aa77df Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 22:25:39 +0300
+Subject: [PATCH 07/10] feat: reconnect checkpoint volumes through scoped
+ attachments
+
+---
+ nova/checkpoints/attachments.py               | 431 ++++++++++++
+ nova/checkpoints/contracts_v2.py              |  20 +-
+ nova/compute/manager.py                       |   7 +
+ nova/db/main/checkpoint_attachments.py        | 101 +++
+ nova/db/main/checkpoint_effects.py            |  24 +-
+ nova/db/main/checkpoints.py                   |   5 +
+ nova/objects/block_device.py                  |  12 +-
+ .../db/test_checkpoint_attachments.py         |  53 ++
+ .../unit/checkpoints/test_attachments.py      | 630 ++++++++++++++++++
+ nova/tests/unit/objects/test_objects.py       |   2 +-
+ .../unit/virt/libvirt/checkpoints/fixtures.py |  15 +-
+ .../checkpoints/test_native_runtime.py        |  68 ++
+ nova/virt/libvirt/checkpoints/journal.py      |   4 +-
+ nova/virt/libvirt/checkpoints/staging.py      |  22 +-
+ nova/virt/libvirt/driver.py                   |  31 +
+ nova/virt/virtapi.py                          |   5 +
+ 16 files changed, 1422 insertions(+), 8 deletions(-)
+ create mode 100644 nova/checkpoints/attachments.py
+ create mode 100644 nova/db/main/checkpoint_attachments.py
+ create mode 100644 nova/tests/functional/db/test_checkpoint_attachments.py
+ create mode 100644 nova/tests/unit/checkpoints/test_attachments.py
+
+diff --git a/nova/checkpoints/attachments.py b/nova/checkpoints/attachments.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf9716852cdb6929da12dcfb498c210120339fee
+--- /dev/null
++++ b/nova/checkpoints/attachments.py
+@@ -0,0 +1,431 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""One claimed attachment effect at a time; observation never dispatches."""
++
++import dataclasses
++
++from oslo_serialization import jsonutils
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova import objects
++from nova.virt.libvirt.checkpoints import journal
++from nova.volume import checkpoints as cinder
++
++
++def intent(row):
++    return v2.ChildIntent(
++        **{f.name: row[f.name] for f in dataclasses.fields(v2.ChildIntent)}
++    )
++
++
++def unknown():
++    return v2.EffectResult('unknown', {}, 'recovery_required')
++
++
++class AttachmentCoordinator:
++    def __init__(
++        self, driver, staging, runtime, client=None, updater=None
++    ):
++        self.driver, self.staging, self.runtime = driver, staging, runtime
++        self.client = client or cinder.CheckpointClient()
++        self.updater = updater or driver.virtapi.checkpoint_update_bdm
++
++    def _bound(self, context, instance, binding, parent_id):
++        parent = objects.InstanceCheckpointStep.get_by_uuid(
++            context, parent_id
++        )
++        operation = objects.InstanceCheckpointOperation.get_by_uuid(
++            context, parent.operation_id
++        )
++        checkpoint = objects.InstanceCheckpoint.get_by_uuid(
++            context, binding.checkpoint_id
++        )
++        c._require(
++            parent.phase in ('volume_disconnect', 'volume_reconnect') and
++            parent.contract_version == 2 and
++            operation.kind == 'revert' and
++            operation.binding == binding.to_primitive() and
++            checkpoint.active_operation_id == operation.uuid and
++            (
++                instance.uuid,
++                instance.host,
++                instance.node,
++                instance.project_id,
++            ) ==
++            (
++                binding.instance_uuid,
++                binding.host,
++                binding.node,
++                binding.project_id,
++            )
++        )
++        current = objects.InstanceCheckpointOperation.device_manifest(
++            context, instance.uuid
++        )
++        c._require(c.device_fingerprint(current) == binding.db_fingerprint)
++        rows = objects.CheckpointEffect.get_children(context, parent_id)
++        c._require(bool(rows))
++        for row in rows:
++            journal.authorize(context, binding, intent(row))
++        return parent, operation, current, rows
++
++    def _stopped(self, context, instance, binding, operation):
++        steps = objects.InstanceCheckpointStepList.get_by_operation(
++            context, operation.uuid
++        )
++        parent = next(s for s in steps if s.phase == 'runtime_stop')
++        c._require(parent.status == 'succeeded')
++        children = objects.CheckpointEffect.get_children(
++            context, parent.uuid
++        )
++        c._require(
++            len(children) == 1 and
++            children[0]['action'] == 'stop' and
++            children[0]['status'] == 'succeeded'
++        )
++        c._require(
++            self.runtime.query(
++                context, instance, intent(children[0])
++            ).status ==
++            'succeeded'
++        )
++
++    def _reverted(self, context, operation, manifest):
++        value = self.client.get(context, operation.uuid)
++        ids = {d['volume_id'] for d in manifest['disks']}
++        c._require(
++            value['kind'] == 'revert' and
++            value['instance_uuid'] == operation.instance_uuid and
++            value['generation'] == 1 and
++            value['status'] == 'succeeded' and
++            {r['volume_id'] for r in value['resources']} == ids
++        )
++        resources = {r['id'] for r in value['resources']}
++        reverted = [s for s in value['steps'] if s['phase'] == 'revert']
++        c._require(
++            len(reverted) == len(resources) and
++            {s['resource_id'] for s in reverted} == resources and
++            all(s['status'] == 'succeeded' for s in reverted)
++        )
++
++    @staticmethod
++    def _bdm(context, instance, volume):
++        return objects.BlockDeviceMapping.get_by_volume_and_instance(
++            context, volume, instance.uuid
++        )
++
++    @staticmethod
++    def _prior(rows, action, volume):
++        row = next(
++            r
++            for r in rows
++            if r['action'] == action and r['resource_id'] == volume
++        )
++        c._require(row['status'] == 'succeeded')
++        proof = v2.validate_child_result(action, row['result'])
++        c._require(proof.status == 'succeeded')
++        return row, proof.evidence
++
++    def _request(self, context, instance, child, rows):
++        action = child.action.removeprefix('attachment_')
++        attachment_id = None
++        if action == 'delete':
++            attachment_id = self._bdm(
++                context, instance, child.resource_id
++            ).attachment_id
++            c._uuid(attachment_id)
++        elif action != 'create':
++            row, proof = self._prior(
++                rows, 'attachment_create', child.resource_id
++            )
++            attachment_id = proof['attachment_id']
++        return dict(
++            id=child.id,
++            generation=1,
++            volume_id=child.resource_id,
++            action=action,
++            attachment_id=attachment_id,
++            connector=(
++                self.driver.get_volume_connector(instance)
++                if action == 'update'
++                else None
++            ),
++            mountpoint=(
++                self._bdm(context, instance, child.resource_id).device_name
++                if action == 'update'
++                else None
++            ),
++        )
++
++    def _attachment(self, context, instance, child, rows, query):
++        value = (
++            self.client.get_attachment_request(
++                context, child.operation_id, child.id
++            )
++            if query
++            else self.client.submit_attachment(
++                context,
++                child.operation_id,
++                self._request(context, instance, child, rows),
++            )
++        )
++        c._require(
++            value['id'] == child.id and
++            value['volume_id'] == child.resource_id and
++            value['action'] == child.action.removeprefix('attachment_')
++        )
++        if value['status'] != 'succeeded':
++            return (
++                v2.EffectResult('pending', {}, None)
++                if value['status'] == 'pending'
++                else unknown()
++            )
++        if child.action != 'attachment_create':
++            expected = (
++                self._bdm(
++                    context, instance, child.resource_id
++                ).attachment_id
++                if child.action == 'attachment_delete'
++                else self._prior(
++                    rows, 'attachment_create', child.resource_id
++                )[1]['attachment_id']
++            )
++            c._require(value['attachment_id'] == expected)
++        return v2.EffectResult(
++            'succeeded',
++            dict(
++                volume_id=child.resource_id,
++                attachment_id=value['attachment_id'],
++            ),
++            None,
++        )
++
++    def _connected(self, context, binding, rows, volume):
++        row, proof = self._prior(rows, 'host_connect', volume)
++        with self.staging.runtime_record(
++            context, binding, intent(row)
++        ) as record:
++            c._require(record.read().evidence == proof)
++            connection = record.connection()
++            c._require(
++                c.canonical_payload_hash(connection) ==
++                proof['connection_sha256']
++            )
++            return proof['attachment_id'], connection
++
++    def _host(self, context, instance, binding, child, rows, query):
++        with self.staging.runtime_record(
++            context, binding, child, write=not query
++        ) as record:
++            if query or record.started():
++                result = record.read()
++                if child.action == 'host_connect':
++                    c._require(
++                        c.canonical_payload_hash(record.connection()) ==
++                        result.evidence['connection_sha256']
++                    )
++                return result
++            if child.action == 'host_disconnect':
++                bdm = self._bdm(context, instance, child.resource_id)
++                connection = jsonutils.loads(bdm.connection_info)
++                record.start()
++                self.driver._checkpoint_disconnect_volume(
++                    context, instance, binding, child, connection
++                )
++                result = v2.EffectResult(
++                    'succeeded',
++                    dict(volume_id=child.resource_id, disconnected=True),
++                    None,
++                )
++            else:
++                row, proof = self._prior(
++                    rows, 'attachment_update', child.resource_id
++                )
++                attachment = self.client.get_attachment(
++                    context, child.operation_id, proof['attachment_id']
++                )
++                c._require(
++                    attachment['volume_id'] == child.resource_id and
++                    attachment['instance'] == instance.uuid and
++                    attachment['status'] == 'attaching'
++                )
++                connection = attachment['connection_info']
++                c._require(type(connection) is dict)
++                current = (
++                    objects.InstanceCheckpointOperation.device_manifest(
++                        context, instance.uuid
++                    )
++                )
++                disk = next(
++                    d
++                    for d in current['disks']
++                    if d['volume_id'] == child.resource_id
++                )
++                connection['serial'] = disk['serial']
++                record.start()
++                self.driver._checkpoint_connect_volume(
++                    context, instance, binding, child, connection
++                )
++                record.connection(connection)
++                result = v2.EffectResult(
++                    'succeeded',
++                    dict(
++                        volume_id=child.resource_id,
++                        attachment_id=proof['attachment_id'],
++                        connection_sha256=c.canonical_payload_hash(
++                            connection
++                        ),
++                    ),
++                    None,
++                )
++            record.finish(result)
++            return result
++
++    def _bdm_effect(self, context, instance, binding, child, rows, query):
++        attachment_id, connection = self._connected(
++            context, binding, rows, child.resource_id
++        )
++        bdm = self._bdm(context, instance, child.resource_id)
++        if not query:
++            self.updater(
++                context,
++                instance.uuid,
++                child.operation_id,
++                1,
++                bdm.uuid,
++                attachment_id,
++                connection,
++            )
++            bdm = self._bdm(context, instance, child.resource_id)
++        c._require(
++            bdm.attachment_id == attachment_id and
++            jsonutils.loads(bdm.connection_info) == connection
++        )
++        return v2.EffectResult(
++            'succeeded',
++            dict(
++                volume_id=child.resource_id,
++                attachment_id=attachment_id,
++                bdm_uuid=bdm.uuid,
++                guest_fingerprint=binding.db_fingerprint,
++                connection_sha256=c.canonical_payload_hash(connection),
++            ),
++            None,
++        )
++
++    def _aggregate(self, parent, manifest, rows):
++        if all(r['status'] == 'succeeded' for r in rows):
++            volumes = sorted(d['volume_id'] for d in manifest['disks'])
++            if parent.phase == 'volume_disconnect':
++                evidence = dict(
++                    volume_ids=volumes, disconnected_volume_ids=volumes
++                )
++            else:
++                evidence = dict(
++                    volume_ids=volumes,
++                    port_ids=sorted(p['uuid'] for p in manifest['ports']),
++                    attachments=[
++                        dict(
++                            self._prior(rows, 'attachment_complete', v)[1]
++                        )
++                        for v in volumes
++                    ],
++                )
++            return v2.EffectResult('succeeded', evidence, None)
++        return None
++
++    def _run(
++        self,
++        context,
++        instance,
++        binding,
++        parent_id,
++        phase=None,
++        query=False,
++    ):
++        try:
++            parent, operation, manifest, rows = self._bound(
++                context, instance, binding, parent_id
++            )
++            c._require(phase is None or parent.phase == phase)
++            self._stopped(context, instance, binding, operation)
++            if parent.phase == 'volume_reconnect':
++                self._reverted(context, operation, manifest)
++            result = self._aggregate(parent, manifest, rows)
++            if result is not None:
++                return result
++            row = next(r for r in rows if r['status'] != 'succeeded')
++            if row['status'] == 'prepared':
++                if query:
++                    value = objects.CheckpointEffect.continuation(
++                        context, parent_id
++                    )
++                    return v2.EffectResult('ready', value, None)
++                row = objects.CheckpointEffect.claim(
++                    context,
++                    row['id'],
++                    1,
++                    binding.executor_id,
++                    row['revision'],
++                )
++                if row is None:
++                    return unknown()
++            else:
++                query = True
++            child = intent(row)
++            if child.action.startswith('attachment_'):
++                result = self._attachment(
++                    context, instance, child, rows, query
++                )
++            elif child.action in ('host_connect', 'host_disconnect'):
++                result = self._host(
++                    context, instance, binding, child, rows, query
++                )
++            elif child.action == 'bdm_update':
++                result = self._bdm_effect(
++                    context, instance, binding, child, rows, query
++                )
++            else:
++                return unknown()
++            objects.CheckpointEffect.observe(
++                context, child.id, 1, result.to_primitive()
++            )
++            rows = objects.CheckpointEffect.get_children(
++                context, parent_id
++            )
++            if result.status != 'succeeded':
++                return result
++            aggregate = self._aggregate(parent, manifest, rows)
++            return aggregate or v2.EffectResult(
++                'ready',
++                objects.CheckpointEffect.continuation(context, parent_id),
++                None,
++            )
++        except Exception:
++            return unknown()
++
++    def disconnect(self, context, instance, binding, parent_step_id):
++        return self._run(
++            context, instance, binding, parent_step_id, 'volume_disconnect'
++        )
++
++    def reconnect(self, context, instance, binding, parent_step_id):
++        return self._run(
++            context, instance, binding, parent_step_id, 'volume_reconnect'
++        )
++
++    def query(self, context, instance, binding, parent_step_id):
++        return self._run(
++            context, instance, binding, parent_step_id, query=True
++        )
+diff --git a/nova/checkpoints/contracts_v2.py b/nova/checkpoints/contracts_v2.py
+index 5ed19032c93788e2c44a357ce04ae7714480ac63..bad0b5bbf4d2dba9661793128655299f3cd9b5e3 100644
+--- a/nova/checkpoints/contracts_v2.py
++++ b/nova/checkpoints/contracts_v2.py
+@@ -373,7 +373,25 @@ def validate_result(phase, value):
+ 
+ 
+ def _child_success(action, evidence):
+-    if action == 'reserve_staging':
++    if action == 'host_disconnect':
++        v1._keys(evidence, ('volume_id', 'disconnected'))
++        v1._uuid(evidence['volume_id'])
++        v1._require(evidence['disconnected'] is True)
++    elif action in ('attachment_create', 'attachment_update',
++                    'attachment_delete', 'attachment_complete',
++                    'host_connect', 'bdm_update'):
++        keys = {'volume_id', 'attachment_id'}
++        if action in ('host_connect', 'bdm_update'):
++            keys.add('connection_sha256')
++            v1._digest(evidence['connection_sha256'])
++        if action == 'bdm_update':
++            keys.update(('bdm_uuid', 'guest_fingerprint'))
++            v1._uuid(evidence['bdm_uuid'])
++            v1._digest(evidence['guest_fingerprint'])
++        v1._keys(evidence, keys)
++        v1._uuid(evidence['volume_id'])
++        v1._uuid(evidence['attachment_id'])
++    elif action == 'reserve_staging':
+         v1._keys(evidence, ('workspace_id', 'limit_bytes'))
+         v1._uuid(evidence['workspace_id'])
+         v1._integer(evidence['limit_bytes'], minimum=1)
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index f7a73afb047e1dc00ba37ba235481ce6fb938109..d44cc113fb5b20c30c3c145c42ef61be02986a09 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -385,6 +385,13 @@ class InstanceEvents(object):
+ 
+ 
+ class ComputeVirtAPI(virtapi.VirtAPI):
++    def checkpoint_update_bdm(self, context, instance_uuid, operation_id,
++                              generation, bdm_uuid, attachment_id,
++                              connection_info):
++        objects.BlockDeviceMapping.checkpoint_update(
++            context, instance_uuid, operation_id, generation, bdm_uuid,
++            attachment_id, connection_info)
++
+     def __init__(self, compute):
+         super(ComputeVirtAPI, self).__init__()
+         self._compute = compute
+diff --git a/nova/db/main/checkpoint_attachments.py b/nova/db/main/checkpoint_attachments.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..232b40239abe1d9d505d396ad6ae1409b7815b9f
+--- /dev/null
++++ b/nova/db/main/checkpoint_attachments.py
+@@ -0,0 +1,101 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""The sole checkpoint BDM mutation, fenced with the Instance transaction."""
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova.db.main import api as db
++from nova.db.main import checkpoint_effects as effects
++from nova.db.main import checkpoint_temporary as temporary
++from nova.db.main import checkpoints as journal
++from nova.db.main import models
++from nova.db.utils import require_context
++
++
++@require_context
++@db.pick_context_manager_writer
++def update(
++    context,
++    instance_uuid,
++    operation_id,
++    generation,
++    bdm_uuid,
++    attachment_id,
++    connection_info,
++):
++    instance, guard, checkpoint, operation = journal._owned(
++        context, operation_id, generation
++    )
++    temporary.assert_dispatch(context, operation, 'volume_reconnect')
++    c._require(
++        operation.contract_version == 2 and
++        operation.kind == 'revert' and
++        instance_uuid == instance.uuid and
++        operation.phase == 'volume_reconnect' and
++        operation.quota_ready
++    )
++    c._uuid(bdm_uuid)
++    c._uuid(attachment_id)
++    c._require(type(connection_info) is dict)
++    c._require(
++        c.device_fingerprint(journal._manifest(context, instance)) ==
++        checkpoint.fingerprint
++    )
++    bdm = (
++        context.session.query(models.BlockDeviceMapping)
++        .filter_by(uuid=bdm_uuid, instance_uuid=instance_uuid, deleted=0)
++        .first()
++    )
++    c._require(bdm is not None)
++    parent = next(
++        s
++        for s in journal._steps(context, operation.uuid)
++        if s.phase == 'volume_reconnect'
++    )
++    c._require(
++        parent.status in ('dispatching', 'pending', 'unknown', 'ready')
++    )
++    rows = effects._rows(context, parent)
++    child = next(
++        r
++        for r in rows
++        if r.action == 'bdm_update' and r.resource_id == bdm.volume_id
++    )
++    c._require(child.status == 'dispatching')
++    c._require(
++        all(r.status == 'succeeded' for r in rows[: child.sequence])
++    )
++    connect = next(
++        r
++        for r in rows
++        if r.action == 'host_connect' and r.resource_id == bdm.volume_id
++    )
++    proof = v2.validate_child_result(
++        'host_connect', journal._row(connect)['result']
++    )
++    c._require(
++        proof.status == 'succeeded' and
++        proof.evidence['volume_id'] == bdm.volume_id and
++        proof.evidence['attachment_id'] == attachment_id and
++        proof.evidence['connection_sha256'] ==
++        c.canonical_payload_hash(connection_info)
++    )
++    bdm.attachment_id = attachment_id
++    bdm.connection_info = journal._encode(connection_info)
++    context.session.flush()
++    # serial is projected from connection_info. An unrelated replacement must
++    # roll back the complete transaction, including attachment_id.
++    c._require(
++        c.device_fingerprint(journal._manifest(context, instance)) ==
++        checkpoint.fingerprint
++    )
+diff --git a/nova/db/main/checkpoint_effects.py b/nova/db/main/checkpoint_effects.py
+index dd62cf3e0d9222cc165bfc9565204aaf3608e80f..83a4807526514e19a1fa275de1ad4ef37fcc4dcc 100644
+--- a/nova/db/main/checkpoint_effects.py
++++ b/nova/db/main/checkpoint_effects.py
+@@ -141,7 +141,9 @@ def claim_parent(context, instance, checkpoint, operation, phase):
+     resources = dict(parent_step_id=ident, operation_id=operation.uuid,
+                      checkpoint_id=checkpoint.uuid,
+                      volume_ids=[d.volume_id for d in journal._disks(
+-                         context, checkpoint.uuid)], artifacts=artifacts)
++                         context, checkpoint.uuid)], artifacts=artifacts,
++                     port_ids=[p['uuid'] for p in jsonutils.loads(
++                         checkpoint.device_manifest)['ports']])
+     if phase == 'cinder_reserve':
+         resources['cinder_reserve'] = v2.cinder_reserve_payload(
+             SimpleNamespace(**journal._row(operation)))
+@@ -259,6 +261,10 @@ def _bind_child(context, checkpoint, operation, child, result):
+         valid = (set(evidence['terminal_child_ids']) == {child.id} and
+                  set(evidence['resource_ids']) == {r.id for r in reservations})
+     if result.status == 'succeeded':
++        if 'volume_id' in evidence:
++            valid &= evidence['volume_id'] == child.resource_id
++        if 'guest_fingerprint' in evidence:
++            valid &= evidence['guest_fingerprint'] == checkpoint.fingerprint
+         if 'fingerprint' in evidence:
+             valid &= evidence['fingerprint'] == checkpoint.fingerprint
+         if 'host' in evidence:
+@@ -490,6 +496,22 @@ def _parent_success(parent, children, evidence):
+                         'runtime_restore_checkpoint',
+                         'cleanup_runtime_restore_current'):
+         return bool(proofs) and proofs[-1] == evidence
++    if parent.phase == 'volume_disconnect':
++        expected = {row.resource_id for row in children}
++        return (set(evidence['volume_ids']) == expected and
++                set(evidence['disconnected_volume_ids']) == expected and
++                all(proof['volume_id'] == row.resource_id
++                    for row, proof in zip(children, proofs)))
++    if parent.phase == 'volume_reconnect':
++        completed = [proof for row, proof in zip(children, proofs)
++                     if row.action == 'attachment_complete']
++        return (sorted(completed, key=lambda p: p['volume_id']) ==
++                sorted(evidence['attachments'],
++                       key=lambda p: p['volume_id']) and
++                set(evidence['volume_ids']) ==
++                {row.resource_id for row in children} and
++                set(evidence['port_ids']) == set(jsonutils.loads(
++                    parent.payload)['resources']['port_ids']))
+     if parent.phase in ('staging_cleanup', 'artifact_delete',
+                         'cleanup_artifacts'):
+         return set(evidence['artifact_ids']) == {
+diff --git a/nova/db/main/checkpoints.py b/nova/db/main/checkpoints.py
+index a1ce92e0307942e883171a36a66c56f55345db50..21df9730b5dfdfd8bbe4031da6c2c5603ed83316 100644
+--- a/nova/db/main/checkpoints.py
++++ b/nova/db/main/checkpoints.py
+@@ -1386,6 +1386,11 @@ def guard_mutation(context, instance_uuid, action, values=None):
+             'volume_reconnect',
+         ):
+             _conflict('guard_busy')
++        if action == 'bdm_update' and _operation(
++                context, guard.operation_id).contract_version == 2:
++            # V2 updates only through the child-bound mutation transaction.
++            # A generic BDM.save must not bypass its connection hash/identity.
++            _conflict('guard_busy')
+         if action == 'instance' and scope.action not in (
+             'runtime_save',
+             'runtime_stop',
+diff --git a/nova/objects/block_device.py b/nova/objects/block_device.py
+index 813fc330697bd26daef559e73577457adb12e23d..721c129b6a448aa896c65f91777b966448c6862a 100644
+--- a/nova/objects/block_device.py
++++ b/nova/objects/block_device.py
+@@ -69,7 +69,17 @@ class BlockDeviceMapping(base.NovaPersistentObject, base.NovaObject,
+     # Version 1.20: Added volume_type
+     # Version 1.21: Added encrypted, encryption_secret_uuid, encryption_format
+     #               and encryption_options
+-    VERSION = '1.21'
++    # Version 1.22: operation-owned checkpoint connection update
++    VERSION = '1.22'
++
++    @base.remotable_classmethod
++    def checkpoint_update(cls, context, instance_uuid, operation_id,
++                          generation, bdm_uuid, attachment_id,
++                          connection_info):
++        from nova.db.main import checkpoint_attachments
++        checkpoint_attachments.update(
++            context, instance_uuid, operation_id, generation, bdm_uuid,
++            attachment_id, connection_info)
+ 
+     fields = {
+         'id': fields.IntegerField(),
+diff --git a/nova/tests/functional/db/test_checkpoint_attachments.py b/nova/tests/functional/db/test_checkpoint_attachments.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f9b143327d941dd6597d5933a1af507ba5eeba86
+--- /dev/null
++++ b/nova/tests/functional/db/test_checkpoint_attachments.py
+@@ -0,0 +1,53 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from unittest import mock
++
++from oslo_db.sqlalchemy import enginefacade
++from oslo_db.sqlalchemy import test_fixtures
++
++from nova.db.main import api as db
++from nova.db import migration
++from nova.tests.unit.checkpoints import test_attachments
++
++
++class Backend:
++    USES_DB = False
++    USES_DB_SELF = True
++
++    def prepare_database(self):
++        engine = enginefacade.writer.get_engine()
++        self.manager = db.create_context_manager(
++            engine.url.render_as_string(hide_password=False))
++        with mock.patch.object(migration, '_get_engine', return_value=engine):
++            migration.db_sync(database='main')
++        self.addCleanup(self.manager.dispose_pool)
++
++
++class AttachmentMySQLTest(Backend, test_fixtures.OpportunisticDBTestMixin,
++                          test_attachments.AttachmentTest):
++    FIXTURE = test_fixtures.MySQLOpportunisticFixture
++
++
++class AttachmentPostgreSQLTest(Backend, test_fixtures.OpportunisticDBTestMixin,
++                               test_attachments.AttachmentTest):
++    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
++
++
++class BDMMySQLTest(Backend, test_fixtures.OpportunisticDBTestMixin,
++                   test_attachments.BDMUpdateTest):
++    FIXTURE = test_fixtures.MySQLOpportunisticFixture
++
++
++class BDMPostgreSQLTest(Backend, test_fixtures.OpportunisticDBTestMixin,
++                        test_attachments.BDMUpdateTest):
++    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
+diff --git a/nova/tests/unit/checkpoints/test_attachments.py b/nova/tests/unit/checkpoints/test_attachments.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c09847a5e6663c9b8401aa9559ebe0bfd376778
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/test_attachments.py
+@@ -0,0 +1,630 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from types import SimpleNamespace
++from unittest import mock
++
++from oslo_serialization import jsonutils
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import attachments
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova.checkpoints import guards
++from nova.db.main import api as db
++from nova.db.main import checkpoints as journal
++from nova.db.main import models
++from nova import exception
++from nova import objects
++from nova.tests.unit.virt.libvirt.checkpoints import fixtures
++
++
++class BDMUpdateTest(fixtures.StoreTestBase):
++    def setUp(self):
++        super().setUp()
++        self.parent_id = self.parent('volume_reconnect', [])
++        self.connection = dict(
++            driver_volume_type='iscsi',
++            serial=uuids.volume,
++            data=dict(
++                volume_id=uuids.volume,
++                device_path='/dev/mapper/new',
++                auth_password='private-password',
++            ),
++        )
++        self.digest = c.canonical_payload_hash(self.connection)
++
++        @db.pick_context_manager_writer
++        def seed(ctx):
++            # The preceding adapters are covered separately; seed their durable
++            # success to exercise the real claimed BDM-only mutation boundary.
++            op = ctx.session.get(
++                models.InstanceCheckpointOperation, uuids.operation
++            )
++            op.kind = 'revert'
++            op.phase = 'volume_reconnect'
++            ctx.session.add(
++                models.InstanceCheckpointTemporaryBudget(
++                    operation_id=uuids.operation,
++                    ticket_id=uuids.temporary,
++                    reserved_bytes=fixtures.LIMIT,
++                    version=1,
++                    state='confirmed',
++                )
++            )
++            rows = (
++                ctx.session.query(models.InstanceCheckpointEffect)
++                .filter_by(parent_step_id=self.parent_id)
++                .all()
++            )
++            for row in rows:
++                row.status = (
++                    'dispatching'
++                    if row.action == 'bdm_update'
++                    else 'succeeded'
++                )
++                evidence = dict(
++                    volume_id=uuids.volume,
++                    attachment_id=uuids.new_attachment,
++                )
++                if row.action in ('host_connect', 'bdm_update'):
++                    evidence['connection_sha256'] = self.digest
++                if row.action == 'bdm_update':
++                    evidence.update(
++                        bdm_uuid=uuids.bdm,
++                        guest_fingerprint=self.binding.db_fingerprint,
++                    )
++                row.result = journal._encode(
++                    v2.EffectResult(
++                        'succeeded', evidence, None
++                    ).to_primitive()
++                )
++
++        seed(self.ctx)
++
++    def update(self, **changes):
++        args = dict(
++            context=self.ctx,
++            instance_uuid=uuids.instance,
++            operation_id=uuids.operation,
++            generation=1,
++            bdm_uuid=uuids.bdm,
++            attachment_id=uuids.new_attachment,
++            connection_info=self.connection,
++        )
++        args.update(changes)
++        objects.BlockDeviceMapping.checkpoint_update(**args)
++
++    def current(self):
++        return objects.BlockDeviceMapping.get_by_volume_and_instance(
++            self.ctx, uuids.volume, uuids.instance
++        )
++
++    def test_only_connection_fields_change_and_guest_identity_stays(self):
++        before = objects.InstanceCheckpointOperation.device_manifest(
++            self.ctx, uuids.instance
++        )
++        self.update()
++        after = objects.InstanceCheckpointOperation.device_manifest(
++            self.ctx, uuids.instance
++        )
++        self.assertEqual(before, after)
++        self.assertEqual(uuids.bdm, self.current().uuid)
++        self.assertEqual(
++            uuids.new_attachment, self.current().attachment_id
++        )
++        self.assertEqual(
++            self.connection,
++            jsonutils.loads(self.current().connection_info),
++        )
++
++    def test_wrong_instance_or_attachment_or_connection_rejected(self):
++        for args in (
++            dict(instance_uuid=uuids.foreign),
++            dict(attachment_id=uuids.foreign),
++            dict(
++                connection_info=dict(self.connection, serial=uuids.foreign)
++            ),
++        ):
++            self.assertRaises(
++                (ValueError, exception.CheckpointConflict),
++                self.update,
++                **args,
++            )
++        self.assertIsNone(self.current().attachment_id)
++
++    def test_released_owner_cannot_save_stale_bdm(self):
++        @db.pick_context_manager_writer
++        def release(ctx):
++            guard = ctx.session.get(
++                models.InstanceCheckpointGuard, uuids.instance
++            )
++            guard.operation_id = None
++
++        release(self.ctx)
++        self.assertRaises(exception.CheckpointConflict, self.update)
++        self.assertIsNone(self.current().attachment_id)
++
++    def test_cancelled_temporary_budget_rejects_late_bdm_update(self):
++        @db.pick_context_manager_writer
++        def cancel(ctx):
++            ctx.session.get(
++                models.InstanceCheckpointTemporaryBudget, uuids.operation
++            ).state = 'cancelled'
++
++        cancel(self.ctx)
++        self.assertRaises(exception.CheckpointConflict, self.update)
++        self.assertIsNone(self.current().attachment_id)
++
++    def test_generic_bdm_save_cannot_bypass_child_connection_proof(self):
++        guard = objects.InstanceCheckpointGuard.get_by_instance_uuid(
++            self.ctx, uuids.instance
++        )
++        scope = c.Scope(
++            uuids.instance,
++            'checkpoint',
++            uuids.operation,
++            1,
++            'volume_reconnect',
++            guard.token,
++        )
++        with guards.scope(self.ctx, scope) as ctx:
++            bdm = objects.BlockDeviceMapping.get_by_volume_and_instance(
++                ctx, uuids.volume, uuids.instance
++            )
++            bdm.attachment_id = uuids.foreign
++            self.assertRaises(exception.CheckpointConflict, bdm.save)
++        self.assertIsNone(self.current().attachment_id)
++
++    def test_new_serial_rolls_back_even_with_matching_connection_hash(
++        self,
++    ):
++        changed = dict(self.connection, serial=uuids.foreign)
++
++        @db.pick_context_manager_writer
++        def proof(ctx):
++            row = (
++                ctx.session.query(models.InstanceCheckpointEffect)
++                .filter_by(
++                    parent_step_id=self.parent_id, action='host_connect'
++                )
++                .one()
++            )
++            value = journal._row(row)['result']
++            value['evidence']['connection_sha256'] = (
++                c.canonical_payload_hash(changed)
++            )
++            row.result = journal._encode(value)
++
++        proof(self.ctx)
++        self.assertRaises(ValueError, self.update, connection_info=changed)
++        self.assertIsNone(self.current().attachment_id)
++        self.assertEqual(
++            uuids.volume,
++            jsonutils.loads(self.current().connection_info)['serial'],
++        )
++
++
++class AttachmentTest(fixtures.StoreTestBase):
++    def prepare_instance(self):
++        for volume, ident, name, boot in (
++            (uuids.volume2, uuids.bdm2, '/dev/vdb', -1),
++        ):
++            db.block_device_mapping_create(
++                self.ctx,
++                dict(
++                    uuid=ident,
++                    instance_uuid=uuids.instance,
++                    volume_id=volume,
++                    source_type='volume',
++                    destination_type='volume',
++                    device_type='disk',
++                    device_name=name,
++                    boot_index=boot,
++                    connection_info=jsonutils.dumps(dict(serial=volume)),
++                ),
++                legacy=False,
++            )
++        self.original = {
++            uuids.volume: uuids.original1,
++            uuids.volume2: uuids.original2,
++        }
++        self.new = {uuids.volume: uuids.new1, uuids.volume2: uuids.new2}
++        for row in db.block_device_mapping_get_all_by_instance(
++            self.ctx, uuids.instance
++        ):
++            db.block_device_mapping_update(
++                self.ctx,
++                row['id'],
++                dict(
++                    attachment_id=self.original[row['volume_id']],
++                    connection_info=jsonutils.dumps(
++                        dict(
++                            serial=row['volume_id'],
++                            driver_volume_type='iscsi',
++                            data=dict(volume_id=row['volume_id']),
++                        )
++                    ),
++                ),
++                legacy=False,
++            )
++
++    def setUp(self):
++        super().setUp()
++        self.instance = SimpleNamespace(
++            uuid=uuids.instance,
++            project_id='project',
++            host='compute',
++            node='node',
++        )
++        self.cinder = mock.Mock()
++        self.driver = mock.Mock()
++        self.runtime = mock.Mock()
++        self.runtime.query.return_value = v2.EffectResult(
++            'succeeded',
++            dict(writes_stopped=True, power_state='SHUTOFF'),
++            None,
++        )
++        self.parent_id = self.parent('volume_reconnect', [])
++        stop_id = self.parent('runtime_stop', [])
++        self.requests = {}
++        self.connections = {}
++        self.cinder.get.return_value = dict(
++            id=uuids.cinder,
++            kind='revert',
++            instance_uuid=uuids.instance,
++            generation=1,
++            status='succeeded',
++            resources=[
++                dict(id=uuids.resource1, volume_id=uuids.volume),
++                dict(id=uuids.resource2, volume_id=uuids.volume2),
++            ],
++            steps=[
++                dict(resource_id=r, phase='revert', status='succeeded')
++                for r in (uuids.resource1, uuids.resource2)
++            ],
++        )
++        self.cinder.submit_attachment.side_effect = self.submit
++        self.cinder.get_attachment_request.side_effect = (
++            lambda ctx, op, ident: self.requests[ident]
++        )
++        self.cinder.get_attachment.side_effect = (
++            lambda ctx, op, ident: self.connections[ident]
++        )
++        self.driver.get_volume_connector.return_value = {
++            'host': 'compute',
++            'initiator': 'iqn.test',
++        }
++        self.driver._checkpoint_connect_volume.side_effect = self.connect
++        self.coordinator = attachments.AttachmentCoordinator(
++            self.driver,
++            self.staging,
++            self.runtime,
++            client=self.cinder,
++            updater=objects.BlockDeviceMapping.checkpoint_update,
++        )
++
++        @db.pick_context_manager_writer
++        def seed(ctx):
++            op = ctx.session.get(
++                models.InstanceCheckpointOperation, uuids.operation
++            )
++            op.kind = 'revert'
++            op.phase = 'volume_reconnect'
++            ctx.session.add(
++                models.InstanceCheckpointTemporaryBudget(
++                    operation_id=uuids.operation,
++                    ticket_id=uuids.temporary,
++                    reserved_bytes=fixtures.LIMIT,
++                    version=1,
++                    state='confirmed',
++                )
++            )
++            parent = ctx.session.get(
++                models.InstanceCheckpointStep, stop_id
++            )
++            parent.status = 'succeeded'
++            row = (
++                ctx.session.query(models.InstanceCheckpointEffect)
++                .filter_by(parent_step_id=stop_id)
++                .one()
++            )
++            row.status = 'succeeded'
++            row.result = journal._encode(
++                self.runtime.query.return_value.to_primitive()
++            )
++
++        seed(self.ctx)
++
++    def submit(self, ctx, operation_id, request):
++        ident = request['attachment_id'] or self.new[request['volume_id']]
++        result = dict(
++            id=request['id'],
++            volume_id=request['volume_id'],
++            attachment_id=ident,
++            action=request['action'],
++            status='succeeded',
++        )
++        self.requests[request['id']] = result
++        if request['action'] == 'update':
++            self.connections[ident] = dict(
++                id=ident,
++                volume_id=request['volume_id'],
++                instance=uuids.instance,
++                status='attaching',
++                connection_info=dict(
++                    driver_volume_type='iscsi',
++                    data=dict(
++                        volume_id=request['volume_id'],
++                        auth_password='private-password',
++                    ),
++                ),
++            )
++        if request['action'] == 'complete':
++            self.connections[ident]['status'] = 'attached'
++        return result
++
++    def connect(self, ctx, instance, binding, child, connection):
++        connection['data']['device_path'] = (
++            '/dev/mapper/' + child.resource_id
++        )
++
++    def run_to_end(self):
++        for unused in range(12):
++            result = self.coordinator.reconnect(
++                self.ctx, self.instance, self.binding, self.parent_id
++            )
++            if result.status != 'ready':
++                return result
++        self.fail('Continuation did not finish')
++
++    def test_partial_revert_never_connects_or_changes_bdm(self):
++        self.cinder.get.return_value['steps'][0]['status'] = 'unknown'
++        before = db.block_device_mapping_get_all_by_instance(
++            self.ctx, uuids.instance
++        )
++        result = self.run_to_end()
++        self.assertEqual('unknown', result.status)
++        self.cinder.get.assert_called_once_with(self.ctx, uuids.operation)
++        self.driver._checkpoint_connect_volume.assert_not_called()
++        self.cinder.submit_attachment.assert_not_called()
++        after = db.block_device_mapping_get_all_by_instance(
++            self.ctx, uuids.instance
++        )
++        self.assertEqual(
++            [r['uuid'] for r in before], [r['uuid'] for r in after]
++        )
++
++    def test_new_attachments_preserve_bdm_identity_and_use_private_connection(
++        self,
++    ):
++        before = objects.InstanceCheckpointOperation.device_manifest(
++            self.ctx, uuids.instance
++        )
++        result = self.run_to_end()
++        self.assertEqual('succeeded', result.status)
++        self.assertEqual(
++            before,
++            objects.InstanceCheckpointOperation.device_manifest(
++                self.ctx, uuids.instance
++            ),
++        )
++        bdms = db.block_device_mapping_get_all_by_instance(
++            self.ctx, uuids.instance
++        )
++        self.assertEqual(
++            self.new, {r['volume_id']: r['attachment_id'] for r in bdms}
++        )
++        self.assertEqual(
++            {uuids.bdm, uuids.bdm2}, {r['uuid'] for r in bdms}
++        )
++        rows = objects.CheckpointEffect.get_children(
++            self.ctx, self.parent_id
++        )
++        self.assertNotIn('private-password', str(rows))
++        self.assertNotIn('device_path', str(rows))
++        self.assertEqual(
++            2, self.driver._checkpoint_connect_volume.call_count
++        )
++        self.driver.detach_volume.assert_not_called()
++        self.assertEqual(
++            2,
++            sum(
++                1
++                for r in self.requests.values()
++                if r['action'] == 'complete'
++            ),
++        )
++
++    def test_query_never_claims_or_submits_prepared_child(self):
++        with mock.patch.object(objects.CheckpointEffect, 'claim') as claim:
++            result = self.coordinator.query(
++                self.ctx, self.instance, self.binding, self.parent_id
++            )
++        self.assertEqual('ready', result.status)
++        claim.assert_not_called()
++        self.cinder.submit_attachment.assert_not_called()
++        self.driver._checkpoint_connect_volume.assert_not_called()
++
++    def test_create_reply_loss_is_queried_without_another_create(self):
++        def lost(ctx, operation, request):
++            self.submit(ctx, operation, request)
++            raise TimeoutError()
++
++        self.cinder.submit_attachment.side_effect = lost
++        self.assertEqual(
++            'unknown',
++            self.coordinator.reconnect(
++                self.ctx, self.instance, self.binding, self.parent_id
++            ).status,
++        )
++        self.assertEqual(
++            'ready',
++            self.coordinator.query(
++                self.ctx, self.instance, self.binding, self.parent_id
++            ).status,
++        )
++        self.assertEqual(1, self.cinder.submit_attachment.call_count)
++
++    def test_unknown_host_connect_is_not_reissued(self):
++        self.driver._checkpoint_connect_volume.side_effect = TimeoutError()
++        self.assertEqual('unknown', self.run_to_end().status)
++        self.assertEqual('unknown', self.run_to_end().status)
++        self.assertEqual(
++            1, self.driver._checkpoint_connect_volume.call_count
++        )
++        self.assertEqual(
++            self.original,
++            {
++                r['volume_id']: r['attachment_id']
++                for r in db.block_device_mapping_get_all_by_instance(
++                    self.ctx, uuids.instance
++                )
++            },
++        )
++
++    def test_unknown_stop_prevents_any_attachment_effect(self):
++        self.runtime.query.return_value = v2.EffectResult(
++            'unknown', {}, 'recovery_required'
++        )
++        self.assertEqual('unknown', self.run_to_end().status)
++        self.cinder.submit_attachment.assert_not_called()
++        self.driver._checkpoint_connect_volume.assert_not_called()
++
++    def test_update_reply_loss_uses_keyed_query(self):
++        def lost(ctx, operation, request):
++            value = self.submit(ctx, operation, request)
++            if request['action'] == 'update':
++                raise TimeoutError()
++            return value
++
++        self.cinder.submit_attachment.side_effect = lost
++        self.assertEqual('unknown', self.run_to_end().status)
++        self.assertEqual(
++            'ready',
++            self.coordinator.query(
++                self.ctx, self.instance, self.binding, self.parent_id
++            ).status,
++        )
++        updates = [
++            v for v in self.requests.values() if v['action'] == 'update'
++        ]
++        self.assertEqual(1, len(updates))
++        self.driver._checkpoint_connect_volume.assert_not_called()
++
++    def test_incomplete_complete_does_not_finish_parent(self):
++        def incomplete(ctx, operation, request):
++            value = self.submit(ctx, operation, request)
++            if request['action'] == 'complete':
++                value['status'] = 'pending'
++            return value
++
++        self.cinder.submit_attachment.side_effect = incomplete
++        self.assertEqual('pending', self.run_to_end().status)
++        self.assertEqual(
++            'pending',
++            self.coordinator.query(
++                self.ctx, self.instance, self.binding, self.parent_id
++            ).status,
++        )
++
++    def test_bdm_write_reply_loss_is_observed_without_reconnecting(self):
++        def lost(*args):
++            objects.BlockDeviceMapping.checkpoint_update(*args)
++            raise TimeoutError()
++
++        self.coordinator.updater = lost
++        self.assertEqual('unknown', self.run_to_end().status)
++        self.assertEqual(
++            'ready',
++            self.coordinator.query(
++                self.ctx, self.instance, self.binding, self.parent_id
++            ).status,
++        )
++        self.assertEqual(
++            1, self.driver._checkpoint_connect_volume.call_count
++        )
++
++    def disconnect_parent(self):
++        parent = self.parent('volume_disconnect', [])
++
++        @db.pick_context_manager_writer
++        def phase(ctx):
++            ctx.session.get(
++                models.InstanceCheckpointOperation, uuids.operation
++            ).phase = 'volume_disconnect'
++
++        phase(self.ctx)
++        return parent
++
++    def test_unknown_disconnect_keeps_cinder_attachment_and_bdm(self):
++        parent = self.disconnect_parent()
++        self.driver._checkpoint_disconnect_volume.side_effect = (
++            TimeoutError()
++        )
++        for unused in range(2):
++            self.assertEqual(
++                'unknown',
++                self.coordinator.disconnect(
++                    self.ctx, self.instance, self.binding, parent
++                ).status,
++            )
++        self.assertEqual(
++            1, self.driver._checkpoint_disconnect_volume.call_count
++        )
++        self.cinder.submit_attachment.assert_not_called()
++        self.assertEqual(
++            self.original,
++            {
++                r['volume_id']: r['attachment_id']
++                for r in db.block_device_mapping_get_all_by_instance(
++                    self.ctx, uuids.instance
++                )
++            },
++        )
++
++    def test_delete_reply_loss_has_no_ordinary_detach_or_bdm_delete(self):
++        parent = self.disconnect_parent()
++        self.assertEqual(
++            'ready',
++            self.coordinator.disconnect(
++                self.ctx, self.instance, self.binding, parent
++            ).status,
++        )
++
++        def lost(ctx, operation, request):
++            self.submit(ctx, operation, request)
++            raise TimeoutError()
++
++        self.cinder.submit_attachment.side_effect = lost
++        self.assertEqual(
++            'unknown',
++            self.coordinator.disconnect(
++                self.ctx, self.instance, self.binding, parent
++            ).status,
++        )
++        self.assertEqual(
++            'ready',
++            self.coordinator.query(
++                self.ctx, self.instance, self.binding, parent
++            ).status,
++        )
++        self.assertEqual(1, self.cinder.submit_attachment.call_count)
++        self.driver.detach_volume.assert_not_called()
++        self.assertEqual(
++            2,
++            len(
++                db.block_device_mapping_get_all_by_instance(
++                    self.ctx, uuids.instance
++                )
++            ),
++        )
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 13ea059c51224fe32174f60e1e39dc9d68697c01..b07fc0d003aa6553641d30371e611344f11d1c11 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1095,7 +1095,7 @@ object_data = {
+     'InstanceCheckpointStepList': '1.1-380130b03f40b317487ed802199130bb',
+     'Aggregate': '1.3-f315cb68906307ca2d1cca84d4753585',
+     'AggregateList': '1.3-3ea55a050354e72ef3306adefa553957',
+-    'BlockDeviceMapping': '1.21-220abb8aa1450e759b72fce8ec6ff955',
++    'BlockDeviceMapping': '1.22-85e9eb83b7a77b0dfff77b2d71485dc0',
+     'BlockDeviceMappingList': '1.18-73bcbbae5ef5e8adcedbc821db869306',
+     'BuildRequest': '1.3-077dee42bed93f8a5b62be77657b7152',
+     'BuildRequestList': '1.0-cd95608eccb89fbc702c8b52f38ec738',
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/fixtures.py b/nova/tests/unit/virt/libvirt/checkpoints/fixtures.py
+index 3221b657d7a59a93eec54dd0d1a5fdfb46469143..abdf800467e435f754f4195d9b88efc7627f2b25 100644
+--- a/nova/tests/unit/virt/libvirt/checkpoints/fixtures.py
++++ b/nova/tests/unit/virt/libvirt/checkpoints/fixtures.py
+@@ -39,6 +39,12 @@ LIMIT = 1024 * 1024
+ class StoreTestBase(test.TestCase):
+     seed_saved_source = True
+ 
++    def prepare_database(self):
++        pass
++
++    def prepare_instance(self):
++        pass
++
+     def setUp(self):
+         super().setUp()
+         self.flags(
+@@ -55,8 +61,12 @@ class StoreTestBase(test.TestCase):
+         )
+         self.shared_root.mkdir(mode=0o700)
+         self.staging_root.mkdir(mode=0o700)
++        self.prepare_database()
+         self.ctx = context.RequestContext('actor', 'project')
++        if hasattr(self, 'manager'):
++            self.ctx.db_connection = self.manager
+         test_cell_db.make_instance(self.ctx)
++        self.prepare_instance()
+         old = test_cell_db.admission(self.ctx)
+         self.admission = v2.AdmissionV2(
+             **dict(
+@@ -217,8 +227,11 @@ class StoreTestBase(test.TestCase):
+             parent_step_id=ident,
+             operation_id=uuids.operation,
+             checkpoint_id=uuids.checkpoint,
+-            volume_ids=[uuids.volume],
++            volume_ids=[d['volume_id'] for d in
++                        self.admission.device_manifest['disks']],
+             artifacts=artifacts,
++            port_ids=[p['uuid'] for p in
++                      self.admission.device_manifest['ports']],
+         )
+         kind = (
+             'revert'
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/test_native_runtime.py b/nova/tests/unit/virt/libvirt/checkpoints/test_native_runtime.py
+index 3488d8049047e3aea3dc8fef9780f7e85cdc68bc..a9e6a4388a59a5f519564cbaa9b31ab601383561 100644
+--- a/nova/tests/unit/virt/libvirt/checkpoints/test_native_runtime.py
++++ b/nova/tests/unit/virt/libvirt/checkpoints/test_native_runtime.py
+@@ -13,7 +13,11 @@
+ from types import SimpleNamespace
+ from unittest import mock
+ 
++from oslo_utils.fixture import uuidsentinel as uuids
++
+ from nova import test
++from nova.virt.libvirt.checkpoints import journal
++from nova.virt.libvirt import driver
+ from nova.virt.libvirt import guest
+ from nova.virt.libvirt import host
+ 
+@@ -85,3 +89,67 @@ class NativeRuntimeTest(test.NoDBTestCase):
+         self.domain.destroyFlags.assert_called_once_with(0)
+         self.domain.detachDeviceFlags.assert_not_called()
+         self.domain.undefine.assert_not_called()
++
++
++class NativeVolumeTest(test.NoDBTestCase):
++    def setUp(self):
++        super().setUp()
++        self.driver = object.__new__(driver.LibvirtDriver)
++        self.driver._host = mock.Mock()
++        self.guest = mock.Mock(uuid=uuids.instance)
++        self.guest.checkpoint_state.return_value = dict(
++            state=5, job=0, managed_save=False
++        )
++        self.driver._host.get_guest.return_value = self.guest
++        self.driver._connect_volume = mock.Mock()
++        self.driver._disconnect_volume = mock.Mock()
++        self.authorize = mock.Mock()
++        self.patch(journal, 'authorize', self.authorize)
++        self.instance = SimpleNamespace(uuid=uuids.instance)
++        self.binding = SimpleNamespace(instance_uuid=uuids.instance)
++        self.child = SimpleNamespace(
++            action='host_connect', resource_id=uuids.volume
++        )
++        self.connection = dict(
++            serial=uuids.volume,
++            driver_volume_type='iscsi',
++            data=dict(volume_id=uuids.volume),
++        )
++
++    def test_connect_reuses_native_secret_without_fetch_or_format(self):
++        self.driver._checkpoint_connect_volume(
++            None, self.instance, self.binding, self.child, self.connection
++        )
++        self.driver._connect_volume.assert_called_once_with(
++            None, self.connection, self.instance, encryption={}
++        )
++        self.authorize.assert_called_once_with(
++            None, self.binding, self.child, write=True
++        )
++
++    def test_disconnect_preserves_secret_and_never_forces(self):
++        self.child.action = 'host_disconnect'
++        self.driver._checkpoint_disconnect_volume(
++            None, self.instance, self.binding, self.child, self.connection
++        )
++        self.driver._disconnect_volume.assert_called_once_with(
++            None,
++            self.connection,
++            self.instance,
++            encryption={},
++            destroy_secrets=False,
++            force=False,
++        )
++
++    def test_live_domain_rejects_host_connection_change(self):
++        self.guest.checkpoint_state.return_value['state'] = 1
++        self.assertRaises(
++            ValueError,
++            self.driver._checkpoint_connect_volume,
++            None,
++            self.instance,
++            self.binding,
++            self.child,
++            self.connection,
++        )
++        self.driver._connect_volume.assert_not_called()
+diff --git a/nova/virt/libvirt/checkpoints/journal.py b/nova/virt/libvirt/checkpoints/journal.py
+index 36438a06b87cb4c0016de4fe2fa7711514df1b8a..8f547621d88496d29788e8e0abbd7cff071e4f41 100644
+--- a/nova/virt/libvirt/checkpoints/journal.py
++++ b/nova/virt/libvirt/checkpoints/journal.py
+@@ -19,6 +19,8 @@ from nova.checkpoints import contracts_v2 as v2
+ from nova import objects
+ 
+ RUNTIME_ACTIONS = frozenset(('save', 'stop', 'restore_paused', 'unpause'))
++LOCAL_ACTIONS = RUNTIME_ACTIONS | frozenset((
++    'host_connect', 'host_disconnect'))
+ 
+ 
+ def runtime_children(context, operation_id, require_closed=False):
+@@ -26,7 +28,7 @@ def runtime_children(context, operation_id, require_closed=False):
+     for step in objects.InstanceCheckpointStepList.get_by_operation(
+             context, operation_id):
+         result.extend(row for row in objects.CheckpointEffect.get_children(
+-            context, step.uuid) if row['action'] in RUNTIME_ACTIONS)
++            context, step.uuid) if row['action'] in LOCAL_ACTIONS)
+     if require_closed:
+         c._require(all(row['status'] in (
+             'succeeded', 'failed_no_effect', 'failed_with_effects')
+diff --git a/nova/virt/libvirt/checkpoints/staging.py b/nova/virt/libvirt/checkpoints/staging.py
+index 237888069df11f5d5665485861ddaa9f66f9ef85..3913c18fec91fd53114c99dcb4947a0e0c5d8955 100644
+--- a/nova/virt/libvirt/checkpoints/staging.py
++++ b/nova/virt/libvirt/checkpoints/staging.py
+@@ -304,7 +304,7 @@ class StagingStore:
+     @contextlib.contextmanager
+     def runtime_record(self, context, binding, child, write=False):
+         journal.authorize(context, binding, child, write=write)
+-        c._require(child.action in journal.RUNTIME_ACTIONS)
++        c._require(child.action in journal.LOCAL_ACTIONS)
+         self._entry(binding, child.operation_id)
+         parts = self._parts(binding, child.operation_id)
+         with self.fs.directory(parts) as directory:
+@@ -525,7 +525,8 @@ class StagingStore:
+                                 allowed = {
+                                     'runtime-%s.%s' % (row['id'], suffix)
+                                     for row in runtime_children
+-                                    for suffix in ('intent', 'done')
++                                    for suffix in (
++                                        'intent', 'done', 'connection')
+                                 }
+                                 c._require(
+                                     names <=
+@@ -720,6 +721,23 @@ class RuntimeRecord:
+         c._require(len(jsonutils.dump_as_bytes(value)) <= 4096)
+         files.create_json(self.directory, self._name('done'), value)
+ 
++    def connection(self, value=None):
++        """Private host-connect output, never returned in effect evidence.
++
++        os-brick adds host paths during connect. Preserve that exact output in
++        the quota-bounded encrypted workspace until the BDM child saves it.
++        """
++        c._require(self.child.action == 'host_connect')
++        if value is not None:
++            c._require(type(value) is dict)
++            files.create_json(self.directory, self._name('connection'),
++                dict(self._value(), connection=value))
++        stored = files.read_json(self.directory, self._name('connection'))
++        c._keys(stored, ('format', 'binding', 'child', 'connection'))
++        c._require({k: stored[k] for k in self._value()} == self._value())
++        c._require(type(stored['connection']) is dict)
++        return stored['connection']
++
+     def read(self):
+         intent = files.read_json(self.directory, self._name('intent'))
+         c._require(intent == self._value())
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 19a2f09083cca26611ae2efb553d1f5c1e88f4ae..25d3053e6a1f027547c76181c3b8abca54b31bd8 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -2115,6 +2115,37 @@ class LibvirtDriver(driver.ComputeDriver):
+                               "volume connection", instance=instance)
+                 vol_driver.disconnect_volume(connection_info, instance)
+ 
++    def _checkpoint_volume_guard(self, context, instance, binding, child,
++                                 connection_info, action):
++        from nova.checkpoints import contracts as checkpoint_contracts
++        from nova.virt.libvirt.checkpoints import journal
++        checkpoint_contracts._require(child.action == action and
++            instance.uuid == binding.instance_uuid and
++            not connection_info.get('multiattach', False) and
++            driver_block_device.get_volume_id(connection_info) ==
++            child.resource_id)
++        journal.authorize(context, binding, child, write=True)
++        guest = self._host.get_guest(instance)
++        checkpoint_contracts._require(guest.uuid == instance.uuid and
++            guest.checkpoint_state() ==
++            dict(state=5, job=0, managed_save=False))
++
++    def _checkpoint_connect_volume(self, context, instance, binding, child,
++                                  connection_info):
++        self._checkpoint_volume_guard(context, instance, binding, child,
++                                      connection_info, 'host_connect')
++        # The supported topology has no host encryptor. Keep native libvirt
++        # secrets; never fetch another key or implicitly format a device here.
++        self._connect_volume(context, connection_info, instance, encryption={})
++
++    def _checkpoint_disconnect_volume(self, context, instance, binding, child,
++                                     connection_info):
++        self._checkpoint_volume_guard(context, instance, binding, child,
++                                      connection_info, 'host_disconnect')
++        self._disconnect_volume(context, connection_info, instance,
++                                encryption={}, destroy_secrets=False,
++                                force=False)
++
+     def _should_disconnect_target(self, context, instance, multiattach,
+                                   vol_driver, volume_id):
+         # NOTE(jdg): Multiattach is a special case (not to be confused
+diff --git a/nova/virt/virtapi.py b/nova/virt/virtapi.py
+index dad1197d8ccb43d6c284ef59c16fd9386a0ce5f3..0febae88e97d17889aa0623ca32428597e40d4ed 100644
+--- a/nova/virt/virtapi.py
++++ b/nova/virt/virtapi.py
+@@ -16,6 +16,11 @@ import contextlib
+ 
+ 
+ class VirtAPI(object):
++    def checkpoint_update_bdm(self, context, instance_uuid, operation_id,
++                              generation, bdm_uuid, attachment_id,
++                              connection_info):
++        raise NotImplementedError()
++
+     @contextlib.contextmanager
+     def wait_for_instance_event(self, instance, event_names, deadline=300,
+                                 error_callback=None):

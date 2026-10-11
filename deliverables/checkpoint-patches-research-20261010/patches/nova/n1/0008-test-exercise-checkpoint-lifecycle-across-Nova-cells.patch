@@ -1,0 +1,1469 @@
+From c28f32cc788674cc0520738b23b4f050c860bf22 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 12:33:52 +0300
+Subject: [PATCH 08/10] test: exercise checkpoint lifecycle across Nova cells
+
+---
+ .../server-checkpoints/action-resp.json       |  12 +
+ .../server-checkpoints/capabilities.json      |   7 +
+ .../server-checkpoints/create-req.json        |   6 +
+ .../server-checkpoints/create-resp.json       |  20 ++
+ .../deleted-operation-resp.json               |  12 +
+ .../server-checkpoints/list-resp.json         |  12 +
+ .../server-checkpoints/operation-resp.json    |  12 +
+ .../server-checkpoints/revert-req.json        |   5 +
+ .../server-checkpoints/show-resp.json         |  10 +
+ .../versions/v21-version-get-resp.json        |   6 +-
+ .../versions/versions-get-resp.json           |  12 +-
+ nova/checkpoints/guards.py                    |   5 +
+ nova/compute/manager.py                       |   3 +-
+ nova/db/api/models.py                         |   1 -
+ nova/db/main/checkpoints.py                   |  44 ++-
+ nova/policies/server_checkpoints.py           |  11 +-
+ nova/tests/fixtures/checkpoints.py            | 199 +++++++++++
+ .../v2.106/action-resp.json.tpl               |  12 +
+ .../v2.106/capabilities.json.tpl              |   7 +
+ .../v2.106/create-req.json.tpl                |   6 +
+ .../v2.106/create-resp.json.tpl               |  20 ++
+ .../v2.106/deleted-operation-resp.json.tpl    |  12 +
+ .../v2.106/list-resp.json.tpl                 |  12 +
+ .../v2.106/operation-resp.json.tpl            |  12 +
+ .../v2.106/revert-req.json.tpl                |   5 +
+ .../v2.106/show-resp.json.tpl                 |  10 +
+ .../api_sample_tests/test_checkpoints.py      |  90 +++++
+ nova/tests/functional/db/test_checkpoints.py  | 109 ++++++
+ nova/tests/functional/test_checkpoints.py     | 314 ++++++++++++++++++
+ nova/tests/unit/checkpoints/test_api.py       |  21 ++
+ nova/tests/unit/checkpoints/test_guards.py    |  37 ++-
+ nova/tests/unit/compute/test_compute.py       |  16 +-
+ .../objects/test_notification.py              |   2 +
+ nova/tests/unit/test_policy.py                |   7 +
+ 34 files changed, 1039 insertions(+), 30 deletions(-)
+ create mode 100644 doc/api_samples/server-checkpoints/action-resp.json
+ create mode 100644 doc/api_samples/server-checkpoints/capabilities.json
+ create mode 100644 doc/api_samples/server-checkpoints/create-req.json
+ create mode 100644 doc/api_samples/server-checkpoints/create-resp.json
+ create mode 100644 doc/api_samples/server-checkpoints/deleted-operation-resp.json
+ create mode 100644 doc/api_samples/server-checkpoints/list-resp.json
+ create mode 100644 doc/api_samples/server-checkpoints/operation-resp.json
+ create mode 100644 doc/api_samples/server-checkpoints/revert-req.json
+ create mode 100644 doc/api_samples/server-checkpoints/show-resp.json
+ create mode 100644 nova/tests/fixtures/checkpoints.py
+ create mode 100644 nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/action-resp.json.tpl
+ create mode 100644 nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/capabilities.json.tpl
+ create mode 100644 nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/create-req.json.tpl
+ create mode 100644 nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/create-resp.json.tpl
+ create mode 100644 nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/deleted-operation-resp.json.tpl
+ create mode 100644 nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/list-resp.json.tpl
+ create mode 100644 nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/operation-resp.json.tpl
+ create mode 100644 nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/revert-req.json.tpl
+ create mode 100644 nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/show-resp.json.tpl
+ create mode 100644 nova/tests/functional/api_sample_tests/test_checkpoints.py
+ create mode 100644 nova/tests/functional/db/test_checkpoints.py
+ create mode 100644 nova/tests/functional/test_checkpoints.py
+
+diff --git a/doc/api_samples/server-checkpoints/action-resp.json b/doc/api_samples/server-checkpoints/action-resp.json
+new file mode 100644
+index 0000000..60639bb
+--- /dev/null
++++ b/doc/api_samples/server-checkpoints/action-resp.json
+@@ -0,0 +1,12 @@
++{
++  "operation": {
++    "id": "c4a5e84e-25c2-4ad6-a3a7-b6cd27d746c0",
++    "checkpoint_id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++    "kind": "revert",
++    "state": "reserved",
++    "phase": null,
++    "error_code": null,
++    "created_at": "2026-10-07T09:10:56.071183+00:00",
++    "updated_at": "2026-10-07T09:10:56.074958+00:00"
++  }
++}
+diff --git a/doc/api_samples/server-checkpoints/capabilities.json b/doc/api_samples/server-checkpoints/capabilities.json
+new file mode 100644
+index 0000000..4fa0e72
+--- /dev/null
++++ b/doc/api_samples/server-checkpoints/capabilities.json
+@@ -0,0 +1,7 @@
++{
++  "capabilities": {
++    "supported": true,
++    "reasons": [],
++    "profile": "kvm-bios-same-host-v1"
++  }
++}
+diff --git a/doc/api_samples/server-checkpoints/create-req.json b/doc/api_samples/server-checkpoints/create-req.json
+new file mode 100644
+index 0000000..48e8db1
+--- /dev/null
++++ b/doc/api_samples/server-checkpoints/create-req.json
+@@ -0,0 +1,6 @@
++{
++  "checkpoint": {
++    "name": "A",
++    "request_id": "ea4a2bc5-e5c5-4460-aba0-d0036f125377"
++  }
++}
+diff --git a/doc/api_samples/server-checkpoints/create-resp.json b/doc/api_samples/server-checkpoints/create-resp.json
+new file mode 100644
+index 0000000..defcb07
+--- /dev/null
++++ b/doc/api_samples/server-checkpoints/create-resp.json
+@@ -0,0 +1,20 @@
++{
++  "checkpoint": {
++    "id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++    "server_id": "7b04ded1-420c-470f-b083-a954ae620493",
++    "name": "A",
++    "status": "available",
++    "created_at": "2026-10-07T09:10:55.811689+00:00",
++    "operation_id": null
++  },
++  "operation": {
++    "id": "c64496f7-dc78-4334-882e-dd45f76e4916",
++    "checkpoint_id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++    "kind": "create",
++    "state": "reserved",
++    "phase": null,
++    "error_code": null,
++    "created_at": "2026-10-07T09:10:55.812425+00:00",
++    "updated_at": "2026-10-07T09:10:55.821933+00:00"
++  }
++}
+diff --git a/doc/api_samples/server-checkpoints/deleted-operation-resp.json b/doc/api_samples/server-checkpoints/deleted-operation-resp.json
+new file mode 100644
+index 0000000..8e8687e
+--- /dev/null
++++ b/doc/api_samples/server-checkpoints/deleted-operation-resp.json
+@@ -0,0 +1,12 @@
++{
++  "operation": {
++    "id": "7e310c67-1361-473a-a18d-fd0b577d84fb",
++    "checkpoint_id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++    "kind": "delete",
++    "state": "released",
++    "phase": "cinder_release",
++    "error_code": null,
++    "created_at": "2026-10-07T09:10:56.326885+00:00",
++    "updated_at": "2026-10-07T09:10:56.473012+00:00"
++  }
++}
+diff --git a/doc/api_samples/server-checkpoints/list-resp.json b/doc/api_samples/server-checkpoints/list-resp.json
+new file mode 100644
+index 0000000..799aa4b
+--- /dev/null
++++ b/doc/api_samples/server-checkpoints/list-resp.json
+@@ -0,0 +1,12 @@
++{
++  "checkpoints": [
++    {
++      "id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++      "server_id": "7b04ded1-420c-470f-b083-a954ae620493",
++      "name": "A",
++      "status": "available",
++      "created_at": "2026-10-07T09:10:55.811689+00:00",
++      "operation_id": null
++    }
++  ]
++}
+diff --git a/doc/api_samples/server-checkpoints/operation-resp.json b/doc/api_samples/server-checkpoints/operation-resp.json
+new file mode 100644
+index 0000000..e0017bd
+--- /dev/null
++++ b/doc/api_samples/server-checkpoints/operation-resp.json
+@@ -0,0 +1,12 @@
++{
++  "operation": {
++    "id": "c4a5e84e-25c2-4ad6-a3a7-b6cd27d746c0",
++    "checkpoint_id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++    "kind": "revert",
++    "state": "succeeded",
++    "phase": "cinder_release",
++    "error_code": null,
++    "created_at": "2026-10-07T09:10:56.071183+00:00",
++    "updated_at": "2026-10-07T09:10:56.232125+00:00"
++  }
++}
+diff --git a/doc/api_samples/server-checkpoints/revert-req.json b/doc/api_samples/server-checkpoints/revert-req.json
+new file mode 100644
+index 0000000..4483e97
+--- /dev/null
++++ b/doc/api_samples/server-checkpoints/revert-req.json
+@@ -0,0 +1,5 @@
++{
++  "revert": {
++    "request_id": "671de9ae-97b5-4042-9e5a-d0274fbf072f"
++  }
++}
+diff --git a/doc/api_samples/server-checkpoints/show-resp.json b/doc/api_samples/server-checkpoints/show-resp.json
+new file mode 100644
+index 0000000..d79a877
+--- /dev/null
++++ b/doc/api_samples/server-checkpoints/show-resp.json
+@@ -0,0 +1,10 @@
++{
++  "checkpoint": {
++    "id": "570d6be1-10bf-4664-878a-05e2b8193e55",
++    "server_id": "7b04ded1-420c-470f-b083-a954ae620493",
++    "name": "A",
++    "status": "available",
++    "created_at": "2026-10-07T09:10:55.811689+00:00",
++    "operation_id": null
++  }
++}
+diff --git a/doc/api_samples/versions/v21-version-get-resp.json b/doc/api_samples/versions/v21-version-get-resp.json
+index 03bed55..0edfd01 100644
+--- a/doc/api_samples/versions/v21-version-get-resp.json
++++ b/doc/api_samples/versions/v21-version-get-resp.json
+@@ -18,9 +18,9 @@
+                 "type": "application/vnd.openstack.compute+json;version=2.1"
+             }
+         ],
+-        "status": "CURRENT",
+-        "version": "2.100",
+         "min_version": "2.1",
+-        "updated": "2013-07-23T11:33:21Z"
++        "status": "CURRENT",
++        "updated": "2013-07-23T11:33:21Z",
++        "version": "2.106"
+     }
+ }
+\ No newline at end of file
+diff --git a/doc/api_samples/versions/versions-get-resp.json b/doc/api_samples/versions/versions-get-resp.json
+index 87ddf18..f413449 100644
+--- a/doc/api_samples/versions/versions-get-resp.json
++++ b/doc/api_samples/versions/versions-get-resp.json
+@@ -8,10 +8,10 @@
+                     "rel": "self"
+                 }
+             ],
+-            "status": "SUPPORTED",
+-            "version": "",
+             "min_version": "",
+-            "updated": "2011-01-21T11:33:21Z"
++            "status": "SUPPORTED",
++            "updated": "2011-01-21T11:33:21Z",
++            "version": ""
+         },
+         {
+             "id": "v2.1",
+@@ -21,10 +21,10 @@
+                     "rel": "self"
+                 }
+             ],
+-            "status": "CURRENT",
+-            "version": "2.100",
+             "min_version": "2.1",
+-            "updated": "2013-07-23T11:33:21Z"
++            "status": "CURRENT",
++            "updated": "2013-07-23T11:33:21Z",
++            "version": "2.106"
+         }
+     ]
+ }
+\ No newline at end of file
+diff --git a/nova/checkpoints/guards.py b/nova/checkpoints/guards.py
+index ff62812..fd55d9d 100644
+--- a/nova/checkpoints/guards.py
++++ b/nova/checkpoints/guards.py
+@@ -105,6 +105,11 @@ def handoff(context, target):
+ 
+ @contextlib.contextmanager
+ def _bound_objects(value, context):
++    if not getattr(context, 'checkpoint_scope', None):
++        # Default-off legacy calls must retain each object's original context
++        # (including cell routing and elevated/read-deleted permissions).
++        yield
++        return
+     saved = {}
+ 
+     def bind(item):
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 5dbe0ec..ddb4e39 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -9850,7 +9850,8 @@ class ComputeManager(manager.Manager):
+         try:
+             context = guards.handoff(
+                 context, 'compute:_do_live_migration:%s' % self.host)
+-            instance = instance.obj_clone()
++            if context.checkpoint_scope:
++                instance = instance.obj_clone()
+             future = nova.utils.pass_context(
+                 self._live_migration_executor.submit,
+                 self._do_live_migration, context, dest, instance,
+diff --git a/nova/db/api/models.py b/nova/db/api/models.py
+index 24675a3..b8569ea 100644
+--- a/nova/db/api/models.py
++++ b/nova/db/api/models.py
+@@ -496,7 +496,6 @@ class Reservation(BASE):
+     usage = orm.relationship('QuotaUsage')
+ 
+ 
+-
+ class CheckpointProjectUsage(BASE):
+     __tablename__ = 'checkpoint_project_usage'
+     project_id = sa.Column(sa.String(255), primary_key=True, nullable=False)
+diff --git a/nova/db/main/checkpoints.py b/nova/db/main/checkpoints.py
+index c1798b4..8f05b1f 100644
+--- a/nova/db/main/checkpoints.py
++++ b/nova/db/main/checkpoints.py
+@@ -701,10 +701,10 @@ def _bind_result(context, checkpoint, step, result):
+         valid &= set(e['artifact_ids']) == {item.uuid for item in artifacts}
+     if step.phase == 'artifact_publish':
+         valid &= {
+-            (a['id'], a['logical_id'], a['checksum'], a['bytes'])
++            (a['id'], a['kind'], a['logical_id'], a['checksum'], a['bytes'])
+             for a in e['artifacts']
+         } == {
+-            (a.uuid, a.logical_id, a.checksum, a.actual_bytes)
++            (a.uuid, a.kind, a.logical_id, a.checksum, a.actual_bytes)
+             for a in artifacts
+         }
+     if step.phase == 'runtime_save':
+@@ -712,6 +712,46 @@ def _bind_result(context, checkpoint, step, result):
+             checkpoint.artifact_upper_bound
+         )
+         valid &= any(a['kind'] == 'ram' for a in e['artifacts'])
++        # The Instance lock serializes point creation for this VM. A second
++        # point must not acquire another live point's backing object: deleting
++        # either point would otherwise destroy the other one's recovery data.
++        existing = (
++            context.session.query(m.InstanceCheckpointArtifact.logical_id)
++            .join(
++                m.InstanceCheckpoint,
++                m.InstanceCheckpointArtifact.checkpoint_id ==
++                m.InstanceCheckpoint.uuid,
++            )
++            .filter(
++                m.InstanceCheckpoint.instance_uuid == checkpoint.instance_uuid,
++                m.InstanceCheckpoint.uuid != checkpoint.uuid,
++                m.InstanceCheckpoint.status != 'deleted',
++            )
++            .all()
++        )
++        valid &= not (
++            {a['logical_id'] for a in e['artifacts']} &
++            {row.logical_id for row in existing}
++        )
++    if step.phase == 'disk_snapshot':
++        existing = (
++            context.session.query(m.InstanceCheckpointDisk.snapshot_id)
++            .join(
++                m.InstanceCheckpoint,
++                m.InstanceCheckpointDisk.checkpoint_id ==
++                m.InstanceCheckpoint.uuid,
++            )
++            .filter(
++                m.InstanceCheckpoint.instance_uuid == checkpoint.instance_uuid,
++                m.InstanceCheckpoint.uuid != checkpoint.uuid,
++                m.InstanceCheckpoint.status != 'deleted',
++            )
++            .all()
++        )
++        valid &= not (
++            {a['snapshot_id'] for a in e['snapshots']} &
++            {row.snapshot_id for row in existing}
++        )
+     if step.phase in ('cinder_release', 'cleanup_cinder_release'):
+         reserve = (
+             context.session.query(m.InstanceCheckpointStep)
+diff --git a/nova/policies/server_checkpoints.py b/nova/policies/server_checkpoints.py
+index 0c2f8cf..e1531d9 100644
+--- a/nova/policies/server_checkpoints.py
++++ b/nova/policies/server_checkpoints.py
+@@ -12,8 +12,6 @@
+ 
+ from oslo_policy import policy
+ 
+-from nova.policies import base
+-
+ POLICY_ROOT = 'os_compute_api:server_checkpoints:%s'
+ 
+ _ACTIONS = (
+@@ -31,7 +29,14 @@ def list_rules():
+     return [
+         policy.DocumentedRuleDefault(
+             name=POLICY_ROOT % action,
+-            check_str=base.PROJECT_MEMBER if write else base.PROJECT_READER,
++            # This is a new API with no legacy admin-or-owner fallback.
++            # The shared base rules carry deprecated checks which can permit
++            # a project reader to mutate when enforce_new_defaults is false.
++            check_str=(
++                'role:member and project_id:%(project_id)s'
++                if write
++                else 'role:reader and project_id:%(project_id)s'
++            ),
+             description='Private server checkpoint %s' % action,
+             operations=[
+                 {'method': method, 'path': '/servers/{server_id}' + path}
+diff --git a/nova/tests/fixtures/checkpoints.py b/nova/tests/fixtures/checkpoints.py
+new file mode 100644
+index 0000000..2aeeecc
+--- /dev/null
++++ b/nova/tests/fixtures/checkpoints.py
+@@ -0,0 +1,199 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Two SQL cells, real WSGI/RPC managers, and test-only N2 effects."""
++
++import oslo_messaging as messaging
++from oslo_serialization import jsonutils
++from oslo_utils.fixture import uuidsentinel as uuids
++from oslo_utils import uuidutils
++import webob
++
++from nova.checkpoints import recovery
++from nova.compute import manager as compute_manager
++from nova.conductor import manager as conductor_manager
++from nova import context
++from nova.db.api import checkpoints as quota_db
++from nova.db.main import api as db_api
++from nova import objects
++from nova import rpc
++from nova import test
++from nova.tests import fixtures
++from nova.tests.unit.api.openstack import fakes
++from nova.tests.unit.checkpoints import fake_executor
++from nova.tests.unit.checkpoints import test_cell_db
++
++
++class CheckpointTestCase(test.TestCase):
++    NUMBER_OF_CELLS = 2
++
++    def setUp(self):
++        super().setUp()
++        self.flags(
++            enabled=True,
++            max_artifact_bytes_per_project=65536,
++            group='checkpoint',
++        )
++        self.useFixture(fixtures.RealPolicyFixture())
++        self.useFixture(fixtures.CastAsCallFixture(self))
++        self.ctx = context.RequestContext(
++            'actor', 'project', roles=['member', 'reader']
++        )
++        self.servers = [uuids.instance1, uuids.instance2]
++        self.volumes = [uuids.volume1, uuids.volume2]
++        self.ports = [uuids.port1, uuids.port2]
++        self.cells = [self.cell_mappings['cell1'], self.cell_mappings['cell2']]
++        self.drivers = []
++        self.managers = []
++        self.conductor = conductor_manager.ConductorManager()
++        self._serve(
++            'conductor',
++            'conductor',
++            [self.conductor, self.conductor.compute_task_mgr],
++        )
++        for index, cell in enumerate(self.cells):
++            host = 'compute%d' % index
++            with context.target_cell(self.ctx, cell) as ctx:
++                test_cell_db.make_instance(
++                    ctx,
++                    self.servers[index],
++                    getattr(uuids, 'bdm%d' % index),
++                    self.volumes[index],
++                )
++                db_api.instance_update(
++                    ctx, self.servers[index], {'host': host}
++                )
++                db_api.virtual_interface_create(
++                    ctx,
++                    dict(
++                        uuid=self.ports[index],
++                        instance_uuid=self.servers[index],
++                        address='fa:16:3e:00:00:%02d' % index,
++                    ),
++                )
++                db_api.instance_info_cache_update(
++                    ctx,
++                    self.servers[index],
++                    {
++                        'network_info': jsonutils.dumps(
++                            [
++                                {
++                                    'id': self.ports[index],
++                                    'address': 'fa:16:3e:00:00:%02d' % index,
++                                    'network': {'id': uuids.network},
++                                    'vnic_type': 'normal',
++                                    'model': 'virtio',
++                                }
++                            ]
++                        )
++                    },
++                )
++                objects.Service(
++                    ctx, host=host, binary='nova-compute', topic='compute'
++                ).create()
++            objects.InstanceMapping(
++                self.ctx,
++                instance_uuid=self.servers[index],
++                cell_mapping=cell,
++                project_id='project',
++            ).create()
++            manager = compute_manager.ComputeManager(host=host)
++            manager.driver = fake_executor.FakeCheckpointDriver()
++            self.managers.append(manager)
++            self.drivers.append(manager.driver)
++            self._serve('compute', host, [manager])
++        # Only authentication is simulated. Controller/API/DB/RPC are real.
++        self.app = fakes.wsgi_app_v21(fake_auth_context=self.ctx)
++
++    def _serve(self, topic, host, endpoints):
++        server = rpc.get_server(
++            messaging.Target(topic=topic, server=host),
++            endpoints,
++            serializer=objects.base.NovaObjectSerializer(),
++        )
++        server.start()
++        self.addCleanup(server.wait)
++        self.addCleanup(server.stop)
++        return server
++
++    def request(
++        self,
++        method,
++        suffix,
++        body=None,
++        index=0,
++        headers=None,
++        version='2.106',
++        expected=200,
++    ):
++        req = webob.Request.blank(
++            '/v2.1/servers/%s/%s' % (self.servers[index], suffix)
++        )
++        req.method = method
++        req.headers['OpenStack-API-Version'] = 'compute ' + version
++        if headers:
++            req.headers.update(headers)
++        if body is not None:
++            req.content_type = 'application/json'
++            req.body = jsonutils.dump_as_bytes(body)
++        response = req.get_response(self.app)
++        self.assertEqual(expected, response.status_int, response.text)
++        return response.json
++
++    def create(self, name='A', index=0, request_id=None, expected=202):
++        return self.request(
++            'POST',
++            'checkpoints',
++            {
++                'checkpoint': {
++                    'name': name,
++                    'request_id': request_id or uuidutils.generate_uuid(),
++                }
++            },
++            index=index,
++            expected=expected,
++        )
++
++    def action(self, checkpoint_id, kind, index=0, request_id=None):
++        request_id = request_id or uuidutils.generate_uuid()
++        if kind == 'delete':
++            return self.request(
++                'DELETE',
++                'checkpoints/' + checkpoint_id,
++                index=index,
++                headers={'OpenStack-Checkpoint-Request-ID': request_id},
++                expected=202,
++            )
++        return self.request(
++            'POST',
++            'checkpoints/%s/action' % checkpoint_id,
++            {'revert': {'request_id': request_id}},
++            index=index,
++            expected=202,
++        )
++
++    def operation(self, result, index=0):
++        return self.request(
++            'GET',
++            'checkpoint-operations/' + result['operation']['id'],
++            index=index,
++        )['operation']
++
++    def recover(self, index=0):
++        # New manager, retained SQL and external fake backend state.
++        with context.target_cell(self.ctx, self.cells[index]) as ctx:
++            return recovery.RecoveryManager().reconcile_instance(
++                ctx, self.servers[index]
++            )
++
++    def usage(self):
++        return quota_db.get_usage(self.ctx, 'project')
+diff --git a/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/action-resp.json.tpl b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/action-resp.json.tpl
+new file mode 100644
+index 0000000..a889775
+--- /dev/null
++++ b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/action-resp.json.tpl
+@@ -0,0 +1,12 @@
++{
++  "operation": {
++    "id": "$uuid",
++    "checkpoint_id": "$uuid",
++    "kind": "revert",
++    "state": "reserved",
++    "phase": null,
++    "error_code": null,
++    "created_at": "$timestamp",
++    "updated_at": "$timestamp"
++  }
++}
+diff --git a/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/capabilities.json.tpl b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/capabilities.json.tpl
+new file mode 100644
+index 0000000..4fa0e72
+--- /dev/null
++++ b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/capabilities.json.tpl
+@@ -0,0 +1,7 @@
++{
++  "capabilities": {
++    "supported": true,
++    "reasons": [],
++    "profile": "kvm-bios-same-host-v1"
++  }
++}
+diff --git a/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/create-req.json.tpl b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/create-req.json.tpl
+new file mode 100644
+index 0000000..57c73d0
+--- /dev/null
++++ b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/create-req.json.tpl
+@@ -0,0 +1,6 @@
++{
++  "checkpoint": {
++    "name": "A",
++    "request_id": "$uuid"
++  }
++}
+diff --git a/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/create-resp.json.tpl b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/create-resp.json.tpl
+new file mode 100644
+index 0000000..a1cfa6f
+--- /dev/null
++++ b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/create-resp.json.tpl
+@@ -0,0 +1,20 @@
++{
++  "checkpoint": {
++    "id": "$uuid",
++    "server_id": "$uuid",
++    "name": "A",
++    "status": "available",
++    "created_at": "$timestamp",
++    "operation_id": null
++  },
++  "operation": {
++    "id": "$uuid",
++    "checkpoint_id": "$uuid",
++    "kind": "create",
++    "state": "reserved",
++    "phase": null,
++    "error_code": null,
++    "created_at": "$timestamp",
++    "updated_at": "$timestamp"
++  }
++}
+diff --git a/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/deleted-operation-resp.json.tpl b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/deleted-operation-resp.json.tpl
+new file mode 100644
+index 0000000..6e14fd9
+--- /dev/null
++++ b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/deleted-operation-resp.json.tpl
+@@ -0,0 +1,12 @@
++{
++  "operation": {
++    "id": "$uuid",
++    "checkpoint_id": "$uuid",
++    "kind": "delete",
++    "state": "released",
++    "phase": "cinder_release",
++    "error_code": null,
++    "created_at": "$timestamp",
++    "updated_at": "$timestamp"
++  }
++}
+diff --git a/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/list-resp.json.tpl b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/list-resp.json.tpl
+new file mode 100644
+index 0000000..1c86da2
+--- /dev/null
++++ b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/list-resp.json.tpl
+@@ -0,0 +1,12 @@
++{
++  "checkpoints": [
++    {
++      "id": "$uuid",
++      "server_id": "$uuid",
++      "name": "A",
++      "status": "available",
++      "created_at": "$timestamp",
++      "operation_id": null
++    }
++  ]
++}
+diff --git a/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/operation-resp.json.tpl b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/operation-resp.json.tpl
+new file mode 100644
+index 0000000..260a5bc
+--- /dev/null
++++ b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/operation-resp.json.tpl
+@@ -0,0 +1,12 @@
++{
++  "operation": {
++    "id": "$uuid",
++    "checkpoint_id": "$uuid",
++    "kind": "revert",
++    "state": "succeeded",
++    "phase": "cinder_release",
++    "error_code": null,
++    "created_at": "$timestamp",
++    "updated_at": "$timestamp"
++  }
++}
+diff --git a/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/revert-req.json.tpl b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/revert-req.json.tpl
+new file mode 100644
+index 0000000..dda04fe
+--- /dev/null
++++ b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/revert-req.json.tpl
+@@ -0,0 +1,5 @@
++{
++  "revert": {
++    "request_id": "$uuid"
++  }
++}
+diff --git a/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/show-resp.json.tpl b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/show-resp.json.tpl
+new file mode 100644
+index 0000000..5c82efb
+--- /dev/null
++++ b/nova/tests/functional/api_sample_tests/api_samples/server-checkpoints/v2.106/show-resp.json.tpl
+@@ -0,0 +1,10 @@
++{
++  "checkpoint": {
++    "id": "$uuid",
++    "server_id": "$uuid",
++    "name": "A",
++    "status": "available",
++    "created_at": "$timestamp",
++    "operation_id": null
++  }
++}
+diff --git a/nova/tests/functional/api_sample_tests/test_checkpoints.py b/nova/tests/functional/api_sample_tests/test_checkpoints.py
+new file mode 100644
+index 0000000..90488b6
+--- /dev/null
++++ b/nova/tests/functional/api_sample_tests/test_checkpoints.py
+@@ -0,0 +1,90 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import datetime
++import os
++from pathlib import Path
++import uuid
++
++from oslo_serialization import jsonutils
++from oslo_utils import uuidutils
++
++from nova.tests.fixtures import checkpoints
++
++
++class CheckpointSamplesTest(checkpoints.CheckpointTestCase):
++    """Check literal public fields against real WSGI and RPC responses."""
++
++    templates = Path(__file__).parent / 'api_samples/server-checkpoints/v2.106'
++    samples = Path(__file__).parents[4] / 'doc/api_samples/server-checkpoints'
++
++    def assert_sample(self, name, response):
++        template = jsonutils.loads(
++            (self.templates / (name + '.json.tpl')).read_text()
++        )
++
++        def compare(expected, actual):
++            if expected == '$uuid':
++                self.assertEqual(actual, str(uuid.UUID(actual)))
++            elif expected == '$timestamp':
++                datetime.datetime.fromisoformat(actual)
++            elif isinstance(expected, dict):
++                self.assertEqual(set(expected), set(actual))
++                for key in expected:
++                    compare(expected[key], actual[key])
++            elif isinstance(expected, list):
++                self.assertEqual(len(expected), len(actual))
++                for left, right in zip(expected, actual):
++                    compare(left, right)
++            else:
++                self.assertEqual(expected, actual)
++
++        compare(template, response)
++        path = self.samples / (name + '.json')
++        if os.getenv('GENERATE_SAMPLES'):
++            path.parent.mkdir(parents=True, exist_ok=True)
++            path.write_text(jsonutils.dumps(response, indent=2) + '\n')
++        else:
++            compare(template, jsonutils.loads(path.read_text()))
++
++    def test_checkpoint_samples(self):
++        self.assert_sample(
++            'capabilities', self.request('GET', 'checkpoint-capabilities')
++        )
++        body = jsonutils.loads(
++            (self.templates / 'create-req.json.tpl').read_text()
++        )
++        body['checkpoint']['request_id'] = uuidutils.generate_uuid()
++        self.assert_sample('create-req', body)
++        created = self.request('POST', 'checkpoints', body, expected=202)
++        self.assert_sample('create-resp', created)
++        checkpoint_id = created['checkpoint']['id']
++        self.assert_sample(
++            'show-resp', self.request('GET', 'checkpoints/' + checkpoint_id)
++        )
++        self.assert_sample('list-resp', self.request('GET', 'checkpoints'))
++        body = jsonutils.loads(
++            (self.templates / 'revert-req.json.tpl').read_text()
++        )
++        body['revert']['request_id'] = uuidutils.generate_uuid()
++        self.assert_sample('revert-req', body)
++        reverted = self.request(
++            'POST', 'checkpoints/%s/action' % checkpoint_id, body, expected=202
++        )
++        self.assert_sample('action-resp', reverted)
++        self.assert_sample(
++            'operation-resp', {'operation': self.operation(reverted)}
++        )
++        deleted = self.action(checkpoint_id, 'delete')
++        self.assert_sample(
++            'deleted-operation-resp', {'operation': self.operation(deleted)}
++        )
+diff --git a/nova/tests/functional/db/test_checkpoints.py b/nova/tests/functional/db/test_checkpoints.py
+new file mode 100644
+index 0000000..09bcb40
+--- /dev/null
++++ b/nova/tests/functional/db/test_checkpoints.py
+@@ -0,0 +1,109 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from dataclasses import replace
++
++from oslo_db.sqlalchemy import test_fixtures
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import compute
++from nova.checkpoints import contracts as c
++from nova.db.main import checkpoints as db
++from nova import exception
++from nova import objects
++from nova import test
++from nova.tests.unit.checkpoints import fake_executor
++from nova.tests.unit.checkpoints import test_cell_db
++
++
++class CheckpointDatabaseMixin(test_cell_db.CellDBRaceMixin):
++    def test_stale_worker_completion_cannot_unlock_new_consumer(self):
++        self.flags(enabled=True, group='checkpoint')
++        first = db.guard_acquire(self.ctx, uuids.instance, 'stop')
++        queued = db.guard_handoff(self.ctx, first, 'compute:stop:compute')
++        current = db.guard_adopt(self.ctx, queued, 'compute:stop:compute')
++        self.assertRaises(
++            exception.CheckpointConflict, db.guard_release, self.ctx, first
++        )
++        self.assertRaises(
++            exception.CheckpointConflict,
++            db.admit,
++            self.ctx,
++            test_cell_db.admission(self.ctx),
++            uuids.ticket,
++        )
++        db.guard_release(self.ctx, current)
++        db.admit(self.ctx, test_cell_db.admission(self.ctx), uuids.ticket)
++        self.assertEqual(
++            uuids.operation,
++            db.guard_get(self.ctx, uuids.instance)['operation_id'],
++        )
++
++    def test_snapshot_proof_cannot_reuse_another_live_point(self):
++        self.flags(enabled=True, group='checkpoint')
++        first = test_cell_db.admission(self.ctx)
++        driver = fake_executor.FakeCheckpointDriver()
++        executor = compute.ComputeExecutor(driver, 'compute')
++        instance = objects.Instance.get_by_uuid(self.ctx, uuids.instance)
++        db.admit(self.ctx, first, uuids.ticket)
++        db.mark_quota_ready(self.ctx, first.operation_id, uuids.ticket)
++        executor.execute(self.ctx, instance, first.operation_id, 1)
++        snapshot = db.disks_get(self.ctx, first.checkpoint_id)[0][
++            'snapshot_id'
++        ]
++        second = replace(
++            first,
++            operation_id=uuids.op2,
++            checkpoint_id=uuids.checkpoint2,
++            key=replace(first.key, request_id=uuids.request2),
++        )
++        db.admit(self.ctx, second, uuids.ticket2)
++        db.mark_quota_ready(self.ctx, second.operation_id, uuids.ticket2)
++        driver.responses['disk_snapshot'] = c.StepResult(
++            'succeeded',
++            {
++                'volume_ids': [uuids.volume],
++                'snapshots': [
++                    {
++                        'volume_id': uuids.volume,
++                        'snapshot_id': snapshot,
++                        'status': 'available',
++                    }
++                ],
++            },
++            None,
++        )
++        executor.execute(self.ctx, instance, second.operation_id, 1)
++        self.assertEqual(
++            'recovery_required',
++            db.get_by_uuid(self.ctx, second.operation_id)['state'],
++        )
++        self.assertEqual(
++            'available',
++            db.checkpoint_get(self.ctx, first.checkpoint_id)['status'],
++        )
++
++
++class CheckpointMySQLTest(
++    CheckpointDatabaseMixin,
++    test_fixtures.OpportunisticDBTestMixin,
++    test.NoDBTestCase,
++):
++    FIXTURE = test_fixtures.MySQLOpportunisticFixture
++
++
++class CheckpointPostgreSQLTest(
++    CheckpointDatabaseMixin,
++    test_fixtures.OpportunisticDBTestMixin,
++    test.NoDBTestCase,
++):
++    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
+diff --git a/nova/tests/functional/test_checkpoints.py b/nova/tests/functional/test_checkpoints.py
+new file mode 100644
+index 0000000..c701f84
+--- /dev/null
++++ b/nova/tests/functional/test_checkpoints.py
+@@ -0,0 +1,314 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from unittest import mock
++
++import ddt
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import guards
++from nova.checkpoints import workflow
++from nova import context
++from nova.db.main import checkpoints as db
++from nova import exception
++from nova import objects
++from nova.tests import fixtures
++from nova.tests.fixtures import checkpoints
++
++
++@ddt.ddt
++class CheckpointLifecycleTest(checkpoints.CheckpointTestCase):
++    def test_probe_transport(self):
++        from nova.compute import rpcapi
++
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            service = objects.Service.get_by_host_and_binary(
++                ctx, 'compute0', 'nova-compute'
++            )
++            self.assertEqual(69, service.version)
++            api = rpcapi.ComputeAPI()
++            client = api.router.client(ctx)
++            self.assertTrue(
++                client.can_send_version('6.5'), str(client.version_cap)
++            )
++            instance = objects.Instance.get_by_uuid(ctx, self.servers[0])
++            result = api.checkpoint_probe(
++                ctx, instance, db.device_manifest(ctx, instance.uuid)
++            )
++            self.assertTrue(result['supported'], str(result))
++
++    def test_independent_points_and_cells_keep_resource_identity(self):
++        driver = self.drivers[0]
++        driver.runtime = 'RAM-A'
++        driver.volumes[self.volumes[0]] = 'DISK-A'
++        first = self.create('A')
++        self.assertEqual('succeeded', self.operation(first)['state'])
++        first_id = first['checkpoint']['id']
++        driver.runtime = 'RAM-B'
++        driver.volumes[self.volumes[0]] = 'DISK-B'
++        second = self.create('B')
++        second_id = second['checkpoint']['id']
++        other_cell = self.create('other-cell', index=1)
++        self.assertEqual('succeeded', self.operation(other_cell, 1)['state'])
++        self.assertEqual(3, self.usage()['checkpoint_count'])
++        self.action(first_id, 'revert')
++        self.assertEqual('RAM-A', driver.runtime)
++        self.assertEqual('DISK-A', driver.volumes[self.volumes[0]])
++        self.action(first_id, 'delete')
++        self.assertEqual(2, self.usage()['checkpoint_count'])
++        remaining = self.request('GET', 'checkpoints')['checkpoints']
++        self.assertEqual([second_id], [x['id'] for x in remaining])
++        self.action(second_id, 'revert')
++        self.assertEqual('RAM-B', driver.runtime)
++        self.assertEqual('DISK-B', driver.volumes[self.volumes[0]])
++        self.assertEqual('RUNNING', driver.power_state)
++        for index, cell in enumerate(self.cells):
++            with context.target_cell(self.ctx, cell) as ctx:
++                manifest = db.device_manifest(ctx, self.servers[index])
++                self.assertEqual(
++                    self.volumes[index], manifest['disks'][0]['volume_id']
++                )
++                self.assertEqual(
++                    self.ports[index], manifest['ports'][0]['uuid']
++                )
++                self.assertEqual(
++                    'fa:16:3e:00:00:%02d' % index, manifest['ports'][0]['mac']
++                )
++
++    @ddt.data(
++        *[
++            (kind, phase)
++            for kind in ('create', 'revert', 'delete')
++            for phase in workflow.steps_for(kind)
++        ]
++    )
++    @ddt.unpack
++    def test_lost_effect_reply_recovers_without_reexecution(self, kind, phase):
++        driver = self.drivers[0]
++        if kind != 'create':
++            original = self.create()
++        driver.lose_reply.add(phase)
++        result = (
++            self.create()
++            if kind == 'create'
++            else self.action(original['checkpoint']['id'], kind)
++        )
++        self.assertEqual('recovery_required', self.operation(result)['state'])
++        claimed = list(driver.executed)
++        self.flags(enabled=False, group='checkpoint')
++        self.recover()
++        self.assertEqual(claimed, driver.executed)
++        self.assertIn(claimed[-1], driver.queried)
++        self.recover()
++        self.assertEqual(
++            'released' if kind == 'delete' else 'succeeded',
++            self.operation(result)['state'],
++        )
++        self.assertEqual(
++            len(driver.executed),
++            len({ident for phase, ident in driver.executed}),
++        )
++
++    def test_lost_dispatch_before_claim_recovers_same_operation(self):
++        with mock.patch.object(
++            self.conductor.compute_task_mgr,
++            'checkpoint_run',
++            side_effect=TimeoutError(),
++        ):
++            result = self.create(request_id=uuids.request)
++        self.assertEqual([], self.drivers[0].executed)
++        self.recover()
++        replay = self.create(request_id=uuids.request)
++        self.assertEqual(result['operation']['id'], replay['operation']['id'])
++        self.assertEqual('succeeded', self.operation(result)['state'])
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++
++    @ddt.data(
++        *[
++            (kind, phase)
++            for kind in ('create', 'revert', 'delete')
++            for phase in workflow.steps_for(kind)
++        ]
++    )
++    @ddt.unpack
++    def test_delivery_lost_before_step_claim(self, kind, phase):
++        if kind != 'create':
++            original = self.create()
++        before = len(self.drivers[0].executed)
++        claim = objects.InstanceCheckpointOperation.claim_step
++
++        def lose_delivery(ctx, operation_id, generation, current, executor):
++            if current == phase:
++                raise TimeoutError('delivery lost before claim')
++            return claim(ctx, operation_id, generation, current, executor)
++
++        with mock.patch.object(
++            objects.InstanceCheckpointOperation,
++            'claim_step',
++            side_effect=lose_delivery,
++        ):
++            result = (
++                self.create()
++                if kind == 'create'
++                else self.action(original['checkpoint']['id'], kind)
++            )
++        phases = [p for p, ident in self.drivers[0].executed[before:]]
++        self.assertNotIn(phase, phases)
++        self.recover()
++        self.assertEqual(
++            'released' if kind == 'delete' else 'succeeded',
++            self.operation(result)['state'],
++        )
++        executed = self.drivers[0].executed
++        self.assertEqual(len(executed), len({ident for p, ident in executed}))
++
++    def test_unknown_cleanup_retains_quota_until_deletion_proven(self):
++        driver = self.drivers[0]
++        driver.responses['artifact_publish'] = c.StepResult(
++            'failed_no_effect',
++            {'no_effect': True, 'late_effect_impossible': True},
++            'executor_unavailable',
++        )
++        driver.lose_reply.add('cleanup_artifacts')
++        result = self.create()
++        self.assertEqual('recovery_required', self.operation(result)['state'])
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++        self.assertEqual(4096, self.usage()['artifact_bytes'])
++        self.recover()
++        self.recover()
++        self.assertEqual('released', self.operation(result)['state'])
++        self.assertEqual(0, self.usage()['checkpoint_count'])
++        self.assertEqual({}, driver.artifacts)
++        self.assertEqual({}, driver.snapshots)
++
++    @ddt.data('compute', 'conductor')
++    def test_old_endpoint_denied_before_quota_or_effect(self, endpoint):
++        target = (
++            self.managers[0].target
++            if endpoint == 'compute'
++            else self.conductor.compute_task_mgr.target
++        )
++        with mock.patch.object(
++            target, 'version', '6.4' if endpoint == 'compute' else '1.25'
++        ):
++            self.create(expected=503)
++        self.assertEqual(0, self.usage()['checkpoint_count'])
++        self.assertEqual([], self.drivers[0].executed)
++
++    @ddt.data(True, False)
++    def test_reader_and_foreign_project_cannot_replay_operation(
++        self, enforce_new_defaults
++    ):
++        self.flags(
++            enforce_new_defaults=enforce_new_defaults, group='oslo_policy'
++        )
++        self.useFixture(fixtures.RealPolicyFixture())
++        result = self.create(request_id=uuids.request)
++        before = list(self.drivers[0].executed)
++        self.ctx.roles = ['reader']
++        self.create(request_id=uuids.request, expected=403)
++        self.ctx.roles = ['member', 'reader']
++        self.ctx.project_id = 'foreign'
++        self.request(
++            'GET', 'checkpoints/' + result['checkpoint']['id'], expected=404
++        )
++        self.assertEqual(before, self.drivers[0].executed)
++
++    def test_late_ordinary_worker_and_forged_scope_preserve_owner(self):
++        self.drivers[0].lose_reply.add('runtime_save')
++        result = self.create()
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            self.assertRaises(
++                exception.CheckpointConflict,
++                db.guard_acquire,
++                ctx,
++                self.servers[0],
++                'delete',
++            )
++            forged = c.Scope(
++                self.servers[0],
++                'checkpoint',
++                result['operation']['id'],
++                1,
++                'delete',
++                'f' * 64,
++            )
++
++            def enter_forged_scope():
++                with guards.scope(ctx, forged):
++                    self.fail('forged scope admitted')
++
++            self.assertRaises(exception.CheckpointConflict, enter_forged_scope)
++            self.assertEqual(
++                result['operation']['id'],
++                db.guard_get(ctx, self.servers[0])['operation_id'],
++            )
++
++    def test_down_cell_keeps_global_quota_hold(self):
++        self.drivers[0].lose_reply.add('runtime_save')
++        result = self.create()
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            original = objects.InstanceCheckpointOperation.get_by_uuid
++
++            def unavailable(context, operation_id):
++                if context.cell_uuid == ctx.cell_uuid:
++                    raise exception.CheckpointUnavailable()
++                return original(context, operation_id)
++
++            with mock.patch.object(
++                objects.InstanceCheckpointOperation,
++                'get_by_uuid',
++                side_effect=unavailable,
++            ):
++                report = self.recover()
++            self.assertEqual(1, report['failed'])
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++        self.assertEqual('recovery_required', self.operation(result)['state'])
++
++    @ddt.data('artifact_kind', 'artifact_logical_id', 'snapshot_id')
++    def test_conflicting_resource_proof_cannot_publish_point(self, variant):
++        driver = self.drivers[0]
++        first = self.create('A')
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            old = db.checkpoint_get(ctx, first['checkpoint']['id'])
++            old_artifacts = db.artifacts_get(ctx, old['uuid'])
++            old_disks = db.disks_get(ctx, old['uuid'])
++        phase = {
++            'artifact_kind': 'artifact_publish',
++            'artifact_logical_id': 'runtime_save',
++            'snapshot_id': 'disk_snapshot',
++        }[variant]
++
++        def corrupt(intent):
++            evidence = driver._effect(intent)
++            if variant == 'artifact_kind':
++                evidence['artifacts'][0]['kind'] = 'config'
++            elif variant == 'artifact_logical_id':
++                evidence['artifacts'][0]['logical_id'] = old_artifacts[0][
++                    'logical_id'
++                ]
++            else:
++                evidence['snapshots'][0]['snapshot_id'] = old_disks[0][
++                    'snapshot_id'
++                ]
++            return c.StepResult('succeeded', evidence, None)
++
++        driver.responses[phase] = corrupt
++        second = self.create('B')
++        self.assertEqual('recovery_required', self.operation(second)['state'])
++        self.assertEqual(
++            'available',
++            self.request('GET', 'checkpoints/' + first['checkpoint']['id'])[
++                'checkpoint'
++            ]['status'],
++        )
+diff --git a/nova/tests/unit/checkpoints/test_api.py b/nova/tests/unit/checkpoints/test_api.py
+index 214cc9d..7a3cd40 100644
+--- a/nova/tests/unit/checkpoints/test_api.py
++++ b/nova/tests/unit/checkpoints/test_api.py
+@@ -132,6 +132,27 @@ class CheckpointAPITest(APIFixture):
+         self.assertRaises(exception.PolicyNotAuthorized, self.create)
+         self.task_rpc.checkpoint_probe.assert_not_called()
+ 
++    def test_reader_denied_with_legacy_policy_defaults(self):
++        self.flags(enforce_new_defaults=False, group='oslo_policy')
++        self.useFixture(fixtures.RealPolicyFixture())
++        self.ctx.roles = ['reader']
++        self.assertRaises(exception.PolicyNotAuthorized, self.create)
++        self.task_rpc.checkpoint_probe.assert_not_called()
++
++    @ddt.data(True, False)
++    def test_roleless_project_denied_read(self, enforce_new_defaults):
++        self.flags(
++            enforce_new_defaults=enforce_new_defaults, group='oslo_policy'
++        )
++        self.useFixture(fixtures.RealPolicyFixture())
++        self.ctx.roles = []
++        self.assertRaises(
++            exception.PolicyNotAuthorized,
++            self.api.list,
++            self.ctx,
++            uuids.instance,
++        )
++
+     def test_foreign_project_admin_cannot_read_or_charge(self):
+         self.ctx = context.RequestContext(
+             'admin',
+diff --git a/nova/tests/unit/checkpoints/test_guards.py b/nova/tests/unit/checkpoints/test_guards.py
+index 77002b6..6e3e410 100644
+--- a/nova/tests/unit/checkpoints/test_guards.py
++++ b/nova/tests/unit/checkpoints/test_guards.py
+@@ -18,11 +18,13 @@ from oslo_serialization import jsonutils
+ from oslo_utils.fixture import uuidsentinel as uuids
+ from oslo_utils import timeutils
+ 
++from nova.checkpoints import guards
+ from nova.checkpoints import workflow
+ from nova import context
+ from nova.db.main import api as db
+ from nova.db.main import checkpoints
+ from nova import exception
++from nova import objects
+ from nova import test
+ from nova.tests.unit.checkpoints import test_cell_db
+ 
+@@ -38,6 +40,20 @@ class GuardMutationTest(test.TestCase):
+     def admit(self):
+         checkpoints.admit(self.ctx, self.admission, uuids.ticket)
+ 
++    def test_disabled_entrypoint_preserves_original_object_context(self):
++        self.flags(enabled=False, group='checkpoint')
++        original = self.ctx.elevated(read_deleted='yes')
++        instance = objects.Instance.get_by_uuid(original, uuids.instance)
++
++        class Endpoint:
++            @guards.entrypoint('stop')
++            def stop(self, context, instance):
++                return context, instance._context
++
++        explicit, implicit = Endpoint().stop(self.ctx, instance)
++        self.assertIs(self.ctx, explicit)
++        self.assertIs(original, implicit)
++
+     def available(self):
+         self.admit()
+         checkpoints.mark_quota_ready(self.ctx, uuids.operation, uuids.ticket)
+@@ -269,17 +285,26 @@ class GuardOwnershipTest(GuardMutationTest):
+         from nova.compute import api
+         from nova.compute import utils
+         from nova import objects
+-        db.instance_update(self.ctx, uuids.instance,
+-                           {'launched_at': timeutils.utcnow()})
++
++        db.instance_update(
++            self.ctx, uuids.instance, {'launched_at': timeutils.utcnow()}
++        )
+         self.available()
+         instance = objects.Instance.get_by_uuid(self.ctx, uuids.instance)
+         # Stop before any external effect; the actual API must reach its
+         # snapshot body while retaining an ordinary claim, despite live CPs.
+         with mock.patch.object(
+-                utils, 'initialize_instance_snapshot_metadata',
+-                side_effect=RuntimeError('body reached')) as initialize:
+-            self.assertRaises(RuntimeError, api.API().snapshot_volume_backed,
+-                              self.ctx, instance, 'image')
++            utils,
++            'initialize_instance_snapshot_metadata',
++            side_effect=RuntimeError('body reached'),
++        ) as initialize:
++            self.assertRaises(
++                RuntimeError,
++                api.API().snapshot_volume_backed,
++                self.ctx,
++                instance,
++                'image',
++            )
+         initialize.assert_called_once()
+ 
+     def test_notifications_do_not_publish_scope_tokens(self):
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 39e8d14..e63f558 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -2615,8 +2615,8 @@ class ComputeTestCase(BaseTestCase,
+         instance = self._create_fake_instance_obj(params=params)
+ 
+         ctxt = context.get_admin_context()
+-        mock_context = mock.Mock()
+-        mock_context.elevated.return_value = ctxt
++        mock_context = context.RequestContext('fake', 'fake')
++        mock_context.elevated = mock.Mock(return_value=ctxt)
+ 
+         mock_get_block_info.return_value = mock.sentinel.block_device_info
+         mock_image_get.return_value = rescue_image_meta
+@@ -2653,8 +2653,8 @@ class ComputeTestCase(BaseTestCase,
+         instance = self._create_fake_instance_obj(params=params)
+ 
+         ctxt = context.get_admin_context()
+-        mock_context = mock.Mock()
+-        mock_context.elevated.return_value = ctxt
++        mock_context = context.RequestContext('fake', 'fake')
++        mock_context.elevated = mock.Mock(return_value=ctxt)
+ 
+         mock_get_block_info.return_value = mock.sentinel.block_device_info
+         mock_image_get.return_value = rescue_image_meta
+@@ -2698,8 +2698,8 @@ class ComputeTestCase(BaseTestCase,
+         instance = self._create_fake_instance_obj(params=params)
+ 
+         ctxt = context.get_admin_context()
+-        mock_context = mock.Mock()
+-        mock_context.elevated.return_value = ctxt
++        mock_context = context.RequestContext('fake', 'fake')
++        mock_context.elevated = mock.Mock(return_value=ctxt)
+ 
+         mock_get_block_info.return_value = mock.sentinel.block_device_info
+         mock_image_get.return_value = rescue_image_meta
+@@ -2743,8 +2743,8 @@ class ComputeTestCase(BaseTestCase,
+         instance = self._create_fake_instance_obj(params=params)
+ 
+         ctxt = context.get_admin_context()
+-        mock_context = mock.Mock()
+-        mock_context.elevated.return_value = ctxt
++        mock_context = context.RequestContext('fake', 'fake')
++        mock_context.elevated = mock.Mock(return_value=ctxt)
+ 
+         mock_get_block_info.return_value = mock.sentinel.block_device_info
+         mock_image_get.return_value = rescue_image_meta
+diff --git a/nova/tests/unit/notifications/objects/test_notification.py b/nova/tests/unit/notifications/objects/test_notification.py
+index bde7fd3..3256a93 100644
+--- a/nova/tests/unit/notifications/objects/test_notification.py
++++ b/nova/tests/unit/notifications/objects/test_notification.py
+@@ -442,6 +442,8 @@ notification_object_data = {
+ 
+ 
+ class TestNotificationObjectVersions(test.NoDBTestCase):
++    STUB_CHECKPOINT_GUARDS = False
++
+     def setUp(self):
+         super(TestNotificationObjectVersions, self).setUp()
+         base.NovaObjectRegistry.register_notification_objects()
+diff --git a/nova/tests/unit/test_policy.py b/nova/tests/unit/test_policy.py
+index 1999866..db702e1 100644
+--- a/nova/tests/unit/test_policy.py
++++ b/nova/tests/unit/test_policy.py
+@@ -392,6 +392,13 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
+ )
+ 
+         self.admin_or_owner_rules = (
++"os_compute_api:server_checkpoints:capabilities",
++"os_compute_api:server_checkpoints:index",
++"os_compute_api:server_checkpoints:show",
++"os_compute_api:server_checkpoints:create",
++"os_compute_api:server_checkpoints:revert",
++"os_compute_api:server_checkpoints:delete",
++"os_compute_api:server_checkpoints:operation_show",
+ "compute:server:topology:index",
+ "os_compute_api:servers:start",
+ "os_compute_api:os-server-keypairs:create",

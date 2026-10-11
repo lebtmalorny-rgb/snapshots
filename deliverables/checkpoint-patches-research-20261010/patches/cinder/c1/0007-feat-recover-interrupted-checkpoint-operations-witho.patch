@@ -1,0 +1,697 @@
+From 934c63ec45f740d36b8fea2767ee19ededdd5361 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Tue, 6 Oct 2026 23:36:31 +0300
+Subject: [PATCH 07/10] feat: recover interrupted checkpoint operations without
+ replaying effects
+
+---
+ cinder/checkpoints/api.py                     |   7 +-
+ cinder/checkpoints/manager.py                 |  25 ++
+ cinder/db/api.py                              |   8 +
+ cinder/db/sqlalchemy/api.py                   |   8 +
+ cinder/db/sqlalchemy/checkpoints.py           | 128 +++++++++-
+ cinder/tests/unit/checkpoints/test_db.py      |  27 +++
+ .../tests/unit/checkpoints/test_recovery.py   | 226 ++++++++++++++++++
+ cinder/tests/unit/volume/test_init_host.py    |  17 ++
+ cinder/volume/manager.py                      |  26 +-
+ 9 files changed, 463 insertions(+), 9 deletions(-)
+ create mode 100644 cinder/tests/unit/checkpoints/test_recovery.py
+
+diff --git a/cinder/checkpoints/api.py b/cinder/checkpoints/api.py
+index 381c83e..1abedfd 100644
+--- a/cinder/checkpoints/api.py
++++ b/cinder/checkpoints/api.py
+@@ -98,6 +98,7 @@ class API:
+                 contracts.validate_capabilities(result))
+         reservations = []
+         values['quota_reservations'] = {}
++        values['quota_deltas'] = {}
+         try:
+             if values['kind'] == 'create':
+                 for volume in volumes:
+@@ -113,6 +114,7 @@ class API:
+                             context, error, resource='snapshots',
+                             size=volume.size)
+                     values['quota_reservations'][volume.id] = reserved
++                    values['quota_deltas'][volume.id] = deltas
+                     reservations.extend(reserved)
+             row = db.checkpoint_reserve(context, values, volume_ids)
+         except Exception:
+@@ -152,13 +154,14 @@ class API:
+         if operation.status == 'released':
+             return operation
+         if name == 'cleanup':
+-            raise exception.CheckpointConflict(reason='cleanup_not_prepared')
++            operation = self._object(context, db.checkpoint_cleanup(
++                context, operation_id, generation))
+         resources = {resource.id: resource for resource in operation.resources}
+         for step in operation.steps:
+             volume = self._volume(
+                 context, resources[step.resource_id].volume_id)
+             self.rpc.assert_checkpoint_ready(context, volume)
+-            if name == 'execute':
++            if name in ('execute', 'cleanup'):
+                 self.rpc.execute_checkpoint_step(context, step.id, generation,
+                                                  volume.service_topic_queue)
+             else:
+diff --git a/cinder/checkpoints/manager.py b/cinder/checkpoints/manager.py
+index 41bffc8..ee1185c 100644
+--- a/cinder/checkpoints/manager.py
++++ b/cinder/checkpoints/manager.py
+@@ -14,8 +14,12 @@
+ 
+ import json
+ 
++from oslo_log import log as logging
++
++from cinder.checkpoints import config
+ from cinder.checkpoints import contracts
+ from cinder.checkpoints import guards
++from cinder import context as cinder_context
+ from cinder import db
+ from cinder import exception
+ from cinder import objects
+@@ -23,6 +27,9 @@ from cinder.policies import checkpoints as policy
+ from cinder.volume import volume_utils
+ 
+ 
++LOG = logging.getLogger(__name__)
++
++
+ class CheckpointManager:
+     def __init__(self, volume_manager):
+         self.owner = volume_manager
+@@ -117,3 +124,21 @@ class CheckpointManager:
+         except Exception:
+             result = {'status': 'unknown', 'error_code': 'query_exception'}
+         db.checkpoint_step_finish(context, step_id, generation, result)
++
++    def recover_pending(self, context):
++        if not self.owner.driver.initialized:
++            return
++        for row in db.checkpoint_pending(context, self.owner.host):
++            # Internal read-only recovery reconstructs the journal owner; it
++            # never renews ownership, dispatches an effect or removes a lock.
++            owner = cinder_context.RequestContext(
++                project_id=row['project_id'], user_id=row['user_id'],
++                service_user_id=row['service_user_id'], roles=['member'],
++                service_roles=(
++                    config.CONF.keystone_authtoken.service_token_roles))
++            try:
++                self.reconcile(owner, row['step_id'], row['generation'])
++            except Exception:
++                # The journal remains authoritative. Never log driver text.
++                LOG.warning('Checkpoint reconciliation deferred for step %s',
++                            row['step_id'])
+diff --git a/cinder/db/api.py b/cinder/db/api.py
+index ad318bf..1b86510 100644
+--- a/cinder/db/api.py
++++ b/cinder/db/api.py
+@@ -2048,3 +2048,11 @@ def checkpoint_attachment_scope(context, operation_id, generation, volume_id,
+     return IMPL.checkpoint_attachment_scope(
+         context, operation_id, generation, volume_id, action,
+         attachment_id, instance_uuid)
++
++
++def checkpoint_cleanup(context, operation_id, generation):
++    return IMPL.checkpoint_cleanup(context, operation_id, generation)
++
++
++def checkpoint_pending(context, host):
++    return IMPL.checkpoint_pending(context, host)
+diff --git a/cinder/db/sqlalchemy/api.py b/cinder/db/sqlalchemy/api.py
+index f589155..9c96069 100644
+--- a/cinder/db/sqlalchemy/api.py
++++ b/cinder/db/sqlalchemy/api.py
+@@ -8814,3 +8814,11 @@ def checkpoint_attachment_scope(context, operation_id, generation, volume_id,
+     return _checkpoint_guards().attachment_scope(
+         context, operation_id, generation, volume_id, action,
+         attachment_id, instance_uuid)
++
++
++def checkpoint_cleanup(context, operation_id, generation):
++    return _checkpoint_guards().cleanup(context, operation_id, generation)
++
++
++def checkpoint_pending(context, host):
++    return _checkpoint_guards().pending(context, host)
+diff --git a/cinder/db/sqlalchemy/checkpoints.py b/cinder/db/sqlalchemy/checkpoints.py
+index cda333c..2da5b4c 100644
+--- a/cinder/db/sqlalchemy/checkpoints.py
++++ b/cinder/db/sqlalchemy/checkpoints.py
+@@ -19,6 +19,7 @@ only temporary volume-lock rows are physically removed.
+ """
+ 
+ import contextlib
++import datetime
+ import json
+ import uuid
+ 
+@@ -284,9 +285,11 @@ def reserve(context, values, volume_ids):
+         context.session.add(models.CheckpointStep(
+             id=uuidutils.generate_uuid(), operation_id=operation.id,
+             resource_id=resource.id, phase=PHASES[kind], generation=1,
+-            status='prepared', quota_reservations_json=json.dumps(
+-                values.get('quota_reservations', {}).get(
+-                    resource.volume_id, [])),
++            status='prepared', quota_reservations_json=json.dumps({
++                'reservations': values.get('quota_reservations', {}).get(
++                    resource.volume_id, []),
++                'deltas': values.get('quota_deltas', {}).get(
++                    resource.volume_id, {}), 'released': False}),
+             original_attachment_ids_json=json.dumps(
+                 attachments[resource.volume_id])))
+         context.session.add(models.CheckpointVolumeLock(
+@@ -429,6 +432,7 @@ def step_finish(context, step_id, generation, result):
+                 snapshot.status = 'available'
+                 snapshot.progress = '100%'
+         elif step.phase == 'delete_snapshot':
++            _release_quota(context, resource)
+             resource.status = 'deleted'
+             if snapshot:
+                 snapshot.status = 'deleted'
+@@ -454,6 +458,9 @@ def release(context, operation_id, generation, outcome):
+     if outcome == 'commit':
+         if any(s.status != 'succeeded' for s in steps):
+             _conflict('unconfirmed_result')
++        if operation.kind == 'create' and any(
++                s.phase == 'delete_snapshot' for s in steps):
++            _conflict('cleanup_requires_abort')
+         if operation.kind == 'revert':
+             for volume in volumes:
+                 attachments = _attachments(context, volume.id)
+@@ -464,12 +471,23 @@ def release(context, operation_id, generation, outcome):
+                         a.attach_status != 'attached' for a in attachments)):
+                     _conflict('reattachment_required')
+     else:
+-        if any(s.status not in ('prepared', 'failed_no_effect')
+-               for s in steps):
+-            _conflict('effect_not_cleaned')
++        for step in steps:
++            if step.phase == 'delete_snapshot' and operation.kind == 'create':
++                if step.status != 'succeeded':
++                    _conflict('effect_not_cleaned')
++            elif step.status not in ('prepared', 'failed_no_effect'):
++                cleaned = (operation.kind == 'create' and
++                           step.phase == 'snapshot' and
++                           step.status == 'succeeded' and any(
++                               other.resource_id == step.resource_id and
++                               other.phase == 'delete_snapshot' and
++                               other.status == 'succeeded' for other in steps))
++                if not cleaned:
++                    _conflict('effect_not_cleaned')
+         if operation.kind == 'create':
+             for resource in _resources(context, operation.checkpoint_id,
+                                        lock=True):
++                _release_quota(context, resource)
+                 resource.status = 'deleted'
+                 snapshot = _query(context, models.Snapshot).filter_by(
+                     id=resource.snapshot_id).first()
+@@ -486,6 +504,104 @@ def release(context, operation_id, generation, outcome):
+     return _as_dict(context, operation)
+ 
+ 
++def _release_quota(context, resource):
++    create_operation = _query(context, models.CheckpointOperation).filter_by(
++        create_checkpoint_id=resource.checkpoint_id).one()
++    source = _current(_query(context, models.CheckpointStep).filter_by(
++        operation_id=create_operation.id, resource_id=resource.id,
++        phase='snapshot')).one()
++    journal = json.loads(source.quota_reservations_json)
++    if not isinstance(journal, dict) or journal.get('released'):
++        return
++    deltas = journal.get('deltas', {})
++    if deltas:
++        usages = api._get_quota_usages(
++            context, resource.project_id, resources=deltas)
++        if set(usages) != set(deltas):
++            _conflict('quota_usage_missing')
++        # Negative reservations need no quota-limit admission. Create and
++        # commit stock reservation rows in this writer transaction, so an
++        # effect result, quota release and resource tombstone commit together.
++        ids = []
++        for name, delta in deltas.items():
++            row = api._reservation_create(
++                context, uuidutils.generate_uuid(), usages[name],
++                resource.project_id, name, -delta,
++                timeutils.utcnow() + datetime.timedelta(hours=1))
++            ids.append(row.uuid)
++        api.reservation_commit(context, ids, project_id=resource.project_id)
++        journal['release_reservations'] = ids
++    journal['released'] = True
++    source.quota_reservations_json = json.dumps(journal, sort_keys=True)
++    snapshot = _query(context, models.Snapshot).filter_by(
++        id=resource.snapshot_id).first()
++    if snapshot:
++        snapshot.use_quota = False
++
++
++@api.require_context
++@api.main_context_manager.writer
++def cleanup(context, operation_id, generation):
++    operation, instance, volumes = _locked_operation(
++        context, operation_id, generation)
++    if operation.status == 'released':
++        return _as_dict(context, operation)
++    if operation.kind != 'create':
++        _conflict('cleanup_only_for_create')
++    steps = _steps(context, operation_id)
++    originals = [s for s in steps if s.phase == 'snapshot']
++    if any(s.status in ('dispatching', 'pending', 'unknown')
++           for s in originals):
++        _conflict('create_outcome_unknown')
++    resources = {r.id: r for r in _resources(
++        context, operation.checkpoint_id, lock=True)}
++    for step in originals:
++        resource = resources[step.resource_id]
++        if step.status in ('prepared', 'failed_no_effect'):
++            step.status = 'failed_no_effect'
++            step.error_code = step.error_code or 'cancelled_before_dispatch'
++            _release_quota(context, resource)
++            resource.status = 'deleted'
++            snapshot = _query(context, models.Snapshot).filter_by(
++                id=resource.snapshot_id).first()
++            if snapshot:
++                snapshot.status = 'deleted'
++                snapshot.deleted = True
++                snapshot.deleted_at = timeutils.utcnow()
++        elif not any(s.resource_id == resource.id and
++                     s.phase == 'delete_snapshot' for s in steps):
++            context.session.add(models.CheckpointStep(
++                id=uuidutils.generate_uuid(), operation_id=operation_id,
++                resource_id=resource.id, phase='delete_snapshot',
++                generation=generation, status='prepared',
++                quota_reservations_json='[]',
++                original_attachment_ids_json=(
++                    step.original_attachment_ids_json)))
++    context.session.flush()
++    _update_operation(context, operation)
++    return _as_dict(context, operation)
++
++
++@api.require_admin_context
++@api.main_context_manager.reader
++def pending(context, host):
++    step = models.CheckpointStep
++    operation = models.CheckpointOperation
++    resource = models.CheckpointResource
++    volume = models.Volume
++    query = context.session.query(step, operation).join(
++        operation, operation.id == step.operation_id).join(
++            resource, resource.id == step.resource_id).join(
++                volume, volume.id == resource.volume_id)
++    query = query.filter(
++        operation.status != 'released',
++        step.status.in_(('dispatching', 'pending', 'unknown')),
++        api._filter_host(volume.host, host))
++    return [dict(step_id=step.id, generation=step.generation,
++                 **{key: getattr(operation, key) for key in IDENTITY})
++            for step, operation in query.all()]
++
++
+ def _scope(context, operation_id, generation, volume_id, action,
+            attachment_id=None, instance_uuid=None):
+     from cinder.checkpoints import guards
+diff --git a/cinder/tests/unit/checkpoints/test_db.py b/cinder/tests/unit/checkpoints/test_db.py
+index 44a9e3d..c958e4a 100644
+--- a/cinder/tests/unit/checkpoints/test_db.py
++++ b/cinder/tests/unit/checkpoints/test_db.py
+@@ -26,6 +26,7 @@ from cinder.db import migration
+ from cinder.db.sqlalchemy import api as sqla_api
+ from cinder.db.sqlalchemy import models
+ from cinder import exception
++from cinder import quota
+ from cinder.tests.unit.checkpoints.test_contracts import supported_capabilities
+ from cinder.tests.unit import fake_constants as fake
+ from cinder.tests.unit import test
+@@ -227,6 +228,32 @@ class CheckpointDBTests(CheckpointDBHelpers):
+             self.assertEqual(1, len(json.loads(
+                 step['original_attachment_ids_json'])))
+ 
++    def test_snapshot_quota_commit_and_delete_are_exactly_once(self):
++        self.prepare_volumes()
++        values = self.values()
++        values['quota_reservations'] = {}
++        values['quota_deltas'] = {}
++        for volume_id in self.volumes:
++            deltas = {'snapshots': 1, 'gigabytes': 1}
++            values['quota_reservations'][volume_id] = quota.QUOTAS.reserve(
++                self.ctxt, **deltas)
++            values['quota_deltas'][volume_id] = deltas
++        created = self.reserve(values)
++        self.succeed(created)
++        db.checkpoint_release(self.ctxt, created['id'], 1, 'commit')
++        usage = db.quota_usage_get_all_by_project(
++            self.ctxt.elevated(), self.ctxt.project_id)
++        self.assertEqual(2, usage['snapshots']['in_use'])
++        deletion = self.reserve(self.values('delete', created['checkpoint_id']))
++        self.succeed(deletion)
++        db.checkpoint_release(self.ctxt, deletion['id'], 1, 'commit')
++        db.checkpoint_release(self.ctxt, deletion['id'], 1, 'commit')
++        usage = db.quota_usage_get_all_by_project(
++            self.ctxt.elevated(), self.ctxt.project_id)
++        self.assertEqual(0, usage['snapshots']['in_use'])
++        self.assertEqual(0, usage['snapshots']['reserved'])
++        self.assertEqual([], self.locks())
++
+     def test_partial_revert_cannot_release(self):
+         self.prepare_volumes()
+         created = self.reserve()
+diff --git a/cinder/tests/unit/checkpoints/test_recovery.py b/cinder/tests/unit/checkpoints/test_recovery.py
+new file mode 100644
+index 0000000..ee8a710
+--- /dev/null
++++ b/cinder/tests/unit/checkpoints/test_recovery.py
+@@ -0,0 +1,226 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import datetime
++from unittest import mock
++
++from oslo_utils import timeutils
++from oslo_utils import uuidutils
++
++from cinder.checkpoints import manager
++from cinder import context
++from cinder import db
++from cinder.db.sqlalchemy import api as sqla_api
++from cinder.db.sqlalchemy import models
++from cinder import exception
++from cinder import objects
++from cinder.tests.unit.checkpoints import test_manager
++from cinder.tests.unit import test
++from cinder.volume import manager as volume_manager
++
++
++class TestRecovery(test_manager.ManagerHelpers, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_manager()
++        self.rpc.execute_checkpoint_step.side_effect = (
++            lambda ctxt, step, gen, host: self.manager.execute(
++                ctxt, step, gen))
++        self.rpc.reconcile_checkpoint_step.side_effect = (
++            lambda ctxt, step, gen, host: self.manager.reconcile(
++                ctxt, step, gen))
++
++    def test_restart_after_native_effect_only_queries(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.driver.outcomes['snapshot'].append(RuntimeError('secret'))
++        self.execute(operation)
++        restarted = manager.CheckpointManager(self.owner)
++        restarted.recover_pending(context.get_admin_context())
++        self.assertEqual(2, self.driver.native_call_count)
++        self.assertEqual(1, len(self.driver.query_calls))
++        self.assertEqual('succeeded', self.read(operation).status)
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++    def test_disable_retains_guards_and_recovery(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.driver.outcomes['snapshot'].append({'status': 'pending'})
++        self.execute(operation)
++        self.flags(enabled=False, group='checkpoint')
++        self.manager.recover_pending(context.get_admin_context())
++        self.assertEqual('succeeded', self.read(operation).status)
++        self.assertRaises(exception.CheckpointConflict, db.volume_update,
++                          self.ctxt, self.volumes[0], {'status': 'available'})
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++    def test_claim_without_effect_never_dispatches_during_recovery(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        db.checkpoint_step_claim(self.ctxt, operation.steps[0].id, 1,
++                                 self.owner.host)
++        self.manager.recover_pending(context.get_admin_context())
++        self.assertEqual(0, self.driver.native_call_count)
++        self.assertEqual('recovery_required', self.read(operation).status)
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++    def test_cleanup_is_repeatable_and_releases_quota_once(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.driver.outcomes['snapshot'].extend([
++            {'status': 'succeeded'}, {'status': 'failed_no_effect'}])
++        self.execute(operation)
++        self.api.action(self.ctxt, operation.id, 'cleanup', 1)
++        self.api.action(self.ctxt, operation.id, 'cleanup', 1)
++        self.assertEqual(3, self.driver.native_call_count)
++        self.assertEqual({}, self.driver.snapshots)
++        self.assertEqual(0, self.usage()['snapshots']['in_use'])
++        self.api.action(self.ctxt, operation.id, 'release', 1, 'abort')
++        self.api.action(self.ctxt, operation.id, 'release', 1, 'abort')
++        self.assertEqual(0, self.usage()['snapshots']['in_use'])
++        self.assertEqual([], self.locks())
++        self.assertEqual(operation.id,
++                         self.api.reserve(self.ctxt, self.payload).id)
++
++    def test_cleanup_unknown_result_queries_without_second_delete(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.execute(operation)
++        self.driver.outcomes['delete_snapshot'].append(RuntimeError('lost'))
++        self.api.action(self.ctxt, operation.id, 'cleanup', 1)
++        self.api.action(self.ctxt, operation.id, 'cleanup', 1)
++        self.assertEqual(4, self.driver.native_call_count)
++        self.assertRaises(exception.CheckpointConflict, self.api.action,
++                          self.ctxt, operation.id, 'release', 1, 'abort')
++        self.manager.recover_pending(context.get_admin_context())
++        self.api.action(self.ctxt, operation.id, 'release', 1, 'abort')
++        self.assertEqual(4, self.driver.native_call_count)
++        self.assertEqual(0, self.usage()['snapshots']['in_use'])
++
++    def test_unknown_create_forbids_cleanup(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.driver.outcomes['snapshot'].append(RuntimeError('lost'))
++        self.execute(operation)
++        self.assertRaises(exception.CheckpointConflict, self.api.action,
++                          self.ctxt, operation.id, 'cleanup', 1)
++        self.assertEqual(2, self.driver.native_call_count)
++        self.assertEqual(2, self.usage()['snapshots']['in_use'])
++
++    def test_abort_before_effect_releases_snapshot_and_gb_quota(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        charged_gb = self.usage()['gigabytes']['in_use']
++        self.flags(no_snapshot_gb_quota=True)
++        self.api.action(self.ctxt, operation.id, 'release', 1, 'abort')
++        self.assertEqual(0, self.usage()['snapshots']['in_use'])
++        self.assertEqual(charged_gb - 2, self.usage()['gigabytes']['in_use'])
++        self.assertEqual(0, self.driver.native_call_count)
++
++    def test_cleanup_cancels_prepared_steps(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.manager.execute(self.ctxt, operation.steps[0].id, 1)
++        self.api.action(self.ctxt, operation.id, 'cleanup', 1)
++        self.execute(operation)
++        self.assertEqual(2, self.driver.native_call_count)
++        self.api.action(self.ctxt, operation.id, 'release', 1, 'abort')
++        self.assertEqual(0, self.usage()['snapshots']['in_use'])
++
++    def test_delete_releases_only_its_checkpoint_quota(self):
++        first = self.available_checkpoint()
++        self.payload.update(request_id=uuidutils.generate_uuid(),
++                            checkpoint_id=uuidutils.generate_uuid())
++        second = self.available_checkpoint()
++        self.payload.update(kind='delete',
++                            request_id=uuidutils.generate_uuid(),
++                            checkpoint_id=first.checkpoint_id)
++        deletion = self.api.reserve(self.ctxt, self.payload)
++        self.execute(deletion)
++        self.api.action(self.ctxt, deletion.id, 'release', 1, 'commit')
++        self.assertEqual(2, self.usage()['snapshots']['in_use'])
++        self.assertEqual({r.snapshot_id for r in second.resources},
++                         set(self.driver.snapshots))
++        self.api.action(self.ctxt, deletion.id, 'execute', 1)
++        self.assertEqual(6, self.driver.native_call_count)
++
++    def test_quota_failure_rolls_back_and_recovers_by_query(self):
++        self.available_checkpoint()
++        self.payload.update(kind='delete',
++                            request_id=uuidutils.generate_uuid())
++        operation = self.api.reserve(self.ctxt, self.payload)
++        original_commit = sqla_api.reservation_commit
++
++        def commit_then_fail(*args, **kwargs):
++            original_commit(*args, **kwargs)
++            raise RuntimeError('simulated DB failure before journal commit')
++
++        with mock.patch.object(sqla_api, 'reservation_commit',
++                               side_effect=commit_then_fail):
++            self.assertRaises(RuntimeError, self.manager.execute,
++                              self.ctxt, operation.steps[0].id, 1)
++        self.assertEqual(2, self.usage()['snapshots']['in_use'])
++        self.assertEqual('dispatching', next(
++            s for s in self.read(operation).steps
++            if s.id == operation.steps[0].id).status)
++        self.manager.recover_pending(context.get_admin_context())
++        self.assertEqual(1, self.usage()['snapshots']['in_use'])
++        self.assertEqual(3, self.driver.native_call_count)
++        self.manager.recover_pending(context.get_admin_context())
++        self.assertEqual(1, self.usage()['snapshots']['in_use'])
++
++    def test_released_tombstone_survives_ordinary_purge(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.api.action(self.ctxt, operation.id, 'release', 1, 'abort')
++        old = timeutils.utcnow() - datetime.timedelta(days=30)
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            self.ctxt.session.query(models.Snapshot).filter_by(
++                deleted=True).update({'deleted_at': old})
++        db.purge_deleted_rows(self.ctxt.elevated(), 1)
++        self.assertEqual(operation.id,
++                         self.api.reserve(self.ctxt, self.payload).id)
++        self.assertEqual(0, self.usage()['snapshots']['in_use'])
++        self.assertEqual(0, self.driver.native_call_count)
++
++    def test_partial_revert_cannot_release(self):
++        self.available_checkpoint()
++        self.payload.update(kind='revert',
++                            request_id=uuidutils.generate_uuid())
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.detach_for_worker_test()
++        self.driver.outcomes['revert'].append(RuntimeError('lost'))
++        self.execute(operation)
++        self.assertRaises(exception.CheckpointConflict, self.api.action,
++                          self.ctxt, operation.id, 'release', 1, 'abort')
++        self.assertRaises(exception.CheckpointConflict, self.api.action,
++                          self.ctxt, operation.id, 'cleanup', 1)
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++    def test_expired_wait_does_not_unlock_and_purge_retains_journal(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.driver.outcomes['snapshot'].append({'status': 'pending'})
++        self.execute(operation)
++        pending = next(s for s in self.read(operation).steps
++                       if s.status == 'pending')
++        self.driver.query_results[pending.id] = {'status': 'unknown'}
++        yesterday = timeutils.utcnow() - datetime.timedelta(days=30)
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            for model in (models.CheckpointOperation, models.CheckpointStep):
++                self.ctxt.session.query(model).update(
++                    {'created_at': yesterday, 'updated_at': yesterday})
++        db.purge_deleted_rows(self.ctxt.elevated(), 1)
++        self.manager.recover_pending(context.get_admin_context())
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++        self.assertEqual('recovery_required', self.read(operation).status)
++
++    def test_legacy_cleanup_does_not_change_checkpoint_snapshot(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        snapshot = objects.Snapshot.get_by_id(
++            self.ctxt, operation.resources[0].snapshot_id)
++        vm = volume_manager.VolumeManager(host=self.owner.host)
++        vm.driver = self.driver
++        vm._do_cleanup(self.ctxt.elevated(), snapshot)
++        self.assertEqual('creating', objects.Snapshot.get_by_id(
++            self.ctxt, snapshot.id).status)
++        self.assertEqual(0, self.driver.native_call_count)
+diff --git a/cinder/tests/unit/volume/test_init_host.py b/cinder/tests/unit/volume/test_init_host.py
+index 0e6894e..c44be51 100644
+--- a/cinder/tests/unit/volume/test_init_host.py
++++ b/cinder/tests/unit/volume/test_init_host.py
+@@ -20,6 +20,7 @@ from unittest import mock
+ from oslo_config import cfg
+ from oslo_utils import importutils
+ 
++from cinder.checkpoints import manager as checkpoint_manager
+ from cinder import context
+ from cinder import exception
+ from cinder import objects
+@@ -39,6 +40,22 @@ class VolumeInitHostTestCase(base.BaseVolumeTestCase):
+         super(VolumeInitHostTestCase, self).setUp()
+         self.service_id = 1
+ 
++    @mock.patch('cinder.manager.CleanableManager.init_host')
++    def test_checkpoint_recovery_before_cleanup(self, clean):
++        def recover(ctxt):
++            self.assertTrue(self.volume.driver.initialized)
++            clean.assert_not_called()
++
++        with mock.patch.object(checkpoint_manager.CheckpointManager,
++                               'recover_pending', side_effect=recover) as call:
++            self.volume.init_host(service_id=self.service_id)
++            call.assert_called_once()
++        clean.assert_called_once()
++        with mock.patch.object(checkpoint_manager.CheckpointManager,
++                               'recover_pending') as call:
++            self.volume._reconcile_checkpoints(self.context)
++            call.assert_called_once_with(self.context)
++
+     @mock.patch('cinder.manager.CleanableManager.init_host')
+     def test_init_host_count_allocated_capacity(self, init_host_mock):
+         vol0 = tests_utils.create_volume(
+diff --git a/cinder/volume/manager.py b/cinder/volume/manager.py
+index 4997666..82657f1 100644
+--- a/cinder/volume/manager.py
++++ b/cinder/volume/manager.py
+@@ -58,6 +58,7 @@ import requests
+ from taskflow import exceptions as tfe
+ 
+ from cinder.backup import rpcapi as backup_rpcapi
++from cinder.checkpoints import config as checkpoint_config
+ from cinder.checkpoints import guards as checkpoint_guards
+ from cinder.checkpoints import manager as checkpoint_manager
+ from cinder.common import constants
+@@ -438,12 +439,31 @@ class VolumeManager(manager.CleanableManager,
+             LOG.info("Determined volume DB was not empty at startup.")
+             return False
+ 
++    def _checkpoint_protected(self, ctxt, resource):
++        try:
++            if isinstance(resource, objects.Snapshot):
++                checkpoint_guards.check_snapshot(ctxt, resource, 'mutate')
++            else:
++                checkpoint_guards.check_volume(ctxt, resource, 'mutate')
++        except exception.CheckpointConflict:
++            return True
++        return False
++
++    @periodic_task.periodic_task(
++        spacing=checkpoint_config.CONF.checkpoint.reconcile_interval)
++    def _reconcile_checkpoints(self, ctxt):
++        checkpoint_manager.CheckpointManager(self).recover_pending(ctxt)
++
+     def _sync_provider_info(self, ctxt, volumes, snapshots) -> None:
+         # NOTE(jdg): For now this just updates provider_id, we can add more
+         # items to the update if they're relevant but we need to be safe in
+         # what we allow and add a list of allowed keys.  Things that make sense
+         # are provider_*, replication_status etc
+ 
++        volumes = [v for v in volumes
++                   if not self._checkpoint_protected(ctxt, v)]
++        snapshots = [s for s in snapshots
++                     if not self._checkpoint_protected(ctxt, s)]
+         updates, snapshot_updates = self.driver.update_provider_info(
+             volumes, snapshots)
+ 
+@@ -608,7 +628,8 @@ class VolumeManager(manager.CleanableManager,
+                         self._count_allocated_capacity(ctxt, volume)
+ 
+                         try:
+-                            if volume['status'] in ['in-use']:
++                            if (volume['status'] in ['in-use'] and not
++                                    self._checkpoint_protected(ctxt, volume)):
+                                 self.driver.ensure_export(ctxt, volume)
+                         except Exception:
+                             LOG.exception("Failed to re-export volume, "
+@@ -636,6 +657,7 @@ class VolumeManager(manager.CleanableManager,
+         # NOTE(jdg): Careful though because that doesn't mean
+         # that an entry exists in the service table
+         self.driver.set_initialized()
++        checkpoint_manager.CheckpointManager(self).recover_pending(ctxt)
+ 
+         # Keep the image tmp file clean when init host.
+         backend_name = volume_utils.extract_host(self.service_topic_queue)
+@@ -705,6 +727,8 @@ class VolumeManager(manager.CleanableManager,
+     def _do_cleanup(self,
+                     ctxt: context.RequestContext,
+                     vo_resource: 'objects.base.CinderObject') -> bool:
++        if self._checkpoint_protected(ctxt, vo_resource):
++            return True
+         if isinstance(vo_resource, objects.Volume):
+             if vo_resource.status == 'downloading':
+                 self.driver.clear_download(ctxt, vo_resource)

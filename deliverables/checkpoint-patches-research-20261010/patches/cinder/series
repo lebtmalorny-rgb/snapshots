@@ -1,0 +1,17 @@
+c1/0001-feat-define-native-Cinder-checkpoint-driver-contract.patch
+c1/0002-feat-persist-checkpoint-operations-and-resource-rese.patch
+c1/0003-feat-guard-checkpoint-resources-across-Cinder-mutati.patch
+c1/0004-feat-expose-authenticated-checkpoint-reservation-API.patch
+c1/0005-feat-execute-and-reconcile-native-checkpoint-steps-o.patch
+c1/0006-feat-authorize-checkpoint-scoped-volume-reconnection.patch
+c1/0007-feat-recover-interrupted-checkpoint-operations-witho.patch
+c1/0008-style-wrap-checkpoint-quota-regression-test-line.patch
+c1/0009-test-cover-and-document-the-Cinder-checkpoint-contra.patch
+c1/0010-fix-close-checkpoint-worker-and-quota-admission-race.patch
+c11/0001-feat-define-scoped-checkpoint-continuation-contract.patch
+c11/0002-feat-persist-checkpoint-continuation-grants-atomical.patch
+c11/0003-feat-expose-restricted-checkpoint-continuation-API.patch
+c11/0004-feat-journal-checkpoint-attachment-requests.patch
+c11/0005-feat-enforce-checkpoint-continuation-at-worker-bound.patch
+c11/0006-test-verify-checkpoint-continuation-lifecycle-and-au.patch
+c11/0007-fix-preserve-checkpoint-abort-protection-and-continu.patch

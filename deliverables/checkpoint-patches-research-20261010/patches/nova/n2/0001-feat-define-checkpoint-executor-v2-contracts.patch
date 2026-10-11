@@ -1,0 +1,1291 @@
+From 028d25864302ed26c5ffce0ce3347b7399e9137f Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 18:10:46 +0300
+Subject: [PATCH 01/10] feat: define checkpoint executor v2 contracts
+
+---
+ nova/checkpoints/compute.py                   |  58 +++
+ nova/checkpoints/contracts_v2.py              | 401 ++++++++++++++++++
+ nova/checkpoints/coordinator.py               |  40 ++
+ nova/checkpoints/workflow_v2.py               |  39 ++
+ nova/compute/manager.py                       |  10 +-
+ nova/compute/rpcapi.py                        |  14 +-
+ nova/conductor/api.py                         |   6 +
+ nova/conductor/manager.py                     |   8 +-
+ nova/conductor/rpcapi.py                      |  14 +-
+ nova/conf/checkpoint.py                       |  10 +
+ nova/objects/service.py                       |   4 +-
+ .../unit/checkpoints/test_contracts_v2.py     | 316 ++++++++++++++
+ nova/tests/unit/checkpoints/test_rpc.py       |   6 +-
+ nova/virt/driver.py                           |  13 +
+ nova/virt/libvirt/checkpoints/__init__.py     |  13 +
+ nova/virt/libvirt/checkpoints/profiles.py     |  92 ++++
+ 16 files changed, 1032 insertions(+), 12 deletions(-)
+ create mode 100644 nova/checkpoints/contracts_v2.py
+ create mode 100644 nova/checkpoints/workflow_v2.py
+ create mode 100644 nova/tests/unit/checkpoints/test_contracts_v2.py
+ create mode 100644 nova/virt/libvirt/checkpoints/__init__.py
+ create mode 100644 nova/virt/libvirt/checkpoints/profiles.py
+
+diff --git a/nova/checkpoints/compute.py b/nova/checkpoints/compute.py
+index c18030242966d6e6087ef4333c59e9d265c0b1d7..e80024267bb0bb9e240ed563e0decd336e1f9980 100644
+--- a/nova/checkpoints/compute.py
++++ b/nova/checkpoints/compute.py
+@@ -13,6 +13,7 @@
+ """Compute journal consumer using remotable Nova objects for persistence."""
+ 
+ from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
+ from nova.checkpoints import guards
+ from nova.checkpoints import workflow
+ from nova import conf
+@@ -25,6 +26,63 @@ class ComputeExecutor:
+         self.driver = driver
+         self.host = host
+ 
++    @staticmethod
++    def check_probe_binding(context, instance, purpose, checkpoint_id,
++                            operation_id):
++        c._require(purpose in ('create', 'revert', 'delete', 'recover'))
++        c._require(context.project_id == instance.project_id)
++        if purpose in ('revert', 'delete'):
++            c._uuid(checkpoint_id)
++        if purpose == 'recover':
++            c._uuid(operation_id)
++        if operation_id is not None:
++            c._uuid(operation_id)
++            operation = objects.InstanceCheckpointOperation.get_by_uuid(
++                context, operation_id)
++            c._require(operation.instance_uuid == instance.uuid and
++                        operation.project_id == instance.project_id and
++                        operation.host == instance.host and
++                        operation.node == instance.node)
++            if checkpoint_id is not None:
++                c._require(checkpoint_id == operation.checkpoint_id)
++            checkpoint_id = operation.checkpoint_id
++        if checkpoint_id is not None:
++            c._uuid(checkpoint_id)
++            checkpoint = objects.InstanceCheckpoint.get_by_uuid(
++                context, checkpoint_id)
++            c._require(checkpoint.instance_uuid == instance.uuid and
++                        checkpoint.project_id == instance.project_id)
++            if purpose == 'revert' and operation_id is None:
++                c._require(checkpoint.status == 'available')
++
++    def probe_v2(self, context, instance, manifest, purpose,
++                 checkpoint_id=None, operation_id=None):
++        if operation_id is None and not conf.CONF.checkpoint.enabled:
++            return v2.unsupported('disabled')
++        try:
++            self.check_probe_binding(context, instance, purpose, checkpoint_id,
++                                     operation_id)
++            c._require(instance.host == self.host and
++                        manifest.get('host') == self.host and
++                        manifest.get('node') == instance.node and
++                        manifest.get('instance_uuid') == instance.uuid)
++            current = objects.InstanceCheckpointOperation.device_manifest(
++                context, instance.uuid)
++            c._require(c.device_fingerprint(current) ==
++                        c.device_fingerprint(manifest))
++            value = self.driver.checkpoint_probe_v2(
++                context, instance, current, purpose,
++                checkpoint_id=checkpoint_id, operation_id=operation_id)
++            probe = v2.validate_probe(value)
++            if probe.supported and probe.fingerprint != (
++                    c.device_fingerprint(current)):
++                return v2.unsupported('identity_changed')
++            return probe
++        except (ValueError, exception.NotFound, exception.CheckpointConflict):
++            return v2.unsupported('identity_changed')
++        except Exception:
++            return v2.unsupported('executor_unavailable')
++
+     def probe(self, context, instance, manifest, existing=False):
+         if not existing and not conf.CONF.checkpoint.enabled:
+             return c.unsupported('disabled')
+diff --git a/nova/checkpoints/contracts_v2.py b/nova/checkpoints/contracts_v2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7716fd8c600e094275eeddcaeea712518d6f2eb
+--- /dev/null
++++ b/nova/checkpoints/contracts_v2.py
+@@ -0,0 +1,401 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Strict v2 shapes. Only the cell journal can establish effect authority."""
++
++from collections.abc import Mapping
++import dataclasses
++import re
++
++from nova.checkpoints import contracts as v1
++from nova.checkpoints import workflow_v2 as workflow
++
++REASONS = v1.REASONS | frozenset(('store_unavailable', 'profile_unverified',
++                                 'authorization_required', 'artifact_corrupt'))
++
++
++def validate_generation(value):
++    v1._integer(value, minimum=1, maximum=1)
++
++
++def public_reason(value):
++    return {'store_unavailable': 'executor_unavailable',
++            'profile_unverified': 'unsupported_profile',
++            'authorization_required': 'recovery_required',
++            'artifact_corrupt': 'recovery_required'}.get(
++                value, v1.reason_code(value))
++
++
++def _safe_payload(value):
++    if isinstance(value, Mapping):
++        forbidden = {'xml', 'saved_xml', 'connection_info', 'auth_token',
++                     'user_token', 'password', 'auth_password', 'secret',
++                     'ram_path', 'path', 'bearer', 'connector'}
++        v1._require(not (set(value) & forbidden))
++        for item in value.values():
++            _safe_payload(item)
++    elif isinstance(value, (tuple, list)):
++        for item in value:
++            _safe_payload(item)
++
++
++class _Contract(v1._Contract):
++    def to_primitive(self):
++        value = super().to_primitive()
++        value['schema_version'] = 2
++        return value
++
++    @classmethod
++    def from_primitive(cls, value):
++        names = {field.name for field in dataclasses.fields(cls)}
++        v1._keys(value, names | {'schema_version'})
++        v1._integer(value['schema_version'], minimum=2, maximum=2)
++        values = {key: v1._json(value[key]) for key in names}
++        if cls is AdmissionV2:
++            values['key'] = v1.RequestKey.from_primitive(values['key'])
++        return cls(**values)
++
++
++@dataclasses.dataclass(frozen=True)
++class Binding(_Contract):
++    deployment_id: str
++    cell_uuid: str
++    project_id: str
++    instance_uuid: str
++    checkpoint_id: str
++    host: str
++    node: str
++    executor_id: str
++    db_fingerprint: str
++    runtime_fingerprint: str
++    runtime_profile_id: str
++    store_profile_id: str
++    staging_profile_id: str
++
++    def _validate(self):
++        for name in ('deployment_id', 'cell_uuid', 'instance_uuid',
++                     'checkpoint_id', 'runtime_profile_id',
++                     'store_profile_id', 'staging_profile_id'):
++            v1._uuid(getattr(self, name))
++        for name in ('project_id', 'host', 'node', 'executor_id'):
++            v1._string(getattr(self, name))
++        v1._digest(self.db_fingerprint)
++        v1._digest(self.runtime_fingerprint)
++
++
++@dataclasses.dataclass(frozen=True)
++class ArtifactRef(_Contract):
++    id: str
++    kind: str
++    logical_id: str
++    bytes: int
++    checksum: str
++    location: str
++
++    def _validate(self):
++        v1._uuid(self.id)
++        v1._require(self.kind in ('ram', 'runtime', 'config'))
++        v1._require(self.location in ('staging', 'shared'))
++        v1._require(type(self.logical_id) is str and re.fullmatch(
++            '[A-Za-z0-9_-]{1,255}', self.logical_id))
++        v1._integer(self.bytes, minimum=1)
++        v1._digest(self.checksum)
++
++
++@dataclasses.dataclass(frozen=True)
++class ProbeV2(_Contract):
++    supported: bool
++    reasons: tuple
++    executor_id: str
++    executor_profile: str
++    fingerprint: str
++    device_manifest: dict
++    artifact_upper_bound: int
++    runtime_fingerprint: str
++    runtime_profile_id: str
++    store_profile_id: str
++    staging_profile_id: str
++    save_bytes_limit: int
++    restore_bytes_limit: int
++    contract_version: int = 2
++
++    def _validate(self):
++        v1._require(type(self.supported) is bool)
++        v1._require(type(self.reasons) is tuple and all(
++            type(code) is str and code in REASONS for code in self.reasons))
++        v1._integer(self.contract_version, minimum=2, maximum=2)
++        identities = ('executor_id', 'executor_profile', 'fingerprint',
++                      'runtime_fingerprint', 'runtime_profile_id',
++                      'store_profile_id', 'staging_profile_id')
++        if self.supported:
++            v1._require(not self.reasons)
++            v1._string(self.executor_id)
++            v1._require(self.executor_profile == v1.PROFILE)
++            v1._require(self.fingerprint == v1.device_fingerprint(
++                self.device_manifest))
++            v1._digest(self.runtime_fingerprint)
++            for name in identities[-3:]:
++                v1._uuid(getattr(self, name))
++            for name in ('artifact_upper_bound', 'save_bytes_limit',
++                         'restore_bytes_limit'):
++                v1._integer(getattr(self, name), minimum=1)
++            v1._require(self.artifact_upper_bound >= self.save_bytes_limit)
++        else:
++            v1._require(bool(self.reasons))
++            v1._require(all(getattr(self, key) == '' for key in identities))
++            v1._require(isinstance(self.device_manifest, Mapping) and
++                        not self.device_manifest)
++            for name in ('artifact_upper_bound', 'save_bytes_limit',
++                         'restore_bytes_limit'):
++                v1._integer(getattr(self, name), maximum=0)
++
++
++def unsupported(reason='executor_unsupported'):
++    reason = reason if type(reason) is str and reason in REASONS else (
++        'invalid_executor_result')
++    return ProbeV2(False, (reason,), '', '', '', {}, 0, '', '', '', '', 0, 0)
++
++
++def validate_probe(value):
++    try:
++        return ProbeV2.from_primitive(value)
++    except (ValueError, TypeError, KeyError, AttributeError):
++        return unsupported('invalid_executor_result')
++
++
++@dataclasses.dataclass(frozen=True)
++class AdmissionV2(_Contract):
++    key: v1.RequestKey
++    operation_id: str
++    checkpoint_id: str
++    cell_uuid: str
++    host: str
++    node: str
++    fingerprint: str
++    device_manifest: dict
++    artifact_upper_bound: int
++    executor_id: str
++    name: str
++    runtime_fingerprint: str
++    runtime_profile_id: str
++    store_profile_id: str
++    staging_profile_id: str
++    save_bytes_limit: int
++    restore_bytes_limit: int
++
++    def _validate(self):
++        v1.Admission._validate(self)
++        v1._digest(self.runtime_fingerprint)
++        for name in ('runtime_profile_id', 'store_profile_id',
++                     'staging_profile_id'):
++            v1._uuid(getattr(self, name))
++        for name in ('save_bytes_limit', 'restore_bytes_limit'):
++            v1._integer(getattr(self, name), minimum=1)
++        v1._require(self.artifact_upper_bound >= self.save_bytes_limit)
++
++
++def decode_admission(value):
++    v1._require(isinstance(value, Mapping))
++    version = value.get('schema_version')
++    v1._integer(version, minimum=1, maximum=2)
++    cls = v1.Admission if version == 1 else AdmissionV2
++    return cls.from_primitive(value)
++
++
++@dataclasses.dataclass(frozen=True)
++class ChildIntent(_Contract):
++    id: str
++    parent_step_id: str
++    operation_id: str
++    generation: int
++    action: str
++    resource_id: str
++    executor_id: str
++    payload_hash: str
++    payload: dict
++
++    def _validate(self):
++        for name in ('id', 'parent_step_id', 'operation_id', 'resource_id'):
++            v1._uuid(getattr(self, name))
++        validate_generation(self.generation)
++        v1._require(self.action in workflow.ACTIONS)
++        v1._string(self.executor_id)
++        v1._digest(self.payload_hash)
++        v1._require(
++            self.payload_hash == v1.canonical_payload_hash(self.payload))
++        _safe_payload(self.payload)
++
++
++@dataclasses.dataclass(frozen=True)
++class StepIntentV2(_Contract):
++    id: str
++    operation_id: str
++    generation: int
++    phase: str
++    executor_id: str
++    payload_hash: str
++    payload: dict
++
++    def _validate(self):
++        v1._uuid(self.id)
++        v1._uuid(self.operation_id)
++        validate_generation(self.generation)
++        v1._require(self.phase in workflow.PHASES)
++        v1._string(self.executor_id)
++        v1._digest(self.payload_hash)
++        v1._require(
++            self.payload_hash == v1.canonical_payload_hash(self.payload))
++        _safe_payload(self.payload)
++        v1._keys(self.payload, ('binding', 'kind', 'generation', 'budgets',
++                               'children', 'prior', 'resources'))
++        Binding.from_primitive(self.payload['binding'])
++        v1._require(self.payload['kind'] in ('create', 'revert', 'delete',
++                                            'cleanup'))
++        validate_generation(self.payload['generation'])
++        v1._ids(self.payload['children'])
++
++
++@dataclasses.dataclass(frozen=True)
++class Continuation(_Contract):
++    step_id: str
++    journal_revision: int
++    next_child_id: str
++
++    def _validate(self):
++        v1._uuid(self.step_id)
++        v1._integer(self.journal_revision, minimum=1)
++        v1._uuid(self.next_child_id)
++
++
++@dataclasses.dataclass(frozen=True)
++class TemporaryProof(_Contract):
++    ticket_id: str
++    operation_id: str
++    cell_uuid: str
++    version: int
++    kind: str
++    closed_child_ids: tuple
++
++    def _validate(self):
++        for name in ('ticket_id', 'operation_id', 'cell_uuid'):
++            v1._uuid(getattr(self, name))
++        v1._integer(self.version, minimum=1)
++        v1._require(self.kind in ('cancelled_before_write', 'staging_deleted'))
++        v1._ids(self.closed_child_ids)
++
++
++@dataclasses.dataclass(frozen=True)
++class EffectResult(_Contract):
++    status: str
++    evidence: dict
++    error_code: str | None
++
++    def _validate(self):
++        v1._require(self.status in ('pending', 'succeeded', 'failed_no_effect',
++                                    'failed_with_effects', 'unknown', 'ready'))
++        v1._require(isinstance(self.evidence, Mapping))
++        v1._require(self.error_code is None or (
++            type(self.error_code) is str and self.error_code in REASONS))
++        if self.status in ('succeeded', 'ready'):
++            v1._require(self.error_code is None)
++        _safe_payload(self.evidence)
++
++
++def _artifacts(value, location=None):
++    v1._require(type(value) in (list, tuple) and bool(value))
++    artifacts = [ArtifactRef.from_primitive(item) for item in value]
++    v1._ids([item.id for item in artifacts], nonempty=True)
++    if location:
++        v1._require(all(item.location == location for item in artifacts))
++
++
++def _success(phase, evidence):
++    if phase in ('artifact_publish_shared', 'artifact_stage'):
++        v1._keys(evidence, ('artifacts',))
++        location = (
++            'shared' if phase == 'artifact_publish_shared' else 'staging')
++        _artifacts(evidence['artifacts'], location)
++    elif phase == 'runtime_save':
++        v1._keys(evidence, ('writes_stopped', 'artifacts'))
++        v1._require(evidence['writes_stopped'] is True)
++        _artifacts(evidence['artifacts'], 'staging')
++    elif phase == 'staging_cleanup':
++        v1._keys(evidence, ('artifact_ids', 'deleted_artifact_ids',
++                           'late_effect_impossible'))
++        v1._same_ids(
++            evidence['artifact_ids'], evidence['deleted_artifact_ids'])
++        v1._require(evidence['late_effect_impossible'] is True)
++    else:
++        v1._success_evidence(phase, evidence)
++
++
++def _validate(value, success, parent=False):
++    result = EffectResult.from_primitive(value)
++    evidence = result.evidence
++    if result.status == 'succeeded':
++        success(evidence)
++    elif result.status == 'ready':
++        v1._require(parent)
++        v1._keys(evidence, ('step_id', 'journal_revision', 'next_child_id'))
++        Continuation(**evidence)
++    elif result.status == 'failed_no_effect':
++        v1._keys(evidence, ('no_effect', 'late_effect_impossible'))
++        v1._require(evidence['no_effect'] is True and
++                    evidence['late_effect_impossible'] is True and
++                    result.error_code is not None)
++    elif result.status == 'failed_with_effects':
++        v1._keys(evidence, ('resource_ids', 'terminal_child_ids',
++                           'late_effect_impossible'))
++        v1._ids(evidence['resource_ids'], nonempty=True)
++        v1._ids(evidence['terminal_child_ids'], nonempty=True)
++        v1._require(evidence['late_effect_impossible'] is True and
++                    result.error_code is not None)
++    else:
++        v1._keys(evidence, ())
++    return result
++
++
++def validate_result(phase, value):
++    try:
++        v1._require(phase in workflow.PHASES)
++        return _validate(value, lambda e: _success(phase, e), parent=True)
++    except (ValueError, TypeError, KeyError, AttributeError):
++        return EffectResult('unknown', {}, 'invalid_executor_result')
++
++
++def _child_success(action, evidence):
++    if action in ('restore_paused', 'unpause'):
++        v1._keys(evidence, ('fingerprint', 'power_state'))
++        v1._digest(evidence['fingerprint'])
++        v1._require(evidence['power_state'] == (
++            'PAUSED' if action == 'restore_paused' else 'RUNNING'))
++    elif action in ('save', 'stop', 'reserve', 'release', 'inspect'):
++        _success({'save': 'runtime_save', 'stop': 'runtime_stop',
++                  'reserve': 'cinder_reserve', 'release': 'cinder_release',
++                  'inspect': 'preflight'}[action], evidence)
++    elif action in ('publish', 'download', 'copy_config'):
++        v1._keys(evidence, ('artifact',))
++        artifact = ArtifactRef.from_primitive(evidence['artifact'])
++        v1._require(artifact.location == (
++            'shared' if action == 'publish' else 'staging'))
++    else:
++        # Until the owning adapter defines its closed success shape, a new
++        # action cannot accidentally pass on an empty/opaque success marker.
++        raise ValueError('Unimplemented checkpoint child evidence')
++
++
++def validate_child_result(action, value):
++    try:
++        v1._require(action in workflow.ACTIONS)
++        return _validate(value, lambda e: _child_success(action, e))
++    except (ValueError, TypeError, KeyError, AttributeError):
++        return EffectResult('unknown', {}, 'invalid_executor_result')
+diff --git a/nova/checkpoints/coordinator.py b/nova/checkpoints/coordinator.py
+index ece178cf02d4774cf929b7172154ddf2c0a86a22..1186980ec015134c85c7a1b72266f96100545942 100644
+--- a/nova/checkpoints/coordinator.py
++++ b/nova/checkpoints/coordinator.py
+@@ -12,7 +12,9 @@
+ 
+ """Conductor coordination; cell/RPC/API DB transitions are separate calls."""
+ 
++from nova.checkpoints import compute as checkpoint_compute
+ from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
+ from nova.checkpoints import quota
+ from nova.compute import rpcapi
+ from nova import conf
+@@ -78,6 +80,44 @@ class Coordinator:
+         except Exception:
+             return c.unsupported('executor_unavailable')
+ 
++    def probe_v2(self, context, instance_uuid, purpose, checkpoint_id=None,
++                 operation_id=None):
++        if operation_id is None and not conf.CONF.checkpoint.enabled:
++            return v2.unsupported('disabled')
++        try:
++            cell = self._cell(context, instance_uuid)
++            with nova_context.target_cell(context, cell) as ctx:
++                instance = objects.Instance.get_by_uuid(ctx, instance_uuid)
++                checkpoint_compute.ComputeExecutor.check_probe_binding(
++                    ctx, instance, purpose, checkpoint_id, operation_id)
++                if operation_id is not None:
++                    operation = (
++                        objects.InstanceCheckpointOperation.get_by_uuid(
++                            ctx, operation_id))
++                    c._require(operation.cell_uuid == cell.uuid)
++                service = objects.Service.get_by_host_and_binary(
++                    ctx, instance.host, 'nova-compute')
++                if service.version < 70:
++                    return v2.unsupported('incompatible_service')
++                manifest = objects.InstanceCheckpointOperation.device_manifest(
++                    ctx, instance_uuid)
++                value = self.compute_rpc.checkpoint_probe_v2(
++                    ctx, instance, manifest, purpose,
++                    checkpoint_id=checkpoint_id, operation_id=operation_id)
++                probe = v2.validate_probe(value)
++                if probe.supported and probe.fingerprint != (
++                        c.device_fingerprint(manifest)):
++                    return v2.unsupported('identity_changed')
++                return probe
++        except exception.CheckpointNotSupported:
++            return v2.unsupported('incompatible_service')
++        except exception.CheckpointUnavailable:
++            return v2.unsupported('cell_unavailable')
++        except (ValueError, exception.NotFound, exception.CheckpointConflict):
++            return v2.unsupported('identity_changed')
++        except Exception:
++            return v2.unsupported('executor_unavailable')
++
+     def run(
+         self, context, instance_uuid, operation_id, generation, recovery=False
+     ):
+diff --git a/nova/checkpoints/workflow_v2.py b/nova/checkpoints/workflow_v2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..580d274fccfad5842b6a92cc00942f28f30c2acd
+--- /dev/null
++++ b/nova/checkpoints/workflow_v2.py
+@@ -0,0 +1,39 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""V2 ordering keeps both RAM copies charged until the writer is fenced."""
++
++CREATE = ('preflight', 'cinder_reserve', 'runtime_save', 'disk_snapshot',
++          'artifact_publish_shared', 'runtime_restore_current',
++          'staging_cleanup', 'cinder_release')
++REVERT = ('preflight', 'cinder_reserve', 'artifact_stage', 'runtime_stop',
++          'volume_disconnect', 'disk_revert', 'volume_reconnect',
++          'runtime_restore_checkpoint', 'staging_cleanup', 'cinder_release')
++DELETE = ('cinder_reserve', 'disk_snapshot_delete', 'artifact_delete',
++          'cinder_release')
++CLEANUP = ('cleanup_runtime_restore_current', 'cleanup_disk_snapshots',
++           'cleanup_artifacts', 'staging_cleanup', 'cleanup_cinder_release')
++PHASES = frozenset(CREATE + REVERT + DELETE + CLEANUP)
++ACTIONS = frozenset(('inspect', 'reserve', 'reserve_staging', 'copy_config',
++                     'save', 'submit_disk_operation', 'publish', 'download',
++                     'delete', 'stop', 'restore_paused', 'unpause',
++                     'host_disconnect', 'attachment_delete',
++                     'attachment_create', 'attachment_update', 'host_connect',
++                     'bdm_update', 'attachment_complete', 'release'))
++
++
++def steps_for(kind):
++    try:
++        return {'create': CREATE, 'revert': REVERT, 'delete': DELETE,
++                'cleanup': CLEANUP}[kind]
++    except (KeyError, TypeError):
++        raise ValueError('Invalid checkpoint workflow') from None
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index d4fdc203c2ed4c49b39331749e19b1cd651e1dec..f7a73afb047e1dc00ba37ba235481ce6fb938109 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -622,7 +622,7 @@ class ComputeVirtAPI(virtapi.VirtAPI):
+ class ComputeManager(manager.Manager):
+     """Manages the running instances from creation to destruction."""
+ 
+-    target = messaging.Target(version='6.5')
++    target = messaging.Target(version='6.6')
+ 
+     def __init__(self, compute_driver=None, *args, **kwargs):
+         """Load configuration options and connect to the hypervisor."""
+@@ -12336,6 +12336,14 @@ class ComputeManager(manager.Manager):
+                       "%(profile)s", {'port_id': port_id,
+                                       'profile': profile})
+ 
++    def checkpoint_probe_v2(self, context, instance, manifest, purpose,
++                            checkpoint_id=None, operation_id=None):
++        return checkpoint_compute.ComputeExecutor(
++            self.driver, host=self.host).probe_v2(
++                context, instance, manifest, purpose,
++                checkpoint_id=checkpoint_id,
++                operation_id=operation_id).to_primitive()
++
+     def checkpoint_probe(self, context, instance, manifest, existing=False):
+         return checkpoint_compute.ComputeExecutor(
+             self.driver, host=self.host).probe(
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index 594f7bf19883933cf3cb053272c74ed787441376..d29a8d2ed2e6d7fb58645cc33a01439cea150877 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -408,6 +408,7 @@ class ComputeAPI(object):
+         * 6.3 - Add delete_attachment parameter to remove_volume_connection
+         * 6.4 - Add allow_share() and deny_share()
+         * 6.5 - Add private checkpoint probe, execute and query
++        * 6.6 - Add v2 checkpoint probe and child continuation
+     '''
+ 
+     VERSION_ALIASES = {
+@@ -1587,13 +1588,20 @@ class ComputeAPI(object):
+                                timeout=CONF.long_rpc_timeout)
+         return cctxt.call(ctxt, 'cache_images', image_ids=image_ids)
+ 
+-    def _checkpoint_client(self, context, instance):
++    def _checkpoint_client(self, context, instance, version='6.5'):
+         client = self.router.client(context)
+-        if not client.can_send_version('6.5'):
++        if not client.can_send_version(version):
+             raise exception.CheckpointNotSupported(
+                 reason='incompatible_service')
+         return client.prepare(server=_compute_host(None, instance),
+-                              version='6.5')
++                              version=version)
++
++    def checkpoint_probe_v2(self, context, instance, manifest, purpose,
++                            checkpoint_id=None, operation_id=None):
++        return self._checkpoint_client(context, instance, '6.6').call(
++            context, 'checkpoint_probe_v2', instance=instance,
++            manifest=manifest, purpose=purpose, checkpoint_id=checkpoint_id,
++            operation_id=operation_id)
+ 
+     def checkpoint_probe(self, context, instance, manifest, existing=False):
+         kwargs = {'existing': True} if existing else {}
+diff --git a/nova/conductor/api.py b/nova/conductor/api.py
+index f42e4c511b9b490eae3e559b214d41c5bc49dfa6..f8317d47e1500be9aa692e275c28f9c1c671f052 100644
+--- a/nova/conductor/api.py
++++ b/nova/conductor/api.py
+@@ -189,6 +189,12 @@ class ComputeTaskAPI(object):
+         self.conductor_compute_rpcapi.revert_snapshot_based_resize(
+             ctxt, instance, migration)
+ 
++    def checkpoint_probe_v2(self, context, instance_uuid, purpose,
++                            checkpoint_id=None, operation_id=None):
++        return self.conductor_compute_rpcapi.checkpoint_probe_v2(
++            context, instance_uuid, purpose, checkpoint_id=checkpoint_id,
++            operation_id=operation_id)
++
+     def checkpoint_probe(self, context, instance_uuid, checkpoint_id=None):
+         return self.conductor_compute_rpcapi.checkpoint_probe(
+             context, instance_uuid, checkpoint_id=checkpoint_id)
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index 5492012b4a377d72b3db40d61ac23a47322b552e..3aae6990eae5bb2a8fc999c386f05bd46aeb1da1 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -257,7 +257,7 @@ class ComputeTaskManager:
+     may involve coordinating activities on multiple compute nodes.
+     """
+ 
+-    target = messaging.Target(namespace='compute_task', version='1.26')
++    target = messaging.Target(namespace='compute_task', version='1.27')
+ 
+     def __init__(self):
+         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
+@@ -2253,6 +2253,12 @@ class ComputeTaskManager:
+             context, instance, migration, self.notifier, self.compute_rpcapi)
+         task.execute()
+ 
++    def checkpoint_probe_v2(self, context, instance_uuid, purpose,
++                            checkpoint_id=None, operation_id=None):
++        return checkpoint_coordinator.Coordinator().probe_v2(
++            context, instance_uuid, purpose, checkpoint_id=checkpoint_id,
++            operation_id=operation_id).to_primitive()
++
+     def checkpoint_probe(self, context, instance_uuid, checkpoint_id=None):
+         return checkpoint_coordinator.Coordinator().probe(
+             context, instance_uuid, checkpoint_id=checkpoint_id).to_primitive()
+diff --git a/nova/conductor/rpcapi.py b/nova/conductor/rpcapi.py
+index ea6b90910df81832fc3184d0797e6a8c20280b7b..aae32ae1c010b6a40a5e59b3bbee9b922cb258be 100644
+--- a/nova/conductor/rpcapi.py
++++ b/nova/conductor/rpcapi.py
+@@ -290,6 +290,7 @@ class ComputeTaskAPI(object):
+     1.24 - Add reimage_boot_volume parameter to rebuild_instance()
+     1.25 - Add target_state parameter to rebuild_instance()
+     1.26 - Add private checkpoint probe and run
++    1.27 - Add purpose-aware v2 checkpoint probe
+     """
+ 
+     def __init__(self):
+@@ -498,11 +499,18 @@ class ComputeTaskAPI(object):
+         cctxt = self.client.prepare(version=version)
+         cctxt.cast(ctxt, 'revert_snapshot_based_resize', **kw)
+ 
+-    def _checkpoint_client(self):
+-        if not self.client.can_send_version('1.26'):
++    def _checkpoint_client(self, version='1.26'):
++        if not self.client.can_send_version(version):
+             raise exception.CheckpointNotSupported(
+                 reason='incompatible_service')
+-        return self.client.prepare(version='1.26')
++        return self.client.prepare(version=version)
++
++    def checkpoint_probe_v2(self, context, instance_uuid, purpose,
++                            checkpoint_id=None, operation_id=None):
++        return self._checkpoint_client('1.27').call(
++            context, 'checkpoint_probe_v2', instance_uuid=instance_uuid,
++            purpose=purpose, checkpoint_id=checkpoint_id,
++            operation_id=operation_id)
+ 
+     def checkpoint_probe(self, context, instance_uuid, checkpoint_id=None):
+         kwargs = {} if checkpoint_id is None else {
+diff --git a/nova/conf/checkpoint.py b/nova/conf/checkpoint.py
+index 9f6b75f6d0a04500ca9a94a6d988a0d1140cd6f4..eb0f4e7f77f64db167f384cb1ff58982e4b4e325 100644
+--- a/nova/conf/checkpoint.py
++++ b/nova/conf/checkpoint.py
+@@ -14,6 +14,16 @@ from oslo_config import cfg
+ 
+ checkpoint_group = cfg.OptGroup('checkpoint', title='Instance checkpoints')
+ checkpoint_opts = [
++    cfg.StrOpt('deployment_id', default='',
++               help='Deployment UUID for qualified artifact namespaces.'),
++    cfg.StrOpt('store_root', default='',
++               help='Root of the qualified shared checkpoint filesystem.'),
++    cfg.StrOpt('staging_root', default='',
++               help='Encrypted staging root with enforced filesystem quota.'),
++    cfg.StrOpt('profile_file', default='',
++               help='Root-controlled JSON allowlist of qualified components.'),
++    cfg.IntOpt('max_concurrent_transfers', default=1, min=1,
++               help='Maximum concurrent checkpoint artifact transfers.'),
+     cfg.BoolOpt('enabled', default=False,
+                 help='Allow new checkpoints with a supported executor. '
+                      'Disabling this does not release existing ownership.'),
+diff --git a/nova/objects/service.py b/nova/objects/service.py
+index efd0772e05c940c331ec97c385927b21828b6e1a..acfbfaee9468ea97ba0fb9ade04a11cb1bdef480 100644
+--- a/nova/objects/service.py
++++ b/nova/objects/service.py
+@@ -31,7 +31,7 @@ LOG = logging.getLogger(__name__)
+ 
+ 
+ # NOTE(danms): This is the global service version counter
+-SERVICE_VERSION = 69
++SERVICE_VERSION = 70
+ 
+ 
+ # NOTE(danms): This is our SERVICE_VERSION history. The idea is that any
+@@ -239,6 +239,8 @@ SERVICE_VERSION_HISTORY = (
+     {'compute_rpc': '6.4'},
+     # Version 69: private checkpoint execution RPC 6.5.
+     {'compute_rpc': '6.5'},
++    # Version 70: checkpoint child effects and purpose-aware probe RPC 6.6.
++    {'compute_rpc': '6.6'},
+ )
+ 
+ # This is the version after which we can rely on having a persistent
+diff --git a/nova/tests/unit/checkpoints/test_contracts_v2.py b/nova/tests/unit/checkpoints/test_contracts_v2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c91c6b87ee60e60c43dab366bba29481c62a16a1
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/test_contracts_v2.py
+@@ -0,0 +1,316 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import dataclasses
++import operator
++import os
++import tempfile
++from unittest import mock
++
++from oslo_serialization import jsonutils
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import compute
++from nova.checkpoints import contracts as v1
++from nova.checkpoints import contracts_v2 as v2
++from nova.checkpoints import coordinator
++from nova.checkpoints import workflow_v2
++from nova.compute import rpcapi as compute_rpc
++from nova.conductor import rpcapi as conductor_rpc
++from nova import conf
++from nova import context
++from nova.db.main import api as db_api
++from nova import exception
++from nova import objects
++from nova import test
++from nova.tests.unit.checkpoints import test_cell_db
++from nova.tests.unit.checkpoints import test_contracts
++from nova.virt import driver
++from nova.virt.libvirt.checkpoints import profiles
++
++
++def binding():
++    return dict(deployment_id=uuids.deployment, cell_uuid=uuids.cell,
++                project_id='tenant', instance_uuid=uuids.instance,
++                checkpoint_id=uuids.checkpoint, host='compute', node='node',
++                executor_id='executor', db_fingerprint='a' * 64,
++                runtime_fingerprint='b' * 64, runtime_profile_id=uuids.runtime,
++                store_profile_id=uuids.store, staging_profile_id=uuids.staging)
++
++
++def probe():
++    value = test_contracts.probe()
++    value.update(schema_version=2, contract_version=2,
++                 runtime_fingerprint='b' * 64,
++                 runtime_profile_id=uuids.runtime,
++                 store_profile_id=uuids.store,
++                 staging_profile_id=uuids.staging,
++                 save_bytes_limit=4096, restore_bytes_limit=4096)
++    return value
++
++
++def result(status, evidence, error=None):
++    return dict(schema_version=2, status=status, evidence=evidence,
++                error_code=error)
++
++
++class ContractsV2Test(test.NoDBTestCase):
++    def test_generation_and_closed_ready_evidence(self):
++        good = dict(step_id=uuids.step, journal_revision=1,
++                    next_child_id=uuids.child)
++        self.assertEqual('ready', v2.validate_result(
++            'runtime_save', result('ready', good)).status)
++        for delta in ({'force': True}, {'journal_revision': True},
++                      {'next_child_id': 'bad'}):
++            self.assertEqual('unknown', v2.validate_result(
++                'runtime_save', result('ready', dict(good, **delta))).status)
++        for value in (True, False, 0, 2, '1'):
++            self.assertRaises(ValueError, v2.validate_generation, value)
++        self.assertEqual('unknown', v2.validate_child_result(
++            'save', result('ready', good)).status)
++
++    def test_failed_results_cannot_hide_residues(self):
++        self.assertEqual('failed_no_effect', v2.validate_result(
++            'runtime_save', result('failed_no_effect', dict(
++                no_effect=True, late_effect_impossible=True),
++                'executor_rejected')).status)
++        partial = dict(resource_ids=[uuids.ram],
++                       terminal_child_ids=[uuids.child],
++                       late_effect_impossible=True)
++        self.assertEqual('failed_with_effects', v2.validate_result(
++            'runtime_save', result('failed_with_effects', partial,
++                                   'resources_remaining')).status)
++        for evidence in ({}, dict(partial, late_effect_impossible=False),
++                         dict(partial, resource_ids=[uuids.ram, uuids.ram])):
++            self.assertEqual('unknown', v2.validate_result(
++                'runtime_save', result('failed_with_effects', evidence,
++                                       'resources_remaining')).status)
++        self.assertEqual('unknown', v2.validate_result(
++            'runtime_save', result('unknown', partial)).status)
++
++    def test_restore_child_is_paused_but_parent_must_be_running(self):
++        evidence = dict(fingerprint='a' * 64, power_state='PAUSED')
++        self.assertEqual('succeeded', v2.validate_child_result(
++            'restore_paused', result('succeeded', evidence)).status)
++        self.assertEqual('unknown', v2.validate_result(
++            'runtime_restore_checkpoint', result('succeeded', evidence)
++        ).status)
++
++    def test_publication_does_not_assert_staging_deletion(self):
++        artifact = v2.ArtifactRef(uuids.ram, 'ram', 'a' * 64, 4096,
++                                  'b' * 64, 'shared').to_primitive()
++        self.assertEqual('succeeded', v2.validate_result(
++            'artifact_publish_shared', result(
++                'succeeded', {'artifacts': [artifact]})).status)
++        self.assertEqual('unknown', v2.validate_result(
++            'artifact_publish_shared', result('succeeded', {
++                'artifacts': [artifact], 'staging_deleted': True})).status)
++
++    def test_fingerprints_and_profiles_required_for_supported_probe(self):
++        parsed = v2.validate_probe(probe())
++        self.assertTrue(parsed.supported)
++        self.assertNotEqual(parsed.fingerprint, parsed.runtime_fingerprint)
++        self.assertEqual(probe(), parsed.to_primitive())
++        for field, value in (('runtime_fingerprint', ''),
++                             ('store_profile_id', ''),
++                             ('save_bytes_limit', True),
++                             ('restore_bytes_limit', 0)):
++            bad = probe()
++            bad[field] = value
++            self.assertFalse(v2.validate_probe(bad).supported)
++
++    def test_unsupported_probe_has_no_positive_identity(self):
++        value = v2.unsupported('profile_unverified').to_primitive()
++        self.assertFalse(v2.validate_probe(value).supported)
++        self.assertEqual('', value['runtime_fingerprint'])
++        self.assertEqual('', value['store_profile_id'])
++        self.assertEqual(0, value['save_bytes_limit'])
++        value['executor_id'] = 'cannot-advertise-support'
++        self.assertEqual(('invalid_executor_result',),
++                         v2.validate_probe(value).reasons)
++        self.assertEqual('unsupported_profile',
++                         v2.public_reason('profile_unverified'))
++
++    def test_nested_payload_is_frozen_and_hash_is_bound(self):
++        payload = {'artifact_ids': [uuids.ram]}
++        value = v2.ChildIntent(uuids.child, uuids.step, uuids.operation, 1,
++                               'save', uuids.ram, 'executor',
++                               v1.canonical_payload_hash(payload), payload)
++        payload['artifact_ids'].append(uuids.foreign)
++        self.assertEqual((uuids.ram,), value.payload['artifact_ids'])
++        self.assertRaises(TypeError, operator.setitem, value.payload, 'x', 1)
++        wire = value.to_primitive()
++        wire['payload']['artifact_ids'] = [uuids.foreign]
++        self.assertRaises(ValueError, v2.ChildIntent.from_primitive, wire)
++
++    def test_artifact_path_and_binding_are_strict(self):
++        parsed = v2.Binding(**binding())
++        self.assertEqual(parsed, v2.Binding.from_primitive(
++            parsed.to_primitive()))
++        for logical in ('../foreign', 'a/b', r'a\b', '', '.', '..'):
++            self.assertRaises(ValueError, v2.ArtifactRef, uuids.ram, 'ram',
++                              logical, 1, 'a' * 64, 'shared')
++        self.assertRaises(ValueError, v2.Binding,
++                          **dict(binding(), cell_uuid='foreign'))
++
++    def test_v2_admission_keeps_v1_request_key_and_old_wire_unchanged(self):
++        manifest = test_contracts.manifest()
++        key = v1.RequestKey('tenant', manifest['instance_uuid'], uuids.request,
++                            'actor', 'create', 'c' * 64)
++        base = dict(key=key, operation_id=uuids.operation,
++                    checkpoint_id=uuids.checkpoint, cell_uuid=uuids.cell,
++                    host='compute', node='node',
++                    fingerprint=v1.device_fingerprint(manifest),
++                    device_manifest=manifest, artifact_upper_bound=16384,
++                    executor_id='executor', name='same-name')
++        old = v1.Admission(**base).to_primitive()
++        value = v2.AdmissionV2(**base, runtime_fingerprint='b' * 64,
++                               runtime_profile_id=uuids.runtime,
++                               store_profile_id=uuids.store,
++                               staging_profile_id=uuids.staging,
++                               save_bytes_limit=4096, restore_bytes_limit=4096)
++        self.assertEqual(1, value.to_primitive()['key']['schema_version'])
++        self.assertEqual(value, v2.decode_admission(value.to_primitive()))
++        self.assertEqual(old, v2.decode_admission(old).to_primitive())
++        self.assertRaises(ValueError, v1.Admission.from_primitive,
++                          value.to_primitive())
++
++    def test_phase_order_and_default_driver_are_safe(self):
++        phases = workflow_v2.steps_for('create')
++        self.assertLess(phases.index('runtime_restore_current'),
++                        phases.index('staging_cleanup'))
++        self.assertLess(phases.index('staging_cleanup'),
++                        phases.index('cinder_release'))
++        self.assertEqual(('cinder_reserve', 'disk_snapshot_delete',
++                          'artifact_delete', 'cinder_release'),
++                         workflow_v2.steps_for('delete'))
++        base = driver.ComputeDriver(mock.Mock())
++        self.assertFalse(v2.validate_probe(base.checkpoint_probe_v2(
++            None, None, {}, 'create')).supported)
++        self.assertFalse(conf.CONF.checkpoint.enabled)
++        for name in ('deployment_id', 'store_root', 'staging_root',
++                     'profile_file'):
++            self.assertEqual('', getattr(conf.CONF.checkpoint, name))
++
++
++class VersionV2Test(test.NoDBTestCase):
++    def test_old_compute_and_conductor_caps_reject_v2_before_send(self):
++        ctx = context.RequestContext('actor', 'tenant')
++        instance = objects.Instance(ctx, uuid=uuids.instance, host='compute')
++        api = compute_rpc.ComputeAPI()
++        client = mock.Mock()
++        client.can_send_version.side_effect = lambda version: version == '6.5'
++        with mock.patch.object(api.router, 'client', return_value=client):
++            self.assertRaises(exception.CheckpointNotSupported,
++                              api.checkpoint_probe_v2, ctx, instance, {},
++                              'create')
++        client.prepare.assert_not_called()
++        api = conductor_rpc.ComputeTaskAPI()
++        api.client = mock.Mock()
++        api.client.can_send_version.side_effect = lambda v: v == '1.26'
++        self.assertRaises(exception.CheckpointNotSupported,
++                          api.checkpoint_probe_v2, ctx, uuids.instance,
++                          'create')
++        api.client.prepare.assert_not_called()
++
++
++class ProfilesTest(test.NoDBTestCase):
++    def test_profile_requires_exact_observation_and_qualification_digest(self):
++        observed = {'mount_identity': 'mount-one'}
++        record = profiles.ProfileMatch(
++            uuids.store, 'store', v1.canonical_payload_hash(observed),
++            'b' * 64, observed, {'max_bytes': 8192})
++        group = profiles.ProfileSet((record,))
++        self.assertEqual(record, group.match(observed))
++        self.assertIsNone(group.match({'mount_identity': 'mount-two'}))
++        self.assertRaises(ValueError, dataclasses.replace, record,
++                          qualification_sha256='')
++        self.assertRaises(ValueError, dataclasses.replace, record,
++                          identity_sha256='c' * 64)
++        self.assertRaises(ValueError, dataclasses.replace, record,
++                          limits={'max_bytes': True})
++
++    def test_profile_file_is_closed_and_cannot_be_group_writable(self):
++        with tempfile.TemporaryDirectory() as root:
++            path = os.path.join(root, 'profiles.json')
++            with open(path, 'w') as stream:
++                jsonutils.dump({'schema_version': 1, 'records': []}, stream)
++            os.chmod(path, 0o600)
++            self.assertIsNone(profiles.load(path).match({}))
++            os.chmod(path, 0o666)
++            self.assertRaises(ValueError, profiles.load, path)
++            os.chmod(path, 0o600)
++            with open(path, 'w') as stream:
++                jsonutils.dump({'schema_version': 1, 'records': [],
++                           'qualified': True}, stream)
++            self.assertRaises(ValueError, profiles.load, path)
++
++
++class ProbeV2Test(test.TestCase):
++    NUMBER_OF_CELLS = 2
++
++    def setUp(self):
++        super().setUp()
++        self.flags(enabled=True, group='checkpoint')
++        self.ctx = context.RequestContext('actor', 'project')
++        self.cell = self.cell_mappings['cell1']
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            test_cell_db.make_instance(ctx)
++            self.instance = objects.Instance.get_by_uuid(ctx, uuids.instance)
++            self.manifest = (
++                objects.InstanceCheckpointOperation.device_manifest(
++                    ctx, uuids.instance))
++            objects.Service(ctx, host='compute', binary='nova-compute',
++                            topic='compute').create()
++        objects.InstanceMapping(self.ctx, instance_uuid=uuids.instance,
++                                cell_mapping=self.cell,
++                                project_id='project').create()
++        self.driver = mock.Mock()
++        value = probe()
++        value.update(device_manifest=self.manifest,
++                     fingerprint=v1.device_fingerprint(self.manifest))
++        self.driver.checkpoint_probe_v2.return_value = value
++        self.executor = compute.ComputeExecutor(self.driver, 'compute')
++        self.rpc = mock.Mock()
++        self.rpc.checkpoint_probe_v2.side_effect = lambda *a, **kw: (
++            self.executor.probe_v2(*a, **kw).to_primitive())
++        self.coordinator = coordinator.Coordinator(self.rpc)
++
++    def test_live_probe_uses_v2_and_validates_returned_manifest(self):
++        value = self.coordinator.probe_v2(self.ctx, uuids.instance, 'create')
++        self.assertTrue(value.supported)
++        self.driver.checkpoint_probe_v2.return_value['fingerprint'] = 'c' * 64
++        value = self.coordinator.probe_v2(self.ctx, uuids.instance, 'create')
++        self.assertFalse(value.supported)
++
++    def test_service_69_rejects_without_rpc(self):
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            service = objects.Service.get_by_host_and_binary(
++                ctx, 'compute', 'nova-compute')
++            db_api.service_update(ctx, service.id, {'version': 69})
++        value = self.coordinator.probe_v2(self.ctx, uuids.instance, 'create')
++        self.assertEqual(('incompatible_service',), value.reasons)
++        self.rpc.checkpoint_probe_v2.assert_not_called()
++
++    def test_project_or_recovery_binding_rejects_before_driver(self):
++        other = context.RequestContext('admin', 'foreign', is_admin=True)
++        value = self.coordinator.probe_v2(other, uuids.instance, 'create')
++        self.assertFalse(value.supported)
++        value = self.coordinator.probe_v2(self.ctx, uuids.instance, 'recover')
++        self.assertFalse(value.supported)
++        self.rpc.checkpoint_probe_v2.assert_not_called()
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            value = self.executor.probe_v2(
++                ctx, self.instance, dict(self.manifest, host='other'),
++                'create')
++        self.assertFalse(value.supported)
++        self.driver.checkpoint_probe_v2.assert_not_called()
+diff --git a/nova/tests/unit/checkpoints/test_rpc.py b/nova/tests/unit/checkpoints/test_rpc.py
+index be644afee77d963eb5e41ec1a1d2e8c049e11ab2..076879a8c815eaadbb8f84fabef9987c7465a39b 100644
+--- a/nova/tests/unit/checkpoints/test_rpc.py
++++ b/nova/tests/unit/checkpoints/test_rpc.py
+@@ -35,13 +35,13 @@ class CheckpointRPCTest(test.NoDBTestCase):
+         )
+ 
+     def test_private_versions(self):
+-        self.assertEqual(69, service.SERVICE_VERSION)
++        self.assertEqual(70, service.SERVICE_VERSION)
+         self.assertEqual(
+             '6.5', service.SERVICE_VERSION_HISTORY[69]['compute_rpc']
+         )
+-        self.assertEqual('6.5', compute_manager.ComputeManager.target.version)
++        self.assertEqual('6.6', compute_manager.ComputeManager.target.version)
+         self.assertEqual(
+-            '1.26', conductor_manager.ComputeTaskManager.target.version
++            '1.27', conductor_manager.ComputeTaskManager.target.version
+         )
+         self.assertEqual(
+             '3.0', conductor_manager.ConductorManager.target.version
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index db1249fcc8e98f6359114fde1f65f67dbae3631a..bb7d7c7a59d7dd771f1bf97be8d394916e1e285d 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -36,6 +36,7 @@ import nova.conf
+ import nova.virt.node
+ 
+ from nova.checkpoints import contracts as checkpoint_contracts
++from nova.checkpoints import contracts_v2 as checkpoint_contracts_v2
+ from nova import context as nova_context
+ from nova.i18n import _
+ from nova.network import model as network_model
+@@ -2011,6 +2012,18 @@ class ComputeDriver(object):
+         """
+         return True
+ 
++    def checkpoint_probe_v2(self, context, instance, manifest, purpose,
++                            checkpoint_id=None, operation_id=None):
++        return checkpoint_contracts_v2.unsupported().to_primitive()
++
++    def checkpoint_execute_v2(self, context, instance, intent):
++        return checkpoint_contracts_v2.EffectResult(
++            'unknown', {}, 'executor_unsupported').to_primitive()
++
++    def checkpoint_query_v2(self, context, instance, intent):
++        return checkpoint_contracts_v2.EffectResult(
++            'unknown', {}, 'executor_unsupported').to_primitive()
++
+     def checkpoint_probe(self, context, instance, manifest):
+         """N1 has no physical executor. N2 must override all three hooks."""
+         return checkpoint_contracts.unsupported(
+diff --git a/nova/virt/libvirt/checkpoints/__init__.py b/nova/virt/libvirt/checkpoints/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d19d799eba6977867f108dcf3e93f393c6865fbe
+--- /dev/null
++++ b/nova/virt/libvirt/checkpoints/__init__.py
+@@ -0,0 +1,13 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Operation-bound libvirt checkpoint components."""
+diff --git a/nova/virt/libvirt/checkpoints/profiles.py b/nova/virt/libvirt/checkpoints/profiles.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8d6a0aa7fb8b15e201c0877320c94f52b08cde0
+--- /dev/null
++++ b/nova/virt/libvirt/checkpoints/profiles.py
+@@ -0,0 +1,92 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Root-controlled component allowlist; records alone never prove readiness."""
++
++from collections.abc import Mapping
++import dataclasses
++import os
++import stat
++
++from oslo_serialization import jsonutils
++
++from nova.checkpoints import contracts as c
++
++
++@dataclasses.dataclass(frozen=True)
++class ProfileMatch:
++    id: str
++    kind: str
++    identity_sha256: str
++    qualification_sha256: str
++    observed: dict
++    limits: dict
++
++    def __post_init__(self):
++        c._uuid(self.id)
++        c._require(self.kind in ('runtime', 'store', 'staging'))
++        c._digest(self.identity_sha256)
++        c._digest(self.qualification_sha256)
++        c._require(isinstance(self.observed, Mapping) and bool(self.observed))
++        c._require(self.identity_sha256 == c.canonical_payload_hash(
++            self.observed))
++        c._require(isinstance(self.limits, Mapping) and bool(self.limits))
++        for key, value in self.limits.items():
++            c._string(key)
++            c._integer(value, minimum=1)
++        for name in ('observed', 'limits'):
++            object.__setattr__(self, name, c._freeze(c._json(
++                getattr(self, name))))
++
++
++@dataclasses.dataclass(frozen=True)
++class ProfileSet:
++    records: tuple
++
++    def __post_init__(self):
++        c._require(type(self.records) is tuple and all(
++            type(item) is ProfileMatch for item in self.records))
++        c._ids([item.id for item in self.records])
++
++    def match(self, observed):
++        digest = c.canonical_payload_hash(observed)
++        matches = [r for r in self.records if r.identity_sha256 == digest and
++                   r.observed == c._freeze(c._json(observed))]
++        # Ambiguous records are not permission to choose whichever is easier.
++        return matches[0] if len(matches) == 1 else None
++
++
++def _unique_pairs(pairs):
++    value = {}
++    for key, item in pairs:
++        c._require(key not in value)
++        value[key] = item
++    return value
++
++
++def load(path):
++    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
++    with os.fdopen(descriptor, 'r') as stream:
++        info = os.fstat(stream.fileno())
++        c._require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and
++                   not (info.st_mode & 0o022) and info.st_size <= 1024 * 1024)
++        value = jsonutils.loads(stream.read(1024 * 1024 + 1),
++                           object_pairs_hook=_unique_pairs)
++    c._keys(value, ('schema_version', 'records'))
++    c._integer(value['schema_version'], minimum=1, maximum=1)
++    c._require(type(value['records']) is list)
++    fields = {item.name for item in dataclasses.fields(ProfileMatch)}
++    records = []
++    for record in value['records']:
++        c._keys(record, fields)
++        records.append(ProfileMatch(**record))
++    return ProfileSet(tuple(records))

@@ -1,0 +1,946 @@
+From c3937aa541ebcaa97f314d2803f9cac5bb89feac Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 08:57:27 +0300
+Subject: [PATCH 01/10] feat: define Nova checkpoint contracts and safe
+ defaults
+
+---
+ nova/checkpoints/__init__.py                  |   0
+ nova/checkpoints/contracts.py                 | 462 ++++++++++++++++++
+ nova/checkpoints/workflow.py                  |  35 ++
+ nova/conf/__init__.py                         |   2 +
+ nova/conf/checkpoint.py                       |  41 ++
+ nova/exception.py                             |  30 ++
+ nova/tests/unit/checkpoints/__init__.py       |   0
+ nova/tests/unit/checkpoints/test_contracts.py | 294 +++++++++++
+ 8 files changed, 864 insertions(+)
+ create mode 100644 nova/checkpoints/__init__.py
+ create mode 100644 nova/checkpoints/contracts.py
+ create mode 100644 nova/checkpoints/workflow.py
+ create mode 100644 nova/conf/checkpoint.py
+ create mode 100644 nova/tests/unit/checkpoints/__init__.py
+ create mode 100644 nova/tests/unit/checkpoints/test_contracts.py
+
+diff --git a/nova/checkpoints/__init__.py b/nova/checkpoints/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/nova/checkpoints/contracts.py b/nova/checkpoints/contracts.py
+new file mode 100644
+index 0000000..ceb0958
+--- /dev/null
++++ b/nova/checkpoints/contracts.py
+@@ -0,0 +1,462 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Closed, immutable checkpoint wire contracts; no DB or driver dependencies.
++
++Validation establishes shape, never physical truth. The journal/engine must
++also bind every resource, host, fingerprint and result to its durable intent.
++"""
++
++from collections.abc import Mapping
++import dataclasses
++import hashlib
++import re
++from types import MappingProxyType
++import uuid
++
++from oslo_serialization import jsonutils
++
++from nova.checkpoints import workflow
++
++MAX_BYTES = 2 ** 63 - 1
++PROFILE = 'kvm-bios-same-host-v1'
++REASONS = frozenset({
++    'disabled', 'executor_unsupported', 'invalid_executor_result',
++    'executor_unavailable', 'executor_rejected', 'incompatible_service',
++    'unsupported_profile', 'quota_exceeded', 'guard_busy', 'identity_changed',
++    'invalid_state', 'operation_conflict', 'recovery_required',
++    'cell_unavailable', 'admission_cancelled', 'resources_remaining',
++})
++
++
++def reason_code(value):
++    return value if type(value) is str and value in REASONS else (
++        'invalid_executor_result')
++
++
++def _require(condition):
++    if not condition:
++        raise ValueError('Invalid checkpoint contract')
++
++
++def _string(value):
++    _require(type(value) is str and 0 < len(value) <= 255)
++
++
++def _uuid(value):
++    _require(type(value) is str)
++    try:
++        _require(str(uuid.UUID(value)) == value)
++    except (ValueError, AttributeError):
++        raise ValueError('Invalid checkpoint UUID') from None
++
++
++def _digest(value):
++    _require(type(value) is str and re.fullmatch('[0-9a-f]{64}', value))
++
++
++def _integer(value, minimum=0, maximum=MAX_BYTES):
++    _require(type(value) is int and minimum <= value <= maximum)
++
++
++def _json(value, depth=0):
++    """Detach JSON; reject objects, non-string keys and floating point."""
++    _require(depth <= 32)
++    if value is None or type(value) in (str, bool, int):
++        return value
++    if isinstance(value, Mapping):
++        _require(all(type(key) is str for key in value))
++        return {key: _json(item, depth + 1) for key, item in value.items()}
++    if type(value) in (list, tuple):
++        return [_json(item, depth + 1) for item in value]
++    raise ValueError('Non-JSON checkpoint value')
++
++
++def _freeze(value):
++    if isinstance(value, Mapping):
++        return MappingProxyType({key: _freeze(item)
++                                 for key, item in value.items()})
++    if type(value) in (list, tuple):
++        return tuple(_freeze(item) for item in value)
++    return value
++
++
++def canonical_payload_hash(payload):
++    _require(isinstance(payload, Mapping))
++    encoded = jsonutils.dumps(
++        _json(payload), sort_keys=True, separators=(',', ':'),
++        ensure_ascii=True, allow_nan=False).encode('ascii')
++    return hashlib.sha256(encoded).hexdigest()
++
++
++def _keys(value, names):
++    _require(isinstance(value, Mapping) and set(value) == set(names))
++
++
++def _ids(value, nonempty=False):
++    _require(type(value) in (tuple, list))
++    _require(not nonempty or len(value) > 0)
++    for item in value:
++        _uuid(item)
++    _require(len(set(value)) == len(value))
++
++
++def device_projection(manifest):
++    """Hash identity fields only; IPs, tokens and volatile status are excluded.
++
++    The producer must construct image_properties from device properties, never
++    from an unfiltered Glance/Instance metadata or connection_info dictionary.
++    """
++    _require(isinstance(manifest, Mapping))
++    required = ('instance_uuid', 'host', 'node', 'flavor', 'image_properties',
++                'config_drive', 'disks', 'ports', 'shares',
++                'runtime_key_fingerprints')
++    _require(all(key in manifest for key in required))
++    result = {key: _json(manifest[key]) for key in required}
++    _uuid(result['instance_uuid'])
++    _string(result['host'])
++    _string(result['node'])
++    _require(isinstance(result['flavor'], dict))
++    _require(isinstance(result['image_properties'], dict))
++    disk_keys = ('uuid', 'volume_id', 'serial', 'device_name', 'boot_index')
++    port_keys = ('uuid', 'mac', 'network_uuid', 'vnic_type', 'model')
++    for kind, keys in (('disks', disk_keys), ('ports', port_keys)):
++        _require(type(result[kind]) is list)
++        projected = []
++        for item in result[kind]:
++            _require(isinstance(item, dict) and all(k in item for k in keys))
++            projected.append({key: item[key] for key in keys})
++        _ids([item['uuid'] for item in projected], nonempty=kind == 'disks')
++        result[kind] = sorted(projected, key=lambda item: item['uuid'])
++    _ids([item['volume_id'] for item in result['disks']], nonempty=True)
++    for disk in result['disks']:
++        _string(disk['serial'])
++        _string(disk['device_name'])
++        _integer(disk['boot_index'], minimum=-1)
++    for port in result['ports']:
++        _uuid(port['network_uuid'])
++        for key in ('mac', 'vnic_type', 'model'):
++            _string(port[key])
++    _ids(result['shares'])
++    result['shares'].sort()
++    _require(type(result['runtime_key_fingerprints']) is list)
++    for key in result['runtime_key_fingerprints']:
++        _string(key)
++    result['runtime_key_fingerprints'] = sorted(set(
++        result['runtime_key_fingerprints']))
++    return result
++
++
++def device_fingerprint(manifest):
++    return canonical_payload_hash(device_projection(manifest))
++
++
++class _Contract:
++    def __post_init__(self):
++        for field in dataclasses.fields(self):
++            value = getattr(self, field.name)
++            if not isinstance(value, _Contract):
++                value = _freeze(_json(value))
++            object.__setattr__(self, field.name, value)
++        self._validate()
++
++    def to_primitive(self):
++        value = {'schema_version': 1}
++        for field in dataclasses.fields(self):
++            item = getattr(self, field.name)
++            value[field.name] = (item.to_primitive()
++                                 if isinstance(item, _Contract)
++                                 else _json(item))
++        return value
++
++    @classmethod
++    def from_primitive(cls, value):
++        _require(type(value) is dict)
++        names = {field.name for field in dataclasses.fields(cls)}
++        _keys(value, names | {'schema_version'})
++        _integer(value['schema_version'], minimum=1, maximum=1)
++        values = {key: _json(value[key]) for key in names}
++        if cls is Admission:
++            values['key'] = RequestKey.from_primitive(values['key'])
++        return cls(**values)
++
++
++@dataclasses.dataclass(frozen=True)
++class RequestKey(_Contract):
++    project_id: str
++    instance_uuid: str
++    request_id: str
++    actor_user_id: str
++    kind: str
++    payload_hash: str
++
++    def _validate(self):
++        _string(self.project_id)
++        _string(self.actor_user_id)
++        _uuid(self.instance_uuid)
++        _uuid(self.request_id)
++        _require(self.kind in ('create', 'revert', 'delete'))
++        _digest(self.payload_hash)
++
++
++@dataclasses.dataclass(frozen=True)
++class Admission(_Contract):
++    key: RequestKey
++    operation_id: str
++    checkpoint_id: str
++    cell_uuid: str
++    host: str
++    node: str
++    fingerprint: str
++    device_manifest: dict
++    artifact_upper_bound: int
++
++    def _validate(self):
++        _require(type(self.key) is RequestKey)
++        for value in (self.operation_id, self.checkpoint_id, self.cell_uuid):
++            _uuid(value)
++        _integer(self.artifact_upper_bound, minimum=1)
++        _digest(self.fingerprint)
++        _require(self.fingerprint == device_fingerprint(self.device_manifest))
++        _require(self.key.instance_uuid ==
++                 self.device_manifest['instance_uuid'])
++        _require(self.host == self.device_manifest['host'])
++        _require(self.node == self.device_manifest['node'])
++
++
++@dataclasses.dataclass(frozen=True)
++class Probe(_Contract):
++    supported: bool
++    reasons: tuple
++    executor_id: str
++    executor_profile: str
++    fingerprint: str
++    device_manifest: dict
++    artifact_upper_bound: int
++    contract_version: int = 1
++
++    def _validate(self):
++        _require(type(self.supported) is bool)
++        _require(type(self.reasons) is tuple)
++        _require(all(type(code) is str and code in REASONS
++                     for code in self.reasons))
++        _integer(self.contract_version, minimum=1, maximum=1)
++        if self.supported:
++            _require(not self.reasons)
++            _string(self.executor_id)
++            _require(self.executor_profile == PROFILE)
++            _digest(self.fingerprint)
++            _require(self.fingerprint == device_fingerprint(
++                self.device_manifest))
++            _integer(self.artifact_upper_bound, minimum=1)
++        else:
++            _require(bool(self.reasons))
++            _require(self.executor_id == self.executor_profile ==
++                     self.fingerprint == '')
++            _require(isinstance(self.device_manifest, Mapping) and
++                     not self.device_manifest)
++            _integer(self.artifact_upper_bound, maximum=0)
++
++
++def unsupported(reason='executor_unsupported'):
++    return Probe(False, (reason_code(reason),), '', '', '', {}, 0)
++
++
++def validate_probe(value):
++    try:
++        return Probe.from_primitive(value)
++    except (ValueError, TypeError, KeyError, AttributeError):
++        return unsupported('invalid_executor_result')
++
++
++@dataclasses.dataclass(frozen=True)
++class Scope(_Contract):
++    instance_uuid: str
++    kind: str
++    owner_uuid: str
++    generation: int
++    action: str
++    token: str
++
++    def _validate(self):
++        _uuid(self.instance_uuid)
++        _uuid(self.owner_uuid)
++        _integer(self.generation, minimum=1, maximum=1)
++        _require(self.kind in ('checkpoint', 'ordinary'))
++        _string(self.action)
++        _digest(self.token)
++
++
++@dataclasses.dataclass(frozen=True)
++class StepIntent(_Contract):
++    id: str
++    operation_id: str
++    generation: int
++    phase: str
++    executor_id: str
++    payload_hash: str
++    payload: dict
++
++    def _validate(self):
++        _uuid(self.id)
++        _uuid(self.operation_id)
++        _integer(self.generation, minimum=1, maximum=1)
++        _require(self.phase in workflow.PHASES)
++        _string(self.executor_id)
++        _digest(self.payload_hash)
++        _require(self.payload_hash == canonical_payload_hash(self.payload))
++
++
++@dataclasses.dataclass(frozen=True)
++class StepResult(_Contract):
++    status: str
++    evidence: dict
++    error_code: str | None
++
++    def _validate(self):
++        _require(self.status in ('pending', 'succeeded', 'failed_no_effect',
++                                 'unknown'))
++        _require(isinstance(self.evidence, Mapping))
++        _require(self.error_code is None or
++                 (type(self.error_code) is str and self.error_code in REASONS))
++        if self.status == 'succeeded':
++            _require(self.error_code is None)
++
++
++@dataclasses.dataclass(frozen=True)
++class CloseProof(_Contract):
++    create_operation_id: str
++    closing_operation_id: str
++    checkpoint_id: str
++    cell_uuid: str
++    kind: str
++    proof_version: int = 1
++
++    def _validate(self):
++        for value in (self.create_operation_id, self.closing_operation_id,
++                      self.checkpoint_id, self.cell_uuid):
++            _uuid(value)
++        _integer(self.proof_version, minimum=1, maximum=1)
++        _require(self.kind in ('admission_cancelled', 'resources_deleted'))
++        if self.kind == 'admission_cancelled':
++            _require(self.create_operation_id == self.closing_operation_id)
++
++
++def _artifacts(items):
++    _require(type(items) in (tuple, list) and bool(items))
++    ids = []
++    for item in items:
++        _keys(item, ('id', 'kind', 'logical_id', 'checksum', 'bytes'))
++        ids.append(item['id'])
++        _require(item['kind'] in ('ram', 'runtime', 'config'))
++        _string(item['logical_id'])
++        _require('/' not in item['logical_id'] and
++                 '\\' not in item['logical_id'])
++        _digest(item['checksum'])
++        _integer(item['bytes'], minimum=1)
++    _ids(ids, nonempty=True)
++
++
++def _same_ids(first, second, nonempty=False):
++    _ids(first, nonempty=nonempty)
++    _ids(second, nonempty=nonempty)
++    _require(set(first) == set(second))
++
++
++def _success_evidence(phase, evidence):
++    if phase == 'preflight':
++        _keys(evidence, ('fingerprint', 'host', 'node'))
++        _digest(evidence['fingerprint'])
++        _string(evidence['host'])
++        _string(evidence['node'])
++    elif phase == 'cinder_reserve':
++        _keys(evidence, ('operation_id', 'generation', 'volume_ids', 'state'))
++        _uuid(evidence['operation_id'])
++        _integer(evidence['generation'], minimum=1, maximum=1)
++        _ids(evidence['volume_ids'], nonempty=True)
++        _require(evidence['state'] == 'reserved')
++    elif phase in ('cinder_release', 'cleanup_cinder_release'):
++        _keys(evidence, ('operation_id', 'generation', 'state', 'outcome'))
++        _uuid(evidence['operation_id'])
++        _integer(evidence['generation'], minimum=1, maximum=1)
++        _require(evidence['state'] == 'released')
++        _require(evidence['outcome'] in ('succeeded', 'failed_no_effect'))
++    elif phase == 'runtime_save':
++        _keys(evidence, ('writes_stopped', 'artifacts'))
++        _require(evidence['writes_stopped'] is True)
++        _artifacts(evidence['artifacts'])
++    elif phase == 'runtime_stop':
++        _keys(evidence, ('writes_stopped', 'power_state'))
++        _require(evidence['writes_stopped'] is True)
++        _require(evidence['power_state'] == 'SHUTOFF')
++    elif phase in ('runtime_restore_current', 'runtime_restore_checkpoint',
++                    'cleanup_runtime_restore_current'):
++        _keys(evidence, ('fingerprint', 'power_state'))
++        _digest(evidence['fingerprint'])
++        _require(evidence['power_state'] == 'RUNNING')
++    elif phase in ('disk_snapshot', 'disk_revert', 'disk_snapshot_delete',
++                    'cleanup_disk_snapshots'):
++        _keys(evidence, ('volume_ids', 'snapshots'))
++        _require(type(evidence['snapshots']) in (tuple, list))
++        status = {'disk_snapshot': 'available', 'disk_revert': 'reverted'}.get(
++            phase, 'deleted')
++        volumes, snapshots = [], []
++        for item in evidence['snapshots']:
++            _keys(item, ('volume_id', 'snapshot_id', 'status'))
++            _require(item['status'] == status)
++            volumes.append(item['volume_id'])
++            snapshots.append(item['snapshot_id'])
++        _same_ids(evidence['volume_ids'], volumes,
++                  nonempty=phase != 'cleanup_disk_snapshots')
++        _ids(snapshots)
++    elif phase == 'volume_disconnect':
++        _keys(evidence, ('volume_ids', 'disconnected_volume_ids'))
++        _same_ids(evidence['volume_ids'], evidence['disconnected_volume_ids'],
++                  nonempty=True)
++    elif phase == 'volume_reconnect':
++        _keys(evidence, ('volume_ids', 'port_ids', 'attachments'))
++        _ids(evidence['port_ids'])
++        _require(type(evidence['attachments']) in (tuple, list))
++        volumes, attachments = [], []
++        for item in evidence['attachments']:
++            _keys(item, ('volume_id', 'attachment_id'))
++            volumes.append(item['volume_id'])
++            attachments.append(item['attachment_id'])
++        _ids(attachments, nonempty=True)
++        _same_ids(evidence['volume_ids'], volumes, nonempty=True)
++    elif phase == 'artifact_publish':
++        _keys(evidence, ('artifacts', 'staging_deleted'))
++        _artifacts(evidence['artifacts'])
++        _require(evidence['staging_deleted'] is True)
++    elif phase in ('artifact_delete', 'cleanup_artifacts'):
++        _keys(evidence, ('artifact_ids', 'deleted_artifact_ids'))
++        _same_ids(evidence['artifact_ids'], evidence['deleted_artifact_ids'])
++    else:
++        raise ValueError('Invalid checkpoint phase')
++
++
++def validate_result(phase, value):
++    try:
++        _require(phase in workflow.PHASES)
++        result = StepResult.from_primitive(value)
++        if result.status == 'succeeded':
++            _success_evidence(phase, result.evidence)
++        elif result.status == 'failed_no_effect':
++            _keys(result.evidence, ('no_effect', 'late_effect_impossible'))
++            _require(result.evidence['no_effect'] is True and
++                     result.evidence['late_effect_impossible'] is True)
++            _require(result.error_code is not None)
++        else:
++            _keys(result.evidence, ())
++        return result
++    except (ValueError, TypeError, KeyError, AttributeError):
++        return StepResult('unknown', {}, 'invalid_executor_result')
+diff --git a/nova/checkpoints/workflow.py b/nova/checkpoints/workflow.py
+new file mode 100644
+index 0000000..24a4654
+--- /dev/null
++++ b/nova/checkpoints/workflow.py
+@@ -0,0 +1,35 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Allowed effects, excluding local journal and quota transitions."""
++
++_STEPS = {
++    'create': ('preflight', 'cinder_reserve', 'runtime_save', 'disk_snapshot',
++               'artifact_publish', 'runtime_restore_current',
++               'cinder_release'),
++    'revert': ('preflight', 'cinder_reserve', 'runtime_stop',
++               'volume_disconnect',
++               'disk_revert', 'volume_reconnect', 'runtime_restore_checkpoint',
++               'cinder_release'),
++    'delete': ('cinder_reserve', 'disk_snapshot_delete', 'artifact_delete',
++               'cinder_release'),
++    'cleanup': ('cleanup_runtime_restore_current', 'cleanup_disk_snapshots',
++                'cleanup_artifacts', 'cleanup_cinder_release'),
++}
++PHASES = frozenset(phase for steps in _STEPS.values() for phase in steps)
++
++
++def steps_for(kind):
++    try:
++        return _STEPS[kind]
++    except (KeyError, TypeError):
++        raise ValueError('Invalid checkpoint operation kind') from None
+diff --git a/nova/conf/__init__.py b/nova/conf/__init__.py
+index 6155281..b8b829a 100644
+--- a/nova/conf/__init__.py
++++ b/nova/conf/__init__.py
+@@ -23,6 +23,7 @@ from nova.conf import api
+ from nova.conf import availability_zone
+ from nova.conf import base
+ from nova.conf import cache
++from nova.conf import checkpoint
+ from nova.conf import cinder
+ from nova.conf import compute
+ from nova.conf import conductor
+@@ -71,6 +72,7 @@ api.register_opts(CONF)
+ availability_zone.register_opts(CONF)
+ base.register_opts(CONF)
+ cache.register_opts(CONF)
++checkpoint.register_opts(CONF)
+ cinder.register_opts(CONF)
+ compute.register_opts(CONF)
+ conductor.register_opts(CONF)
+diff --git a/nova/conf/checkpoint.py b/nova/conf/checkpoint.py
+new file mode 100644
+index 0000000..9f6b75f
+--- /dev/null
++++ b/nova/conf/checkpoint.py
+@@ -0,0 +1,41 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from oslo_config import cfg
++
++checkpoint_group = cfg.OptGroup('checkpoint', title='Instance checkpoints')
++checkpoint_opts = [
++    cfg.BoolOpt('enabled', default=False,
++                help='Allow new checkpoints with a supported executor. '
++                     'Disabling this does not release existing ownership.'),
++    cfg.IntOpt('max_checkpoints_per_instance', default=8, min=0,
++               help='Maximum retained checkpoints per instance, including '
++                    'pending operations and resources awaiting cleanup.'),
++    cfg.IntOpt('max_checkpoints_per_project', default=100, min=0,
++               help='Maximum retained checkpoints across all project cells.'),
++    cfg.IntOpt('max_artifact_bytes_per_project', default=0, min=0,
++               max=2 ** 63 - 1,
++               help='Artifact and staging byte budget across project cells. '
++                    'Zero denies new checkpoints; unlimited is unsupported.'),
++    cfg.IntOpt('reconcile_interval', default=60, min=1,
++               help='Seconds between journal reconciliation passes. '
++                    'Also runs when checkpoint creation is disabled.'),
++]
++
++
++def register_opts(conf):
++    conf.register_group(checkpoint_group)
++    conf.register_opts(checkpoint_opts, group=checkpoint_group)
++
++
++def list_opts():
++    return {checkpoint_group.name: checkpoint_opts}
+diff --git a/nova/exception.py b/nova/exception.py
+index cef454e..27f74d2 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -113,6 +113,36 @@ class EncryptionFailure(NovaException):
+     msg_fmt = _("Failed to encrypt text: %(reason)s")
+ 
+ 
++class CheckpointConflict(NovaException):
++    msg_fmt = _("Instance checkpoint request rejected: %(reason)s")
++    code = 409
++    safe = True
++
++    def __init__(self, reason='operation_conflict', **kwargs):
++        # Never echo a backend exception, token or caller-supplied message.
++        from nova.checkpoints import contracts
++        super().__init__(reason=contracts.reason_code(reason))
++
++
++class CheckpointNotSupported(CheckpointConflict):
++    def __init__(self, reason='executor_unsupported', **kwargs):
++        super().__init__(reason=reason)
++
++
++class CheckpointUnavailable(CheckpointConflict):
++    code = 503
++
++    def __init__(self, reason='executor_unavailable', **kwargs):
++        super().__init__(reason=reason)
++
++
++class CheckpointQuotaExceeded(CheckpointConflict):
++    code = 413
++
++    def __init__(self, reason='quota_exceeded', **kwargs):
++        super().__init__(reason=reason)
++
++
+ class VirtualInterfaceCreateException(NovaException):
+     msg_fmt = _("Virtual Interface creation failed")
+ 
+diff --git a/nova/tests/unit/checkpoints/__init__.py b/nova/tests/unit/checkpoints/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/nova/tests/unit/checkpoints/test_contracts.py b/nova/tests/unit/checkpoints/test_contracts.py
+new file mode 100644
+index 0000000..6cfc96a
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/test_contracts.py
+@@ -0,0 +1,294 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import copy
++import dataclasses
++import unittest
++import uuid
++
++from oslo_serialization import jsonutils
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import workflow
++
++
++INSTANCE = str(uuid.UUID(int=1))
++VOLUME = str(uuid.UUID(int=2))
++OPERATION = str(uuid.UUID(int=3))
++ARTIFACT = str(uuid.UUID(int=4))
++CHECKPOINT = str(uuid.UUID(int=5))
++CELL = str(uuid.UUID(int=6))
++DIGEST = 'a' * 64
++
++
++def manifest():
++    return dict(instance_uuid=INSTANCE, host='compute', node='node',
++                flavor={'memory_mb': 1024, 'vcpus': 1, 'extra_specs': {}},
++                image_properties={}, config_drive=None,
++                disks=[dict(uuid=str(uuid.UUID(int=7)), volume_id=VOLUME,
++                            serial=VOLUME, device_name='/dev/vda',
++                            boot_index=0)],
++                ports=[], shares=[], runtime_key_fingerprints=[])
++
++
++def probe():
++    devices = manifest()
++    return dict(schema_version=1, supported=True, reasons=[],
++                executor_id='test-executor',
++                executor_profile='kvm-bios-same-host-v1',
++                fingerprint=c.device_fingerprint(devices),
++                device_manifest=devices, artifact_upper_bound=1048576,
++                contract_version=1)
++
++
++def success(evidence):
++    return dict(schema_version=1, status='succeeded', evidence=evidence,
++                error_code=None)
++
++
++class ContractsTest(unittest.TestCase):
++    def test_defaults_disabled(self):
++        from nova import conf
++        opts = conf.CONF.checkpoint
++        self.assertFalse(opts.enabled)
++        self.assertEqual((8, 100, 0, 60), (
++            opts.max_checkpoints_per_instance,
++            opts.max_checkpoints_per_project,
++            opts.max_artifact_bytes_per_project, opts.reconcile_interval))
++
++    def test_negative_limits_rejected(self):
++        from oslo_config import cfg
++
++        from nova.conf import checkpoint
++        config = cfg.ConfigOpts()
++        checkpoint.register_opts(config)
++        for name in ('max_checkpoints_per_instance',
++                     'max_checkpoints_per_project',
++                     'max_artifact_bytes_per_project', 'reconcile_interval'):
++            with self.subTest(name=name), self.assertRaises(ValueError):
++                config.set_override(name, -1, group='checkpoint')
++
++    def test_supported_probe_roundtrip(self):
++        value = probe()
++        parsed = c.validate_probe(value)
++        self.assertTrue(parsed.supported)
++        self.assertEqual(value, parsed.to_primitive())
++        self.assertEqual(parsed, c.Probe.from_primitive(value))
++
++    def test_invalid_probe_fails_closed(self):
++        variants = [None, {}, {'supported': True}]
++        for field, value in (
++                ('executor_id', ''), ('executor_profile', 'unknown'),
++                ('contract_version', 2), ('supported', 1),
++                ('artifact_upper_bound', True), ('fingerprint', DIGEST),
++                ('reasons', ['backend password=secret']),
++                ('schema_version', True), ('arbitrary', 'value')):
++            changed = probe()
++            changed[field] = value
++            variants.append(changed)
++        for value in variants:
++            with self.subTest(value=value):
++                result = c.validate_probe(value)
++                self.assertFalse(result.supported)
++                self.assertEqual(('invalid_executor_result',), result.reasons)
++                self.assertEqual({}, result.to_primitive()['device_manifest'])
++
++    def test_phase_success_requires_evidence(self):
++        for kind in ('create', 'revert', 'delete', 'cleanup'):
++            for phase in workflow.steps_for(kind):
++                with self.subTest(phase=phase):
++                    result = c.validate_result(phase, success({}))
++                    self.assertEqual('unknown', result.status)
++                    self.assertEqual('invalid_executor_result',
++                                     result.error_code)
++
++    def test_preflight_evidence_is_typed_and_closed(self):
++        evidence = dict(fingerprint=DIGEST, host='compute', node='node')
++        self.assertEqual('succeeded',
++                         c.validate_result('preflight',
++                                           success(evidence)).status)
++        for field, value in [('fingerprint', 'bad'), ('host', ''),
++                             ('password', 'secret')]:
++            changed = dict(evidence, **{field: value})
++            self.assertEqual('unknown', c.validate_result(
++                'preflight', success(changed)).status)
++
++    def test_runtime_save_requires_all_artifact_fields_and_write_stop(self):
++        evidence = dict(writes_stopped=True, artifacts=[dict(
++            id=ARTIFACT, kind='ram', logical_id='opaque-ram-object',
++            checksum=DIGEST, bytes=1024)])
++        self.assertEqual('succeeded', c.validate_result(
++            'runtime_save', success(evidence)).status)
++        for changed in (dict(evidence, writes_stopped=False),
++                        dict(evidence, artifacts=[]),
++                        dict(evidence, artifacts=[{'id': ARTIFACT}])):
++            self.assertEqual('unknown', c.validate_result(
++                'runtime_save', success(changed)).status)
++
++    def test_each_effect_has_a_closed_success_schema(self):
++        artifacts = [dict(id=ARTIFACT, kind='ram', logical_id='opaque-object',
++                          checksum=DIGEST, bytes=1024)]
++        release = dict(operation_id=OPERATION, generation=1, state='released',
++                       outcome='succeeded')
++        deleted = dict(volume_ids=[VOLUME], snapshots=[dict(
++            volume_id=VOLUME, snapshot_id=CHECKPOINT, status='deleted')])
++        proofs = {
++            'cinder_reserve': dict(operation_id=OPERATION, generation=1,
++                                   volume_ids=[VOLUME], state='reserved'),
++            'runtime_stop': dict(power_state='SHUTOFF', writes_stopped=True),
++            'volume_disconnect': dict(volume_ids=[VOLUME],
++                                      disconnected_volume_ids=[VOLUME]),
++            'disk_revert': dict(volume_ids=[VOLUME], snapshots=[dict(
++                volume_id=VOLUME, snapshot_id=CHECKPOINT, status='reverted')]),
++            'volume_reconnect': dict(volume_ids=[VOLUME], port_ids=[],
++                                     attachments=[dict(volume_id=VOLUME,
++                                                       attachment_id=CELL)]),
++            'artifact_publish': dict(artifacts=artifacts,
++                                     staging_deleted=True),
++            'runtime_restore_current': dict(fingerprint=DIGEST,
++                                             power_state='RUNNING'),
++            'runtime_restore_checkpoint': dict(fingerprint=DIGEST,
++                                                power_state='RUNNING'),
++            'cinder_release': release,
++            'disk_snapshot_delete': deleted,
++            'artifact_delete': dict(artifact_ids=[ARTIFACT],
++                                    deleted_artifact_ids=[ARTIFACT]),
++            'cleanup_runtime_restore_current': dict(fingerprint=DIGEST,
++                                                     power_state='RUNNING'),
++            'cleanup_disk_snapshots': deleted,
++            'cleanup_artifacts': dict(artifact_ids=[ARTIFACT],
++                                      deleted_artifact_ids=[ARTIFACT]),
++            'cleanup_cinder_release': release,
++        }
++        for phase, evidence in proofs.items():
++            with self.subTest(phase=phase):
++                self.assertEqual('succeeded', c.validate_result(
++                    phase, success(evidence)).status)
++                for field in evidence:
++                    partial = dict(evidence)
++                    del partial[field]
++                    self.assertEqual('unknown', c.validate_result(
++                        phase, success(partial)).status)
++
++    def test_failure_is_not_proof_of_no_effect(self):
++        result = dict(schema_version=1, status='failed_no_effect',
++                      error_code='executor_rejected', evidence={})
++        self.assertEqual('unknown',
++                         c.validate_result('runtime_save', result).status)
++        result['evidence'] = dict(no_effect=True, late_effect_impossible=True)
++        self.assertEqual('failed_no_effect',
++                         c.validate_result('runtime_save', result).status)
++        result['evidence']['late_effect_impossible'] = False
++        self.assertEqual('unknown',
++                         c.validate_result('runtime_save', result).status)
++
++    def test_disk_results_reject_missing_duplicate_and_unknown_fields(self):
++        evidence = dict(volume_ids=[VOLUME], snapshots=[dict(
++            volume_id=VOLUME, snapshot_id=CHECKPOINT, status='available')])
++        self.assertEqual('succeeded', c.validate_result(
++            'disk_snapshot', success(evidence)).status)
++        for changed in (dict(evidence, snapshots=[]),
++                        dict(evidence, volume_ids=[VOLUME, OPERATION]),
++                        dict(evidence, snapshots=evidence['snapshots'] * 2),
++                        dict(evidence, password='secret')):
++            self.assertEqual('unknown', c.validate_result(
++                'disk_snapshot', success(changed)).status)
++
++    def test_canonical_request_hash(self):
++        first = dict(actor='alice', kind='create', body={'b': 2, 'a': 1})
++        other_order = dict(body={'a': 1, 'b': 2}, kind='create', actor='alice')
++        self.assertEqual(c.canonical_payload_hash(first),
++                         c.canonical_payload_hash(other_order))
++        for changed in (dict(first, actor='bob'), dict(first, kind='delete')):
++            self.assertNotEqual(c.canonical_payload_hash(first),
++                                c.canonical_payload_hash(changed))
++        for bad in ({'value': float('nan')}, {'value': object()}, {1: 'x'}):
++            with self.assertRaises(ValueError):
++                c.canonical_payload_hash(bad)
++
++    def test_device_fingerprint_ignores_ephemeral_network_state(self):
++        original = manifest()
++        original['ports'] = [dict(uuid=ARTIFACT, mac='fa:16:3e:00:00:01',
++                                  network_uuid=CELL, vnic_type='normal',
++                                  model='virtio', fixed_ips=['10.0.0.1'])]
++        changed = copy.deepcopy(original)
++        changed['ports'][0]['fixed_ips'] = ['10.0.0.2']
++        changed['ports'][0]['security_groups'] = [CHECKPOINT]
++        changed['task_state'] = 'checkpoint_creating'
++        self.assertEqual(c.device_fingerprint(original),
++                         c.device_fingerprint(changed))
++        changed['ports'][0]['mac'] = 'fa:16:3e:00:00:02'
++        self.assertNotEqual(c.device_fingerprint(original),
++                            c.device_fingerprint(changed))
++
++    def test_device_fingerprint_canonical_resource_order(self):
++        original = manifest()
++        original['disks'].append(dict(original['disks'][0], uuid=ARTIFACT,
++                                      volume_id=CHECKPOINT, boot_index=1))
++        original['runtime_key_fingerprints'] = ['SHA256:bbb', 'SHA256:aaa']
++        changed = copy.deepcopy(original)
++        changed['disks'].reverse()
++        changed['runtime_key_fingerprints'].reverse()
++        self.assertEqual(c.device_fingerprint(original),
++                         c.device_fingerprint(changed))
++
++    def test_admission_roundtrip_and_deep_immutability(self):
++        devices = manifest()
++        key = c.RequestKey('project', INSTANCE, OPERATION, 'actor', 'create',
++                           DIGEST)
++        admission = c.Admission(key, OPERATION, CHECKPOINT, CELL, 'compute',
++                                'node', c.device_fingerprint(devices), devices,
++                                1024)
++        primitive = admission.to_primitive()
++        self.assertEqual(admission, c.Admission.from_primitive(
++            jsonutils.loads(jsonutils.dumps(primitive))))
++        devices['disks'].clear()
++        self.assertEqual(1, len(admission.device_manifest['disks']))
++        with self.assertRaises(TypeError):
++            admission.device_manifest['host'] = 'elsewhere'
++        with self.assertRaises(dataclasses.FrozenInstanceError):
++            admission.host = 'elsewhere'
++        primitive['host'] = 'elsewhere'
++        self.assertEqual('compute', admission.host)
++
++    def test_primitive_rejects_extras_wrong_types_and_versions(self):
++        key = c.RequestKey('project', INSTANCE, OPERATION, 'actor', 'create',
++                           DIGEST)
++        for changed in (dict(key.to_primitive(), secret='value'),
++                        dict(key.to_primitive(), schema_version=2),
++                        dict(key.to_primitive(), request_id='invalid'),
++                        dict(key.to_primitive(), kind='force_unlock')):
++            with self.assertRaises(ValueError):
++                c.RequestKey.from_primitive(changed)
++
++    def test_no_secrets_in_public_reason(self):
++        from nova import exception
++        secret = 'backend password=secret token=bearer'
++        result = c.validate_result('preflight', dict(
++            schema_version=1, status='failed', evidence={}, error_code=secret))
++        self.assertEqual('invalid_executor_result', result.error_code)
++        self.assertNotIn(secret, jsonutils.dumps(result.to_primitive()))
++        for cls, code in ((exception.CheckpointConflict, 409),
++                          (exception.CheckpointNotSupported, 409),
++                          (exception.CheckpointUnavailable, 503),
++                          (exception.CheckpointQuotaExceeded, 413)):
++            exc = cls(reason=secret, message=secret)
++            self.assertEqual(code, exc.code)
++            self.assertNotIn(secret, exc.format_message())
++            self.assertNotIn(secret, repr(exc.kwargs))
++
++    def test_workflow_rejects_arbitrary_effect(self):
++        self.assertEqual(('cinder_reserve', 'disk_snapshot_delete',
++                          'artifact_delete', 'cinder_release'),
++                         workflow.steps_for('delete'))
++        with self.assertRaises(ValueError):
++            workflow.steps_for('force_unlock')

@@ -1,0 +1,1507 @@
+From 8ddcb584017b9000002a900a9998e51cff787b8b Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Tue, 6 Oct 2026 22:39:13 +0300
+Subject: [PATCH 02/10] feat: persist checkpoint operations and resource
+ reservations
+
+---
+ cinder/db/api.py                              |  33 ++
+ .../7fa82e10c601_add_checkpoint_contract.py   | 111 ++++
+ cinder/db/sqlalchemy/api.py                   |  40 ++
+ cinder/db/sqlalchemy/checkpoints.py           | 474 ++++++++++++++++++
+ cinder/db/sqlalchemy/models.py                |  94 ++++
+ cinder/objects/__init__.py                    |   1 +
+ cinder/objects/base.py                        |  12 +
+ cinder/objects/checkpoint.py                  | 198 ++++++++
+ cinder/tests/unit/checkpoints/test_db.py      | 314 ++++++++++++
+ cinder/tests/unit/db/test_migrations.py       |  48 ++
+ cinder/tests/unit/objects/test_checkpoint.py  |  48 ++
+ cinder/tests/unit/objects/test_objects.py     |  10 +
+ 12 files changed, 1383 insertions(+)
+ create mode 100644 cinder/db/migrations/versions/7fa82e10c601_add_checkpoint_contract.py
+ create mode 100644 cinder/db/sqlalchemy/checkpoints.py
+ create mode 100644 cinder/objects/checkpoint.py
+ create mode 100644 cinder/tests/unit/checkpoints/test_db.py
+ create mode 100644 cinder/tests/unit/objects/test_checkpoint.py
+
+diff --git a/cinder/db/api.py b/cinder/db/api.py
+index a1df296..e6b82f0 100644
+--- a/cinder/db/api.py
++++ b/cinder/db/api.py
+@@ -1991,3 +1991,36 @@ def remove_temporary_admin_metadata_data_migration(context, max_count):
+ 
+ def get_projects(context, model, read_deleted="no"):
+     return IMPL.get_projects(context, model, read_deleted=read_deleted)
++
++
++def checkpoint_reserve(context, values, volume_ids):
++    return IMPL.checkpoint_reserve(context, values, volume_ids)
++
++
++def checkpoint_get(context, operation_id):
++    return IMPL.checkpoint_get(context, operation_id)
++
++
++def checkpoint_get_all(context, filters=None, marker=None, limit=None):
++    return IMPL.checkpoint_get_all(context, filters, marker, limit)
++
++
++def checkpoint_step_claim(context, step_id, generation, executor_id):
++    return IMPL.checkpoint_step_claim(
++        context, step_id, generation, executor_id)
++
++
++def checkpoint_step_finish(context, step_id, generation, result):
++    return IMPL.checkpoint_step_finish(context, step_id, generation, result)
++
++
++def checkpoint_release(context, operation_id, generation, outcome):
++    return IMPL.checkpoint_release(context, operation_id, generation, outcome)
++
++
++def checkpoint_resource_guard(context, volume_id, action):
++    return IMPL.checkpoint_resource_guard(context, volume_id, action)
++
++
++def checkpoint_records(context, name, record_id=None):
++    return IMPL.checkpoint_records(context, name, record_id)
+diff --git a/cinder/db/migrations/versions/7fa82e10c601_add_checkpoint_contract.py b/cinder/db/migrations/versions/7fa82e10c601_add_checkpoint_contract.py
+new file mode 100644
+index 0000000..722d663
+--- /dev/null
++++ b/cinder/db/migrations/versions/7fa82e10c601_add_checkpoint_contract.py
+@@ -0,0 +1,111 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Add durable native checkpoint operations and resource ownership."""
++
++from alembic import op
++import sqlalchemy as sa
++
++revision = '7fa82e10c601'
++down_revision = '9c74c1c6971f'
++branch_labels = None
++depends_on = None
++
++
++def _timestamps():
++    return [sa.Column('created_at', sa.DateTime),
++            sa.Column('updated_at', sa.DateTime),
++            sa.Column('deleted_at', sa.DateTime),
++            sa.Column('deleted', sa.Boolean, default=False)]
++
++
++def _uuid(name, target=None, primary=False, nullable=False):
++    args = [sa.String(36)]
++    if target:
++        args.append(sa.ForeignKey(target))
++    return sa.Column(name, *args, primary_key=primary, nullable=nullable)
++
++
++def upgrade():
++    op.create_table(
++        'checkpoint_instances',
++        _uuid('instance_uuid', primary=True),
++        sa.Column('project_id', sa.String(255), nullable=False),
++        sa.Column('volume_ids_json', sa.Text, nullable=False),
++        _uuid('active_operation_id', nullable=True),
++        *_timestamps(), mysql_engine='InnoDB')
++    op.create_table(
++        'checkpoint_operations',
++        _uuid('id', primary=True),
++        sa.Column('project_id', sa.String(255), nullable=False),
++        sa.Column('user_id', sa.String(255), nullable=False),
++        sa.Column('service_user_id', sa.String(255), nullable=False),
++        _uuid('request_id'), _uuid('checkpoint_id'),
++        _uuid('create_checkpoint_id', nullable=True),
++        _uuid('instance_uuid', 'checkpoint_instances.instance_uuid'),
++        sa.Column('kind', sa.String(16), nullable=False),
++        sa.Column('payload_hash', sa.String(64), nullable=False),
++        sa.Column('generation', sa.Integer, nullable=False),
++        sa.Column('status', sa.String(32), nullable=False),
++        sa.Column('release_outcome', sa.String(16)),
++        sa.Column('error_code', sa.String(64)),
++        *_timestamps(),
++        sa.UniqueConstraint('project_id', 'request_id',
++                            name='checkpoint_operations_request_uc'),
++        sa.UniqueConstraint('create_checkpoint_id',
++                            name='checkpoint_operations_create_uc'),
++        mysql_engine='InnoDB')
++    op.create_index('checkpoint_operations_instance_status_idx',
++                    'checkpoint_operations', ['instance_uuid', 'status'])
++    op.create_table(
++        'checkpoint_resources',
++        _uuid('id', primary=True),
++        sa.Column('project_id', sa.String(255), nullable=False),
++        _uuid('instance_uuid', 'checkpoint_instances.instance_uuid'),
++        _uuid('checkpoint_id'), _uuid('volume_id'), _uuid('snapshot_id'),
++        sa.Column('volume_size', sa.Integer, nullable=False),
++        sa.Column('backend_profile', sa.String(255), nullable=False),
++        sa.Column('capabilities_json', sa.Text, nullable=False),
++        sa.Column('status', sa.String(32), nullable=False),
++        *_timestamps(),
++        sa.UniqueConstraint('checkpoint_id', 'volume_id',
++                            name='checkpoint_resources_volume_uc'),
++        sa.UniqueConstraint('snapshot_id',
++                            name='checkpoint_resources_snap_uc'),
++        mysql_engine='InnoDB')
++    op.create_index('checkpoint_resources_volume_status_idx',
++                    'checkpoint_resources', ['volume_id', 'status'])
++    op.create_index('checkpoint_resources_instance_status_idx',
++                    'checkpoint_resources', ['instance_uuid', 'status'])
++    op.create_table(
++        'checkpoint_steps',
++        _uuid('id', primary=True),
++        _uuid('operation_id', 'checkpoint_operations.id'),
++        _uuid('resource_id', 'checkpoint_resources.id'),
++        sa.Column('phase', sa.String(32), nullable=False),
++        sa.Column('generation', sa.Integer, nullable=False),
++        sa.Column('status', sa.String(32), nullable=False),
++        sa.Column('executor_id', sa.String(255)),
++        sa.Column('backend_reference', sa.String(1024)),
++        sa.Column('error_code', sa.String(64)),
++        sa.Column('quota_reservations_json', sa.Text, nullable=False),
++        sa.Column('original_attachment_ids_json', sa.Text, nullable=False),
++        *_timestamps(),
++        sa.UniqueConstraint('operation_id', 'resource_id', 'phase',
++                            name='checkpoint_steps_phase_uc'),
++        mysql_engine='InnoDB')
++    op.create_table(
++        'checkpoint_volume_locks',
++        _uuid('volume_id', primary=True),
++        _uuid('operation_id', 'checkpoint_operations.id'),
++        sa.Column('generation', sa.Integer, nullable=False),
++        *_timestamps(), mysql_engine='InnoDB')
+diff --git a/cinder/db/sqlalchemy/api.py b/cinder/db/sqlalchemy/api.py
+index a3fd2c6..efa6358 100644
+--- a/cinder/db/sqlalchemy/api.py
++++ b/cinder/db/sqlalchemy/api.py
+@@ -8701,3 +8701,43 @@ CALCULATE_COUNT_HELPERS = {
+ def get_projects(context, model, read_deleted="no"):
+     return model_query(context, model, read_deleted=read_deleted).\
+         with_entities(sa.Column('project_id')).distinct().all()
++
++
++def checkpoint_reserve(context, values, volume_ids):
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints.reserve(context, values, volume_ids)
++
++
++def checkpoint_get(context, operation_id):
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints.get(context, operation_id)
++
++
++def checkpoint_get_all(context, filters=None, marker=None, limit=None):
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints.get_all(context, filters, marker, limit)
++
++
++def checkpoint_step_claim(context, step_id, generation, executor_id):
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints.step_claim(context, step_id, generation, executor_id)
++
++
++def checkpoint_step_finish(context, step_id, generation, result):
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints.step_finish(context, step_id, generation, result)
++
++
++def checkpoint_release(context, operation_id, generation, outcome):
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints.release(context, operation_id, generation, outcome)
++
++
++def checkpoint_resource_guard(context, volume_id, action):
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints.resource_guard(context, volume_id, action)
++
++
++def checkpoint_records(context, name, record_id=None):
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints.records(context, name, record_id)
+diff --git a/cinder/db/sqlalchemy/checkpoints.py b/cinder/db/sqlalchemy/checkpoints.py
+new file mode 100644
+index 0000000..ebe88bc
+--- /dev/null
++++ b/cinder/db/sqlalchemy/checkpoints.py
+@@ -0,0 +1,474 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Checkpoint journal transitions.
++
++Always lock instance, then sorted volumes, before changing journal ownership.
++Admission uses current reads, including on MySQL REPEATABLE READ. No backend
++call belongs in any of these short transactions. Journal rows are tombstones;
++only temporary volume-lock rows are physically removed.
++"""
++
++import json
++import uuid
++
++from oslo_db import api as oslo_db_api
++from oslo_utils import timeutils
++from oslo_utils import uuidutils
++
++from cinder.checkpoints import contracts
++from cinder.db.sqlalchemy import api
++from cinder.db.sqlalchemy import models
++from cinder import exception
++
++
++PHASES = {'create': 'snapshot', 'revert': 'revert',
++          'delete': 'delete_snapshot'}
++IDENTITY = ('project_id', 'user_id', 'service_user_id')
++
++
++def _conflict(reason):
++    raise exception.CheckpointConflict(reason=reason)
++
++
++def _query(context, model):
++    return context.session.query(model).filter_by(deleted=False)
++
++
++def _current(query):
++    return query.populate_existing().with_for_update()
++
++
++def _identity(context):
++    identity = {key: getattr(context, key, None) for key in IDENTITY}
++    if not all(identity.values()):
++        raise exception.CheckpointServiceForbidden()
++    return identity
++
++
++def _owned(context, row):
++    if row is None or any(getattr(context, key, None) != row[key]
++                          for key in IDENTITY):
++        raise exception.CheckpointOperationNotFound()
++    return row
++
++
++def _operation(context, operation_id):
++    return _owned(context, _query(context, models.CheckpointOperation).
++                  filter_by(id=operation_id).first())
++
++
++def _resources(context, checkpoint_id, lock=False):
++    query = _query(context, models.CheckpointResource).filter_by(
++        checkpoint_id=checkpoint_id).order_by(models.CheckpointResource.id)
++    return (_current(query) if lock else query).all()
++
++
++def _steps(context, operation_id):
++    return _query(context, models.CheckpointStep).filter_by(
++        operation_id=operation_id).order_by(models.CheckpointStep.id).all()
++
++
++def _as_dict(context, operation):
++    context.session.flush()
++    result = dict(operation)
++    result['resources'] = [dict(r) for r in _resources(
++        context, operation.checkpoint_id)]
++    result['steps'] = [dict(s) for s in _steps(context, operation.id)]
++    return result
++
++
++def _lock_volumes(context, volume_ids):
++    volumes = []
++    for volume_id in sorted(volume_ids):
++        volume = _current(_query(context, models.Volume).filter_by(
++            id=volume_id)).first()
++        if volume is None or volume.project_id != context.project_id:
++            raise exception.VolumeNotFound(volume_id=volume_id)
++        volumes.append(volume)
++    return volumes
++
++
++def _locked_operation(context, operation_id, generation):
++    old = _operation(context, operation_id)
++    if type(generation) is not int or generation != old.generation:
++        _conflict('stale_generation')
++    # A released journal entry is immutable and independent of live volumes.
++    if old.status == 'released':
++        return old, None, []
++    instance = _current(_query(context, models.CheckpointInstance).filter_by(
++        instance_uuid=old.instance_uuid)).one()
++    volumes = _lock_volumes(context, json.loads(instance.volume_ids_json))
++    operation = _owned(context, _current(_query(
++        context, models.CheckpointOperation).filter_by(id=operation_id)).one())
++    if type(generation) is not int or generation != operation.generation:
++        _conflict('stale_generation')
++    if operation.status != 'released':
++        if instance.active_operation_id != operation_id:
++            _conflict('operation_not_owner')
++        locks = _current(_query(context, models.CheckpointVolumeLock).
++                         filter_by(operation_id=operation_id)).all()
++        if (sorted(lock.volume_id for lock in locks) !=
++                sorted(volume.id for volume in volumes) or
++                any(lock.generation != generation for lock in locks)):
++            _conflict('operation_not_owner')
++    return operation, instance, volumes
++
++
++def _attachments(context, volume_id):
++    return _current(_query(context, models.VolumeAttachment).filter_by(
++        volume_id=volume_id)).all()
++
++
++def _check_volume(context, volume, instance_uuid, kind):
++    if (volume.status not in ('available', 'in-use') or volume.multiattach or
++            volume.group_id or volume.consistencygroup_id or
++            volume.migration_status or volume.replication_status not in
++            (None, 'disabled', 'not-capable')):
++        _conflict('unsupported_volume_state')
++    attachments = _attachments(context, volume.id)
++    if (len(attachments) > 1 or (kind == 'create' and len(attachments) != 1)
++            or any(a.attach_status != 'attached' or
++                   a.instance_uuid != instance_uuid for a in attachments)):
++        _conflict('attachment_conflict')
++    pending = _current(_query(context, models.Snapshot).filter(
++        models.Snapshot.volume_id == volume.id,
++        models.Snapshot.status != 'available')).first()
++    if pending:
++        _conflict('snapshot_in_progress')
++    return [a.id for a in attachments]
++
++
++def _replay(context, operation, payload_hash):
++    _owned(context, operation)
++    if operation.payload_hash != payload_hash:
++        _conflict('request_payload_changed')
++    return _as_dict(context, operation)
++
++
++@api.require_context
++@oslo_db_api.wrap_db_retry(
++    max_retries=5, retry_on_deadlock=True, exception_checker=api._is_duplicate)
++@api.main_context_manager.writer
++def reserve(context, values, volume_ids):
++    identity = _identity(context)
++    payload = {key: values.get(key) for key in
++               ('request_id', 'checkpoint_id', 'instance_uuid', 'kind')}
++    payload.update(identity, volume_ids=volume_ids)
++    payload_hash = contracts.canonical_payload_hash(payload)
++    for key in ('request_id', 'checkpoint_id', 'instance_uuid'):
++        payload[key] = str(uuid.UUID(payload[key]))
++    volume_ids = sorted(str(uuid.UUID(v)) for v in volume_ids)
++    kind = payload['kind']
++    if kind not in PHASES:
++        raise exception.InvalidInput(reason='invalid_checkpoint_kind')
++    request_query = _query(context, models.CheckpointOperation).filter_by(
++        project_id=context.project_id, request_id=payload['request_id'])
++    previous = request_query.first()
++    if previous:
++        return _replay(context, previous, payload_hash)
++
++    instance = _current(_query(context, models.CheckpointInstance).filter_by(
++        instance_uuid=payload['instance_uuid'])).first()
++    if instance is None:
++        instance = models.CheckpointInstance(
++            instance_uuid=payload['instance_uuid'],
++            project_id=context.project_id,
++            volume_ids_json=json.dumps(volume_ids))
++        context.session.add(instance)
++        # A competing insert rolls back and retries the entire transaction.
++        context.session.flush()
++    if instance.project_id != context.project_id:
++        raise exception.CheckpointOperationNotFound()
++    previous = _current(request_query).first()
++    if previous:
++        return _replay(context, previous, payload_hash)
++    if instance.active_operation_id:
++        _conflict('instance_operation_active')
++    live = _current(_query(context, models.CheckpointResource).filter(
++        models.CheckpointResource.instance_uuid == instance.instance_uuid,
++        models.CheckpointResource.status != 'deleted')).all()
++    if live and json.loads(instance.volume_ids_json) != volume_ids:
++        _conflict('volume_set_changed')
++    instance.volume_ids_json = json.dumps(volume_ids)
++    volumes = _lock_volumes(context, volume_ids)
++    attachments = {}
++    for volume in volumes:
++        if _current(_query(context, models.CheckpointVolumeLock).filter_by(
++                volume_id=volume.id)).first():
++            _conflict('volume_operation_active')
++        references = _current(_query(context, models.CheckpointResource).
++                              filter_by(volume_id=volume.id).filter(
++            models.CheckpointResource.status != 'deleted')).all()
++        if any(r.instance_uuid != instance.instance_uuid or
++               r.project_id != context.project_id for r in references):
++            _conflict('volume_owned_by_other_instance')
++        attachments[volume.id] = _check_volume(context, volume,
++                                               instance.instance_uuid, kind)
++
++    checkpoint_id = payload['checkpoint_id']
++    resources = _resources(context, checkpoint_id, lock=True)
++    if kind == 'create':
++        if _current(_query(context, models.CheckpointOperation).filter_by(
++                create_checkpoint_id=checkpoint_id)).first():
++            _conflict('checkpoint_id_reused')
++        for volume in volumes:
++            caps = contracts.validate_capabilities(
++                values.get('capabilities', {}).get(volume.id))
++            resource = models.CheckpointResource(
++                id=uuidutils.generate_uuid(), project_id=context.project_id,
++                instance_uuid=instance.instance_uuid,
++                checkpoint_id=checkpoint_id, volume_id=volume.id,
++                snapshot_id=uuidutils.generate_uuid(), volume_size=volume.size,
++                backend_profile=caps['driver_identity']['profile'],
++                capabilities_json=json.dumps(caps, sort_keys=True),
++                status='creating')
++            context.session.add(resource)
++            api.snapshot_create(context, {
++                'id': resource.snapshot_id, 'volume_id': volume.id,
++                'project_id': context.project_id, 'user_id': context.user_id,
++                'status': 'creating', 'progress': '0%',
++                'volume_size': volume.size,
++                'volume_type_id': volume.volume_type_id,
++                'encryption_key_id': volume.encryption_key_id})
++            resources.append(resource)
++    elif (not resources or
++          sorted(r.volume_id for r in resources) != volume_ids or
++          any(r.project_id != context.project_id or
++              r.instance_uuid != instance.instance_uuid or
++              r.status != 'available' for r in resources)):
++        _conflict('checkpoint_resource_mismatch')
++
++    operation = models.CheckpointOperation(
++        id=uuidutils.generate_uuid(), **identity,
++        request_id=payload['request_id'], checkpoint_id=checkpoint_id,
++        create_checkpoint_id=checkpoint_id if kind == 'create' else None,
++        instance_uuid=instance.instance_uuid, kind=kind,
++        payload_hash=payload_hash, generation=1, status='reserved')
++    context.session.add(operation)
++    context.session.flush()
++    instance.active_operation_id = operation.id
++    for resource in resources:
++        context.session.add(models.CheckpointStep(
++            id=uuidutils.generate_uuid(), operation_id=operation.id,
++            resource_id=resource.id, phase=PHASES[kind], generation=1,
++            status='prepared', quota_reservations_json='[]',
++            original_attachment_ids_json=json.dumps(
++                attachments[resource.volume_id])))
++        context.session.add(models.CheckpointVolumeLock(
++            volume_id=resource.volume_id, operation_id=operation.id,
++            generation=1))
++    return _as_dict(context, operation)
++
++
++@api.require_context
++@api.main_context_manager.reader
++def get(context, operation_id):
++    return _as_dict(context, _operation(context, operation_id))
++
++
++@api.require_context
++@api.main_context_manager.reader
++def get_all(context, filters=None, marker=None, limit=None):
++    query = _query(context, models.CheckpointOperation).filter_by(
++        **_identity(context))
++    filters = filters or {}
++    if set(filters) - {'checkpoint_id', 'instance_uuid', 'status'}:
++        raise exception.InvalidInput(reason='invalid_checkpoint_filter')
++    query = query.filter_by(**filters)
++    if marker:
++        _operation(context, marker)
++        query = query.filter(models.CheckpointOperation.id > marker)
++    query = query.order_by(models.CheckpointOperation.id)
++    if limit is not None:
++        if type(limit) is not int or limit < 1:
++            raise exception.InvalidInput(reason='invalid_limit')
++        query = query.limit(limit)
++    return [_as_dict(context, row) for row in query.all()]
++
++
++def _step_operation(context, step_id, generation):
++    step = _query(context, models.CheckpointStep).filter_by(id=step_id).first()
++    if step is None:
++        raise exception.CheckpointOperationNotFound()
++    operation, instance, volumes = _locked_operation(
++        context, step.operation_id, generation)
++    step = _current(_query(context, models.CheckpointStep).filter_by(
++        id=step_id)).one()
++    if step.generation != generation:
++        _conflict('stale_generation')
++    return step, operation
++
++
++@api.require_context
++@api.main_context_manager.writer
++def step_claim(context, step_id, generation, executor_id):
++    step, operation = _step_operation(context, step_id, generation)
++    if operation.status == 'released' or step.status != 'prepared':
++        return False
++    if not isinstance(executor_id, str) or not 0 < len(executor_id) <= 255:
++        raise exception.InvalidInput(reason='invalid_executor_id')
++    step.status = 'dispatching'
++    step.executor_id = executor_id
++    operation.status = 'running'
++    return True
++
++
++def _update_operation(context, operation):
++    statuses = {s.status for s in _steps(context, operation.id)}
++    if statuses & {'unknown', 'dispatching', 'pending'}:
++        operation.status = 'recovery_required'
++    elif statuses == {'succeeded'}:
++        operation.status = 'succeeded'
++    elif 'failed_no_effect' in statuses:
++        operation.status = 'failed'
++    else:
++        operation.status = 'running'
++
++
++@api.require_context
++@api.main_context_manager.writer
++def step_finish(context, step_id, generation, result):
++    step, operation = _step_operation(context, step_id, generation)
++    result = contracts.validate_driver_result(result)
++    if operation.status == 'released':
++        return dict(step)
++    if step.status in ('succeeded', 'failed_no_effect'):
++        if result['status'] != step.status:
++            _conflict('terminal_step_result_changed')
++        return dict(step)
++    if step.status == 'prepared':
++        _conflict('step_not_dispatched')
++    step.status = result['status']
++    step.backend_reference = result.get('backend_reference',
++                                        step.backend_reference)
++    step.error_code = result.get('error_code')
++    if step.status == 'succeeded':
++        resource = _current(_query(context, models.CheckpointResource).
++                            filter_by(id=step.resource_id)).one()
++        snapshot = _query(context, models.Snapshot).filter_by(
++            id=resource.snapshot_id).first()
++        if step.phase == 'snapshot':
++            resource.status = 'available'
++            if snapshot:
++                snapshot.status = 'available'
++                snapshot.progress = '100%'
++        elif step.phase == 'delete_snapshot':
++            resource.status = 'deleted'
++            if snapshot:
++                snapshot.status = 'deleted'
++                snapshot.deleted = True
++                snapshot.deleted_at = timeutils.utcnow()
++    context.session.flush()
++    _update_operation(context, operation)
++    return dict(step)
++
++
++@api.require_context
++@api.main_context_manager.writer
++def release(context, operation_id, generation, outcome):
++    if outcome not in ('commit', 'abort'):
++        raise exception.InvalidInput(reason='invalid_release_outcome')
++    operation, instance, volumes = _locked_operation(
++        context, operation_id, generation)
++    if operation.status == 'released':
++        if outcome != operation.release_outcome:
++            _conflict('release_outcome_changed')
++        return _as_dict(context, operation)
++    steps = _steps(context, operation_id)
++    if outcome == 'commit':
++        if any(s.status != 'succeeded' for s in steps):
++            _conflict('unconfirmed_result')
++        if operation.kind == 'revert':
++            for volume in volumes:
++                attachments = _attachments(context, volume.id)
++                if (len(attachments) != 1 or any(
++                        a.instance_uuid != instance.instance_uuid or
++                        a.attach_status != 'attached' for a in attachments)):
++                    _conflict('reattachment_required')
++    else:
++        if any(s.status not in ('prepared', 'failed_no_effect')
++               for s in steps):
++            _conflict('effect_not_cleaned')
++        if operation.kind == 'create':
++            for resource in _resources(context, operation.checkpoint_id,
++                                       lock=True):
++                resource.status = 'deleted'
++                snapshot = _query(context, models.Snapshot).filter_by(
++                    id=resource.snapshot_id).first()
++                if snapshot:
++                    snapshot.deleted = True
++                    snapshot.deleted_at = timeutils.utcnow()
++                    snapshot.status = 'deleted'
++    _query(context, models.CheckpointVolumeLock).filter_by(
++        operation_id=operation_id, generation=generation).delete(
++            synchronize_session=False)
++    instance.active_operation_id = None
++    operation.status = 'released'
++    operation.release_outcome = outcome
++    return _as_dict(context, operation)
++
++
++@api.require_context
++@api.main_context_manager.writer
++def resource_guard(context, volume_id, action):
++    if action == 'read':
++        return
++    _lock_volumes(context, [volume_id])
++    active = _current(_query(context, models.CheckpointVolumeLock).filter_by(
++        volume_id=volume_id)).first()
++    if active:
++        _conflict('volume_operation_active')
++    # These source-only operations are allowed between reservations. Their
++    # pending status is checked again by checkpoint admission.
++    if action in ('snapshot', 'backup', 'clone', 'upload'):
++        return
++    reference = _current(_query(context, models.CheckpointResource).filter_by(
++        volume_id=volume_id).filter(
++            models.CheckpointResource.status != 'deleted')).first()
++    if reference:
++        _conflict('volume_has_checkpoints')
++
++
++RECORD_TYPES = {name: getattr(models, name) for name in (
++    'CheckpointInstance', 'CheckpointOperation', 'CheckpointResource',
++    'CheckpointStep', 'CheckpointVolumeLock')}
++
++
++@api.require_context
++@api.main_context_manager.reader
++def records(context, name, record_id=None):
++    """Read-only OVO projections with the same ownership as the operation."""
++    model = RECORD_TYPES[name]
++    owned = _query(context, models.CheckpointOperation).filter_by(
++        **_identity(context))
++    query = _query(context, model)
++    if name == 'CheckpointOperation':
++        query = owned
++    elif name in ('CheckpointStep', 'CheckpointVolumeLock'):
++        query = query.filter(model.operation_id.in_(
++            owned.with_entities(models.CheckpointOperation.id)))
++    elif name == 'CheckpointResource':
++        query = query.filter(model.checkpoint_id.in_(
++            owned.with_entities(models.CheckpointOperation.checkpoint_id)))
++    else:
++        query = query.filter(model.instance_uuid.in_(
++            owned.with_entities(models.CheckpointOperation.instance_uuid)))
++    key = ('instance_uuid' if name == 'CheckpointInstance' else
++           'volume_id' if name == 'CheckpointVolumeLock' else 'id')
++    if record_id:
++        query = query.filter(getattr(model, key) == record_id)
++    rows = query.order_by(getattr(model, key)).all()
++    if record_id and not rows:
++        raise exception.CheckpointOperationNotFound()
++    return [(_as_dict(context, row) if name == 'CheckpointOperation'
++             else dict(row)) for row in rows]
+diff --git a/cinder/db/sqlalchemy/models.py b/cinder/db/sqlalchemy/models.py
+index 1aa8e0d..d57b321 100644
+--- a/cinder/db/sqlalchemy/models.py
++++ b/cinder/db/sqlalchemy/models.py
+@@ -1281,3 +1281,97 @@ class AttachmentSpecs(BASE, CinderBase):
+         'AttachmentSpecs.attachment_id == VolumeAttachment.id,'
+         'AttachmentSpecs.deleted == False)',
+     )
++
++
++class CheckpointInstance(BASE, CinderBase):
++    """Durable serialization point for all checkpoints of one instance."""
++    __tablename__ = 'checkpoint_instances'
++    instance_uuid = sa.Column(sa.String(36), primary_key=True)
++    project_id = sa.Column(sa.String(255), nullable=False)
++    volume_ids_json = sa.Column(sa.Text, nullable=False)
++    active_operation_id = sa.Column(sa.String(36))
++
++
++class CheckpointOperation(BASE, CinderBase):
++    __tablename__ = 'checkpoint_operations'
++    __table_args__ = (
++        sa.UniqueConstraint('project_id', 'request_id',
++                            name='checkpoint_operations_request_uc'),
++        sa.UniqueConstraint('create_checkpoint_id',
++                            name='checkpoint_operations_create_uc'),
++        sa.Index('checkpoint_operations_instance_status_idx',
++                 'instance_uuid', 'status'),
++        CinderBase.__table_args__,
++    )
++    id = sa.Column(sa.String(36), primary_key=True)
++    project_id = sa.Column(sa.String(255), nullable=False)
++    user_id = sa.Column(sa.String(255), nullable=False)
++    service_user_id = sa.Column(sa.String(255), nullable=False)
++    request_id = sa.Column(sa.String(36), nullable=False)
++    checkpoint_id = sa.Column(sa.String(36), nullable=False)
++    create_checkpoint_id = sa.Column(sa.String(36))
++    instance_uuid = sa.Column(sa.String(36), sa.ForeignKey(
++        'checkpoint_instances.instance_uuid'), nullable=False)
++    kind = sa.Column(sa.String(16), nullable=False)
++    payload_hash = sa.Column(sa.String(64), nullable=False)
++    generation = sa.Column(sa.Integer, nullable=False)
++    status = sa.Column(sa.String(32), nullable=False)
++    release_outcome = sa.Column(sa.String(16))
++    error_code = sa.Column(sa.String(64))
++
++
++class CheckpointResource(BASE, CinderBase):
++    __tablename__ = 'checkpoint_resources'
++    __table_args__ = (
++        sa.UniqueConstraint('checkpoint_id', 'volume_id',
++                            name='checkpoint_resources_volume_uc'),
++        sa.UniqueConstraint('snapshot_id',
++                            name='checkpoint_resources_snap_uc'),
++        sa.Index('checkpoint_resources_volume_status_idx', 'volume_id',
++                 'status'),
++        sa.Index('checkpoint_resources_instance_status_idx', 'instance_uuid',
++                 'status'),
++        CinderBase.__table_args__,
++    )
++    id = sa.Column(sa.String(36), primary_key=True)
++    project_id = sa.Column(sa.String(255), nullable=False)
++    instance_uuid = sa.Column(sa.String(36), sa.ForeignKey(
++        'checkpoint_instances.instance_uuid'), nullable=False)
++    checkpoint_id = sa.Column(sa.String(36), nullable=False)
++    # Tombstones retain these identities even after normal resource purging.
++    volume_id = sa.Column(sa.String(36), nullable=False)
++    snapshot_id = sa.Column(sa.String(36), nullable=False)
++    volume_size = sa.Column(sa.Integer, nullable=False)
++    backend_profile = sa.Column(sa.String(255), nullable=False)
++    capabilities_json = sa.Column(sa.Text, nullable=False)
++    status = sa.Column(sa.String(32), nullable=False)
++
++
++class CheckpointStep(BASE, CinderBase):
++    __tablename__ = 'checkpoint_steps'
++    __table_args__ = (
++        sa.UniqueConstraint('operation_id', 'resource_id', 'phase',
++                            name='checkpoint_steps_phase_uc'),
++        CinderBase.__table_args__,
++    )
++    id = sa.Column(sa.String(36), primary_key=True)
++    operation_id = sa.Column(sa.String(36), sa.ForeignKey(
++        'checkpoint_operations.id'), nullable=False)
++    resource_id = sa.Column(sa.String(36), sa.ForeignKey(
++        'checkpoint_resources.id'), nullable=False)
++    phase = sa.Column(sa.String(32), nullable=False)
++    generation = sa.Column(sa.Integer, nullable=False)
++    status = sa.Column(sa.String(32), nullable=False)
++    executor_id = sa.Column(sa.String(255))
++    backend_reference = sa.Column(sa.String(1024))
++    error_code = sa.Column(sa.String(64))
++    quota_reservations_json = sa.Column(sa.Text, nullable=False)
++    original_attachment_ids_json = sa.Column(sa.Text, nullable=False)
++
++
++class CheckpointVolumeLock(BASE, CinderBase):
++    __tablename__ = 'checkpoint_volume_locks'
++    volume_id = sa.Column(sa.String(36), primary_key=True)
++    operation_id = sa.Column(sa.String(36), sa.ForeignKey(
++        'checkpoint_operations.id'), nullable=False)
++    generation = sa.Column(sa.Integer, nullable=False)
+diff --git a/cinder/objects/__init__.py b/cinder/objects/__init__.py
+index 0414627..1da532b 100644
+--- a/cinder/objects/__init__.py
++++ b/cinder/objects/__init__.py
+@@ -25,6 +25,7 @@ def register_all():
+     # function in order for it to be registered by services that may
+     # need to receive it via RPC.
+     __import__('cinder.objects.backup')
++    __import__('cinder.objects.checkpoint')
+     # NOTE(geguileo): Don't include cleanable to prevent circular imports
+     __import__('cinder.objects.cleanup_request')
+     __import__('cinder.objects.cgsnapshot')
+diff --git a/cinder/objects/base.py b/cinder/objects/base.py
+index 0b4f16a..fe89806 100644
+--- a/cinder/objects/base.py
++++ b/cinder/objects/base.py
+@@ -138,6 +138,18 @@ OBJ_VERSIONS = CinderObjectVersionsHistory()
+ # TODO: (Z release) remove up to next TODO  and update
+ #       CinderObjectVersionsHistory (was added in X release)
+ OBJ_VERSIONS.add('1.39', {'Volume': '1.9', 'Snapshot': '1.6'})
++OBJ_VERSIONS.add('1.40', {
++    'CheckpointInstance': '1.0',
++    'CheckpointInstanceList': '1.0',
++    'CheckpointOperation': '1.0',
++    'CheckpointOperationList': '1.0',
++    'CheckpointResource': '1.0',
++    'CheckpointResourceList': '1.0',
++    'CheckpointStep': '1.0',
++    'CheckpointStepList': '1.0',
++    'CheckpointVolumeLock': '1.0',
++    'CheckpointVolumeLockList': '1.0',
++})
+ 
+ 
+ class CinderObjectRegistry(base.VersionedObjectRegistry):
+diff --git a/cinder/objects/checkpoint.py b/cinder/objects/checkpoint.py
+new file mode 100644
+index 0000000..094d6c2
+--- /dev/null
++++ b/cinder/objects/checkpoint.py
+@@ -0,0 +1,198 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Read-only wire projections of the transactional checkpoint journal."""
++
++from oslo_versionedobjects import fields
++
++from cinder import db
++from cinder import exception
++from cinder import objects
++from cinder.objects import base
++
++
++class _CheckpointObject(base.CinderPersistentObject, base.CinderObject,
++                        base.CinderObjectDictCompat):
++    @classmethod
++    def get_by_id(cls, context, id, *args, **kwargs):
++        row = db.checkpoint_records(context, cls.obj_name(), id)[0]
++        return cls._from_db_object(context, cls(context), row)
++
++    @classmethod
++    def _from_db_object(cls, context, obj, row):
++        for name in obj.fields:
++            if name == 'resources':
++                obj.resources = [objects.CheckpointResource._from_db_object(
++                    context, objects.CheckpointResource(context), item)
++                    for item in row[name]]
++            elif name == 'steps':
++                obj.steps = [objects.CheckpointStep._from_db_object(
++                    context, objects.CheckpointStep(context), item)
++                    for item in row[name]]
++            else:
++                obj[name] = row.get(name)
++        obj._context = context
++        obj.obj_reset_changes()
++        return obj
++
++    def conditional_update(self, *args, **kwargs):
++        raise exception.ObjectActionError(
++            action='conditional_update', reason='read-only checkpoint object')
++
++
++@base.CinderObjectRegistry.register
++class CheckpointInstance(_CheckpointObject):
++    VERSION = '1.0'
++
++    fields = {
++        'instance_uuid': fields.UUIDField(),
++        'project_id': fields.StringField(),
++        'volume_ids_json': fields.StringField(),
++        'active_operation_id': fields.UUIDField(nullable=True),
++    }
++
++
++@base.CinderObjectRegistry.register
++class CheckpointInstanceList(base.ObjectListBase, base.CinderObject):
++    VERSION = '1.0'
++
++    fields = {'objects': fields.ListOfObjectsField('CheckpointInstance')}
++
++    @classmethod
++    def get_all(cls, context):
++        return base.obj_make_list(
++            context, cls(context), CheckpointInstance,
++            db.checkpoint_records(context, 'CheckpointInstance'))
++
++
++@base.CinderObjectRegistry.register
++class CheckpointOperation(_CheckpointObject):
++    VERSION = '1.0'
++
++    fields = {
++        'id': fields.UUIDField(),
++        'project_id': fields.StringField(),
++        'user_id': fields.StringField(),
++        'service_user_id': fields.StringField(),
++        'request_id': fields.UUIDField(),
++        'checkpoint_id': fields.UUIDField(),
++        'create_checkpoint_id': fields.UUIDField(nullable=True),
++        'instance_uuid': fields.UUIDField(),
++        'kind': fields.StringField(),
++        'payload_hash': fields.StringField(),
++        'generation': fields.IntegerField(),
++        'status': fields.StringField(),
++        'release_outcome': fields.StringField(nullable=True),
++        'error_code': fields.StringField(nullable=True),
++        'resources': fields.ListOfObjectsField('CheckpointResource'),
++        'steps': fields.ListOfObjectsField('CheckpointStep'),
++    }
++
++
++@base.CinderObjectRegistry.register
++class CheckpointOperationList(base.ObjectListBase, base.CinderObject):
++    VERSION = '1.0'
++
++    fields = {'objects': fields.ListOfObjectsField('CheckpointOperation')}
++
++    @classmethod
++    def get_all(cls, context):
++        return base.obj_make_list(
++            context, cls(context), CheckpointOperation,
++            db.checkpoint_records(context, 'CheckpointOperation'))
++
++
++@base.CinderObjectRegistry.register
++class CheckpointResource(_CheckpointObject):
++    VERSION = '1.0'
++
++    fields = {
++        'id': fields.UUIDField(),
++        'project_id': fields.StringField(),
++        'instance_uuid': fields.UUIDField(),
++        'checkpoint_id': fields.UUIDField(),
++        'volume_id': fields.UUIDField(),
++        'snapshot_id': fields.UUIDField(),
++        'volume_size': fields.IntegerField(),
++        'backend_profile': fields.StringField(),
++        'capabilities_json': fields.StringField(),
++        'status': fields.StringField(),
++    }
++
++
++@base.CinderObjectRegistry.register
++class CheckpointResourceList(base.ObjectListBase, base.CinderObject):
++    VERSION = '1.0'
++
++    fields = {'objects': fields.ListOfObjectsField('CheckpointResource')}
++
++    @classmethod
++    def get_all(cls, context):
++        return base.obj_make_list(
++            context, cls(context), CheckpointResource,
++            db.checkpoint_records(context, 'CheckpointResource'))
++
++
++@base.CinderObjectRegistry.register
++class CheckpointStep(_CheckpointObject):
++    VERSION = '1.0'
++
++    fields = {
++        'id': fields.UUIDField(),
++        'operation_id': fields.UUIDField(),
++        'resource_id': fields.UUIDField(),
++        'phase': fields.StringField(),
++        'generation': fields.IntegerField(),
++        'status': fields.StringField(),
++        'executor_id': fields.StringField(nullable=True),
++        'backend_reference': fields.StringField(nullable=True),
++        'error_code': fields.StringField(nullable=True),
++        'quota_reservations_json': fields.StringField(),
++        'original_attachment_ids_json': fields.StringField(),
++    }
++
++
++@base.CinderObjectRegistry.register
++class CheckpointStepList(base.ObjectListBase, base.CinderObject):
++    VERSION = '1.0'
++
++    fields = {'objects': fields.ListOfObjectsField('CheckpointStep')}
++
++    @classmethod
++    def get_all(cls, context):
++        return base.obj_make_list(
++            context, cls(context), CheckpointStep,
++            db.checkpoint_records(context, 'CheckpointStep'))
++
++
++@base.CinderObjectRegistry.register
++class CheckpointVolumeLock(_CheckpointObject):
++    VERSION = '1.0'
++
++    fields = {
++        'volume_id': fields.UUIDField(),
++        'operation_id': fields.UUIDField(),
++        'generation': fields.IntegerField(),
++    }
++
++
++@base.CinderObjectRegistry.register
++class CheckpointVolumeLockList(base.ObjectListBase, base.CinderObject):
++    VERSION = '1.0'
++
++    fields = {'objects': fields.ListOfObjectsField('CheckpointVolumeLock')}
++
++    @classmethod
++    def get_all(cls, context):
++        return base.obj_make_list(
++            context, cls(context), CheckpointVolumeLock,
++            db.checkpoint_records(context, 'CheckpointVolumeLock'))
+diff --git a/cinder/tests/unit/checkpoints/test_db.py b/cinder/tests/unit/checkpoints/test_db.py
+new file mode 100644
+index 0000000..4e2e6ae
+--- /dev/null
++++ b/cinder/tests/unit/checkpoints/test_db.py
+@@ -0,0 +1,314 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import copy
++import json
++
++import eventlet
++from oslo_config import fixture as config_fixture
++from oslo_db.sqlalchemy import enginefacade
++from oslo_db.sqlalchemy import test_fixtures
++from oslo_utils import uuidutils
++from oslotest import base as test_base
++
++from cinder import context
++from cinder import db
++from cinder.db import migration
++from cinder.db.sqlalchemy import api as sqla_api
++from cinder.db.sqlalchemy import models
++from cinder import exception
++from cinder.tests.unit.checkpoints.test_contracts import supported_capabilities
++from cinder.tests.unit import fake_constants as fake
++from cinder.tests.unit import test
++from cinder.tests.unit import utils
++
++
++SERVICE_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
++
++
++def service_context():
++    return context.RequestContext(fake.USER_ID, fake.PROJECT_ID,
++                                  service_user_id=SERVICE_ID, is_admin=False)
++
++
++class CheckpointDBHelpers:
++    def prepare_volumes(self, count=2):
++        self.ctxt = service_context()
++        self.instance = uuidutils.generate_uuid()
++        self.volumes = []
++        for unused in range(count):
++            volume = utils.create_volume(self.ctxt, volume_type_id=None)
++            utils.attach_volume(self.ctxt, volume, self.instance,
++                                'compute-one', '/dev/vda')
++            self.volumes.append(volume.id)
++
++    def values(self, kind='create', checkpoint_id=None, volumes=None):
++        return {
++            'request_id': uuidutils.generate_uuid(),
++            'checkpoint_id': checkpoint_id or uuidutils.generate_uuid(),
++            'instance_uuid': self.instance,
++            'kind': kind,
++            'capabilities': {v: supported_capabilities()
++                             for v in (volumes or self.volumes)},
++        }
++
++    def reserve(self, values=None, volumes=None, ctxt=None):
++        return db.checkpoint_reserve(ctxt or self.ctxt,
++                                     values or self.values(),
++                                     volumes or self.volumes)
++
++    def locks(self):
++        with sqla_api.main_context_manager.reader.using(self.ctxt):
++            return [row.volume_id for row in self.ctxt.session.query(
++                models.CheckpointVolumeLock).all()]
++
++    def succeed(self, operation):
++        for step in operation['steps']:
++            self.assertTrue(db.checkpoint_step_claim(
++                self.ctxt, step['id'], operation['generation'], 'worker-one'))
++            db.checkpoint_step_finish(self.ctxt, step['id'], 1,
++                                      {'status': 'succeeded'})
++
++
++class CheckpointDBTests(CheckpointDBHelpers):
++    def test_reserve_is_all_or_nothing(self):
++        self.prepare_volumes()
++        self.reserve(volumes=[self.volumes[1]])
++        self.assertRaises(exception.CheckpointConflict, self.reserve)
++        self.assertEqual([self.volumes[1]], self.locks())
++
++    def test_replay_after_release_returns_tombstone(self):
++        self.prepare_volumes()
++        values = self.values()
++        original = self.reserve(values)
++        db.checkpoint_release(self.ctxt, original['id'], 1, 'abort')
++        replay = self.reserve(values)
++        self.assertEqual(original['id'], replay['id'])
++        self.assertEqual('released', replay['status'])
++        self.assertEqual([], self.locks())
++
++    def test_released_tombstone_survives_removed_volume(self):
++        self.prepare_volumes(count=1)
++        values = self.values()
++        original = self.reserve(values)
++        db.checkpoint_release(self.ctxt, original['id'], 1, 'abort')
++        db.volume_destroy(self.ctxt.elevated(), self.volumes[0])
++        self.assertEqual(original['id'], self.reserve(values)['id'])
++        self.assertEqual('released', db.checkpoint_release(
++            self.ctxt, original['id'], 1, 'abort')['status'])
++
++    def test_changed_payload_cannot_reuse_request_id(self):
++        self.prepare_volumes()
++        values = self.values()
++        self.reserve(values)
++        values['checkpoint_id'] = uuidutils.generate_uuid()
++        self.assertRaises(exception.CheckpointConflict, self.reserve, values)
++
++    def test_foreign_identity_cannot_read_or_release(self):
++        self.prepare_volumes()
++        operation = self.reserve()
++        for attr in ('project_id', 'user_id', 'service_user_id'):
++            foreign = service_context()
++            setattr(foreign, attr, uuidutils.generate_uuid())
++            foreign.is_admin = True
++            self.assertRaises(exception.CheckpointOperationNotFound,
++                              db.checkpoint_get, foreign, operation['id'])
++            self.assertRaises(exception.CheckpointOperationNotFound,
++                              db.checkpoint_release, foreign, operation['id'],
++                              1, 'abort')
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++    def test_old_generation_cannot_release(self):
++        self.prepare_volumes()
++        operation = self.reserve()
++        self.assertRaises(exception.CheckpointConflict,
++                          db.checkpoint_release, self.ctxt, operation['id'],
++                          2, 'abort')
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++    def test_old_operation_cannot_release_new_owner(self):
++        self.prepare_volumes()
++        old = self.reserve()
++        db.checkpoint_release(self.ctxt, old['id'], 1, 'abort')
++        new = self.reserve()
++        db.checkpoint_release(self.ctxt, old['id'], 1, 'abort')
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++        self.assertEqual('reserved', db.checkpoint_get(
++            self.ctxt, new['id'])['status'])
++
++    def test_checkpoint_id_cannot_be_recreated_after_abort(self):
++        self.prepare_volumes()
++        old = self.reserve()
++        db.checkpoint_release(self.ctxt, old['id'], 1, 'abort')
++        self.assertRaises(exception.CheckpointConflict, self.reserve,
++                          self.values(checkpoint_id=old['checkpoint_id']))
++
++    def test_pending_snapshot_or_attachment_denies_reservation(self):
++        self.prepare_volumes()
++        snap = utils.create_snapshot(self.ctxt, self.volumes[0],
++                                     status='creating')
++        self.assertRaises(exception.CheckpointConflict, self.reserve)
++        self.assertEqual([], self.locks())
++        db.snapshot_destroy(self.ctxt.elevated(), snap.id)
++        attachments = db.volume_attachment_get_all_by_volume_id(
++            self.ctxt.elevated(), self.volumes[0])
++        db.volume_attachment_update(self.ctxt.elevated(), attachments[0].id,
++                                    {'attach_status': 'attaching'})
++        self.assertRaises(exception.CheckpointConflict, self.reserve)
++        self.assertEqual([], self.locks())
++
++    def test_native_dispatch_claim_is_once(self):
++        self.prepare_volumes()
++        operation = self.reserve()
++        step = operation['steps'][0]
++        self.assertTrue(db.checkpoint_step_claim(self.ctxt, step['id'], 1,
++                                                 'worker-one'))
++        self.assertFalse(db.checkpoint_step_claim(self.ctxt, step['id'], 1,
++                                                  'worker-two'))
++        db.checkpoint_step_finish(self.ctxt, step['id'], 1,
++                                  {'status': 'unknown'})
++        self.assertFalse(db.checkpoint_step_claim(self.ctxt, step['id'], 1,
++                                                  'worker-one'))
++        self.assertEqual('recovery_required', db.checkpoint_get(
++            self.ctxt, operation['id'])['status'])
++
++    def test_unknown_outcome_cannot_unlock(self):
++        self.prepare_volumes()
++        operation = self.reserve()
++        step = operation['steps'][0]
++        db.checkpoint_step_claim(self.ctxt, step['id'], 1, 'worker-one')
++        db.checkpoint_step_finish(self.ctxt, step['id'], 1,
++                                  {'status': 'unknown'})
++        for outcome in ('commit', 'abort'):
++            self.assertRaises(exception.CheckpointConflict,
++                              db.checkpoint_release, self.ctxt,
++                              operation['id'], 1, outcome)
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++    def test_confirmed_create_commits_and_retains_reference_protection(self):
++        self.prepare_volumes()
++        operation = self.reserve()
++        self.succeed(operation)
++        db.checkpoint_release(self.ctxt, operation['id'], 1, 'commit')
++        self.assertEqual([], self.locks())
++        self.assertRaises(exception.CheckpointConflict,
++                          db.checkpoint_resource_guard, self.ctxt,
++                          self.volumes[0], 'delete')
++        db.checkpoint_resource_guard(self.ctxt, self.volumes[0], 'read')
++        second = self.reserve()
++        self.assertNotEqual(operation['id'], second['id'])
++
++    def test_revert_must_use_exact_saved_volume_set(self):
++        self.prepare_volumes()
++        operation = self.reserve()
++        self.succeed(operation)
++        db.checkpoint_release(self.ctxt, operation['id'], 1, 'commit')
++        self.assertRaises(exception.CheckpointConflict, self.reserve,
++                          self.values('revert', operation['checkpoint_id']),
++                          self.volumes[:1])
++
++    def test_saved_snapshot_ids_and_attachments_are_server_owned(self):
++        self.prepare_volumes()
++        operation = self.reserve()
++        self.assertEqual(set(self.volumes),
++                         {r['volume_id'] for r in operation['resources']})
++        for resource in operation['resources']:
++            self.assertTrue(uuidutils.is_uuid_like(resource['snapshot_id']))
++        for step in operation['steps']:
++            self.assertEqual(1, len(json.loads(
++                step['original_attachment_ids_json'])))
++
++    def test_partial_revert_cannot_release(self):
++        self.prepare_volumes()
++        created = self.reserve()
++        self.succeed(created)
++        db.checkpoint_release(self.ctxt, created['id'], 1, 'commit')
++        reverted = self.reserve(
++            self.values('revert', created['checkpoint_id']))
++        first = reverted['steps'][0]
++        db.checkpoint_step_claim(self.ctxt, first['id'], 1, 'worker-one')
++        db.checkpoint_step_finish(self.ctxt, first['id'], 1,
++                                  {'status': 'succeeded'})
++        self.assertRaises(exception.CheckpointConflict,
++                          db.checkpoint_release, self.ctxt, reverted['id'],
++                          1, 'abort')
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++
++class TestCheckpointDB(CheckpointDBTests, test.TestCase):
++    pass
++
++
++class ConcurrencyTests(CheckpointDBTests):
++    def setUp(self):
++        super().setUp()
++        self.useFixture(config_fixture.Config()).config(
++            connection='sqlite://', group='database')
++        engine = enginefacade.writer.get_engine()
++        migration.db_sync(engine=engine)
++        self.addCleanup(sqla_api.main_context_manager.patch_engine(engine))
++
++    def race(self, requests):
++        gate = eventlet.event.Event()
++        pool = eventlet.GreenPool(size=2)
++        results = []
++
++        def reserve(values, volumes):
++            gate.wait()
++            try:
++                result = self.reserve(values, volumes, service_context())
++            except exception.CheckpointConflict:
++                result = None
++            results.append(result)
++
++        for values, volumes in requests:
++            pool.spawn_n(reserve, values, volumes)
++        gate.send()
++        pool.waitall()
++        self.assertEqual(2, len(results))
++        return [result for result in results if result]
++
++    def test_two_reservations_have_one_winner(self):
++        self.prepare_volumes()
++        winners = self.race([(self.values(), self.volumes),
++                             (self.values(), self.volumes)])
++        self.assertEqual(1, len(winners))
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++    def test_disjoint_sets_for_one_instance_have_one_winner(self):
++        self.prepare_volumes()
++        winners = self.race([(self.values(), self.volumes[:1]),
++                             (self.values(), self.volumes[1:])])
++        self.assertEqual(1, len(winners))
++        self.assertEqual(1, len(self.locks()))
++
++    def test_identical_concurrent_request_returns_same_operation(self):
++        self.prepare_volumes()
++        values = self.values()
++        winners = self.race([(values, self.volumes),
++                             (copy.deepcopy(values), self.volumes)])
++        self.assertEqual(2, len(winners))
++        self.assertEqual(winners[0]['id'], winners[1]['id'])
++
++
++class TestCheckpointMySQL(ConcurrencyTests,
++                          test_fixtures.OpportunisticDBTestMixin,
++                          test_base.BaseTestCase):
++    FIXTURE = test_fixtures.MySQLOpportunisticFixture
++    SKIP_ON_UNAVAILABLE_DB = False
++
++
++class TestCheckpointPostgreSQL(ConcurrencyTests,
++                               test_fixtures.OpportunisticDBTestMixin,
++                               test_base.BaseTestCase):
++    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
++    SKIP_ON_UNAVAILABLE_DB = False
+diff --git a/cinder/tests/unit/db/test_migrations.py b/cinder/tests/unit/db/test_migrations.py
+index 8e1676d..a260f34 100644
+--- a/cinder/tests/unit/db/test_migrations.py
++++ b/cinder/tests/unit/db/test_migrations.py
+@@ -316,6 +316,54 @@ class MigrationsWalk(
+         ).get_current_head()
+         self.assertEqual(head, migration.db_version())
+ 
++    def test_checkpoint_journal_schema(self):
++        migration.db_sync(engine=self.engine)
++        inspector = sqlalchemy.inspect(self.engine)
++        for name in ('checkpoint_instances', 'checkpoint_operations',
++                     'checkpoint_resources', 'checkpoint_steps',
++                     'checkpoint_volume_locks'):
++            self.assertIn(name, inspector.get_table_names())
++
++    def _pre_upgrade_7fa82e10c601(self, connection):
++        # Compare complete legacy records across the additive upgrade.
++        volume_types = db_utils.get_table(connection, 'volume_types')
++        volume_type_id = '11111111-1111-4111-8111-111111111111'
++        connection.execute(volume_types.insert().values(
++            id=volume_type_id, name='checkpoint-migration-test'))
++        self._checkpoint_legacy_rows = {}
++        for name, values in (
++                ('volumes', {
++                    'id': '22222222-2222-4222-8222-222222222222',
++                    'volume_type_id': volume_type_id, 'size': 17,
++                    'status': 'available', 'deleted': False}),
++                ('snapshots', {
++                    'id': '33333333-3333-4333-8333-333333333333',
++                    'volume_id': '22222222-2222-4222-8222-222222222222',
++                    'volume_type_id': volume_type_id, 'volume_size': 17,
++                    'status': 'available', 'deleted': False})):
++            table = db_utils.get_table(connection, name)
++            connection.execute(table.insert().values(**values))
++            row = connection.execute(table.select().where(
++                table.c.id == values['id'])).mappings().one()
++            self._checkpoint_legacy_rows[name] = dict(row)
++
++    def _check_7fa82e10c601(self, connection):
++        for name, expected in self._checkpoint_legacy_rows.items():
++            table = db_utils.get_table(connection, name)
++            actual = connection.execute(table.select().where(
++                table.c.id == expected['id'])).mappings().one()
++            self.assertEqual(expected, dict(actual))
++        inspector = sqlalchemy.inspect(connection)
++        for name in ('checkpoint_instances', 'checkpoint_operations',
++                     'checkpoint_resources', 'checkpoint_steps',
++                     'checkpoint_volume_locks'):
++            self.assertIn(name, inspector.get_table_names())
++        constraints = inspector.get_unique_constraints('checkpoint_operations')
++        self.assertIn(['project_id', 'request_id'],
++                      [item['column_names'] for item in constraints])
++        self.assertIn(['create_checkpoint_id'],
++                      [item['column_names'] for item in constraints])
++
+     def _pre_upgrade_c92a3e68beed(self, connection):
+         """Test shared_targets is nullable."""
+         table = db_utils.get_table(connection, 'volumes')
+diff --git a/cinder/tests/unit/objects/test_checkpoint.py b/cinder/tests/unit/objects/test_checkpoint.py
+new file mode 100644
+index 0000000..71db4f7
+--- /dev/null
++++ b/cinder/tests/unit/objects/test_checkpoint.py
+@@ -0,0 +1,48 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from cinder import db
++from cinder import objects
++from cinder.objects import base
++from cinder.tests.unit.checkpoints import test_db
++from cinder.tests.unit import test
++
++
++class TestCheckpointObjects(test_db.CheckpointDBHelpers, test.TestCase):
++    def test_operation_wire_roundtrip_preserves_step_identity(self):
++        self.prepare_volumes()
++        operation = self.reserve()
++        obj = objects.CheckpointOperation.get_by_id(self.ctxt, operation['id'])
++        restored = base.CinderObject.obj_from_primitive(
++            obj.obj_to_primitive(), context=self.ctxt)
++        self.assertEqual(obj.id, restored.id)
++        self.assertEqual(obj.generation, restored.generation)
++        self.assertEqual(operation['steps'][0]['id'], restored.steps[0].id)
++        self.assertEqual(operation['resources'][0]['snapshot_id'],
++                         restored.resources[0].snapshot_id)
++
++    def test_new_objects_have_models_and_can_be_listed(self):
++        self.prepare_volumes()
++        operation = self.reserve()
++        for name in ('CheckpointInstance', 'CheckpointOperation',
++                     'CheckpointResource', 'CheckpointStep',
++                     'CheckpointVolumeLock'):
++            obj_type = getattr(objects, name)
++            model = db.get_model_for_versioned_object(obj_type)
++            self.assertIsNotNone(model)
++            records = getattr(objects, name + 'List').get_all(self.ctxt)
++            self.assertGreater(len(records), 0)
++            self.assertTrue(all(isinstance(item, obj_type)
++                                for item in records))
++        self.assertEqual(operation['id'],
++                         objects.CheckpointOperationList.get_all(
++                             self.ctxt)[0].id)
+diff --git a/cinder/tests/unit/objects/test_objects.py b/cinder/tests/unit/objects/test_objects.py
+index ef37afe..2d40840 100644
+--- a/cinder/tests/unit/objects/test_objects.py
++++ b/cinder/tests/unit/objects/test_objects.py
+@@ -23,6 +23,16 @@ from cinder.tests.unit import test
+ # NOTE: The hashes in this list should only be changed if they come with a
+ # corresponding version bump in the affected objects.
+ object_data = {
++    'CheckpointInstance': '1.0-e6e05d9743a2bef7d33ad8ad3dc2befb',
++    'CheckpointInstanceList': '1.0-15ecf022a68ddbb8c2a6739cfc9f8f5e',
++    'CheckpointOperation': '1.0-dd1c623b450ade00956e90bf4d68e717',
++    'CheckpointOperationList': '1.0-15ecf022a68ddbb8c2a6739cfc9f8f5e',
++    'CheckpointResource': '1.0-ee32f7a21b6a0184a182fbdcdc1c93b8',
++    'CheckpointResourceList': '1.0-15ecf022a68ddbb8c2a6739cfc9f8f5e',
++    'CheckpointStep': '1.0-cb71fbf8072886a415cdb3ca089de403',
++    'CheckpointStepList': '1.0-15ecf022a68ddbb8c2a6739cfc9f8f5e',
++    'CheckpointVolumeLock': '1.0-d56b59677f1b4fdb5c9873c9a0b72335',
++    'CheckpointVolumeLockList': '1.0-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'Backup': '1.7-fffdbcd5da3c30750916fa2cc0e8ffb5',
+     'BackupDeviceInfo': '1.0-74b3950676c690538f4bc6796bd0042e',
+     'BackupImport': '1.7-fffdbcd5da3c30750916fa2cc0e8ffb5',

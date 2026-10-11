@@ -1,0 +1,2214 @@
+From 00e21b956735aeca39e835d1ef967d658ad67ddc Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 22:11:25 +0300
+Subject: [PATCH 06/10] feat: implement guarded libvirt checkpoint runtime
+ effects
+
+---
+ .../unit/virt/libvirt/checkpoints/fixtures.py |   6 +-
+ .../checkpoints/test_native_runtime.py        |  87 +++
+ .../virt/libvirt/checkpoints/test_runtime.py  | 379 +++++++++++
+ .../virt/libvirt/checkpoints/test_topology.py | 407 ++++++++++++
+ nova/virt/libvirt/checkpoints/journal.py      |  15 +
+ nova/virt/libvirt/checkpoints/runtime.py      | 301 +++++++++
+ nova/virt/libvirt/checkpoints/staging.py      | 173 ++++-
+ nova/virt/libvirt/checkpoints/topology.py     | 629 ++++++++++++++++++
+ nova/virt/libvirt/guest.py                    |  29 +
+ nova/virt/libvirt/host.py                     |   9 +
+ 10 files changed, 2031 insertions(+), 4 deletions(-)
+ create mode 100644 nova/tests/unit/virt/libvirt/checkpoints/test_native_runtime.py
+ create mode 100644 nova/tests/unit/virt/libvirt/checkpoints/test_runtime.py
+ create mode 100644 nova/tests/unit/virt/libvirt/checkpoints/test_topology.py
+ create mode 100644 nova/virt/libvirt/checkpoints/runtime.py
+ create mode 100644 nova/virt/libvirt/checkpoints/topology.py
+
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/fixtures.py b/nova/tests/unit/virt/libvirt/checkpoints/fixtures.py
+index 93447d031dc88ca586feab35abdb4a1b98bf074a..3221b657d7a59a93eec54dd0d1a5fdfb46469143 100644
+--- a/nova/tests/unit/virt/libvirt/checkpoints/fixtures.py
++++ b/nova/tests/unit/virt/libvirt/checkpoints/fixtures.py
+@@ -37,6 +37,8 @@ LIMIT = 1024 * 1024
+ 
+ 
+ class StoreTestBase(test.TestCase):
++    seed_saved_source = True
++
+     def setUp(self):
+         super().setUp()
+         self.flags(
+@@ -158,6 +160,8 @@ class StoreTestBase(test.TestCase):
+             ).to_primitive(),
+         )
+         self.save_child = self.claim(self.save_parent, 'save')
++        if not self.seed_saved_source:
++            return
+         with self.staging.writer(
+             self.ctx, self.binding, self.save_child
+         ) as writer:
+@@ -218,7 +222,7 @@ class StoreTestBase(test.TestCase):
+         )
+         kind = (
+             'revert'
+-            if phase == 'artifact_stage'
++            if phase in set(workflow_v2.REVERT) - set(workflow_v2.CREATE)
+             else 'cleanup' if phase.startswith('cleanup_') else 'create'
+         )
+         graph = workflow_v2.child_plan(kind, phase, resources)
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/test_native_runtime.py b/nova/tests/unit/virt/libvirt/checkpoints/test_native_runtime.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3488d8049047e3aea3dc8fef9780f7e85cdc68bc
+--- /dev/null
++++ b/nova/tests/unit/virt/libvirt/checkpoints/test_native_runtime.py
+@@ -0,0 +1,87 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from types import SimpleNamespace
++from unittest import mock
++
++from nova import test
++from nova.virt.libvirt import guest
++from nova.virt.libvirt import host
++
++
++class NativeRuntimeTest(test.NoDBTestCase):
++    def setUp(self):
++        super().setUp()
++        # Values also checked against the actual Linux libvirt binding in the
++        # qualification gate. Ordinary Nova tests need no native installation.
++        constants = SimpleNamespace(
++            VIR_DOMAIN_SAVE_PAUSED=4,
++            VIR_DOMAIN_XML_SECURE=1,
++            VIR_DOMAIN_JOB_NONE=0,
++            VIR_DOMAIN_SHUTOFF=5,
++            VIR_DOMAIN_METADATA_ELEMENT=2,
++            VIR_DOMAIN_AFFECT_LIVE=1,
++            VIR_DOMAIN_AFFECT_CONFIG=2,
++        )
++        self.patch(guest, 'libvirt', constants)
++        self.patch(host, 'libvirt', constants)
++        self.domain = mock.Mock()
++        self.guest = guest.Guest(self.domain)
++        self.host = host.Host('qemu:///system')
++        self.conn = mock.Mock()
++        self.patch(
++            self.host, 'get_connection', mock.Mock(return_value=self.conn)
++        )
++
++    def test_dedicated_save_and_paused_restore_leave_managed_save_alone(
++        self,
++    ):
++        self.guest.checkpoint_save('/pinned/image', '<domain/>')
++        self.domain.saveFlags.assert_called_once_with(
++            '/pinned/image', '<domain/>', 0
++        )
++        self.domain.managedSave.assert_not_called()
++        self.host.checkpoint_restore('/pinned/image', '<domain/>')
++        self.conn.restoreFlags.assert_called_once_with(
++            '/pinned/image', '<domain/>', 4
++        )
++        self.domain.resume.assert_not_called()
++        self.host.checkpoint_saved_xml('/pinned/image')
++        self.conn.saveImageGetXMLDesc.assert_called_once_with(
++            '/pinned/image', 1
++        )
++        self.conn.saveImageDefineXML.assert_not_called()
++
++    def test_state_does_not_convert_failed_job_query_to_idle(self):
++        self.domain.state.return_value = (1, 0)
++        self.domain.hasManagedSaveImage.return_value = 0
++        self.domain.jobStats.side_effect = RuntimeError('disconnected')
++        self.assertRaises(RuntimeError, self.guest.checkpoint_state)
++        self.domain.state.return_value = (5, 0)
++        self.assertEqual(
++            dict(state=5, managed_save=False, job=0),
++            self.guest.checkpoint_state(),
++        )
++
++    def test_marker_updates_both_configs_and_stop_has_no_detach(self):
++        self.guest.checkpoint_set_marker('<checkpoint/>')
++        self.domain.setMetadata.assert_called_once_with(
++            2,
++            '<checkpoint/>',
++            'checkpoint',
++            'urn:openstack:nova:checkpoint:2',
++            3,
++        )
++        self.guest.checkpoint_stop()
++        self.domain.destroyFlags.assert_called_once_with(0)
++        self.domain.detachDeviceFlags.assert_not_called()
++        self.domain.undefine.assert_not_called()
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/test_runtime.py b/nova/tests/unit/virt/libvirt/checkpoints/test_runtime.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..918b864829e342025f66d960ffd700d57d305e68
+--- /dev/null
++++ b/nova/tests/unit/virt/libvirt/checkpoints/test_runtime.py
+@@ -0,0 +1,379 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import os
++from pathlib import Path
++from types import SimpleNamespace
++from unittest import mock
++
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova import objects
++from nova.tests.unit.virt.libvirt.checkpoints import fixtures
++from nova.tests.unit.virt.libvirt.checkpoints.test_topology import XML
++from nova.virt.libvirt.checkpoints import runtime
++from nova.virt.libvirt.checkpoints import topology
++
++
++class RuntimeBase(fixtures.StoreTestBase):
++    def setUp(self):
++        super().setUp()
++        self.instance = SimpleNamespace(
++            uuid=self.binding.instance_uuid,
++            host=self.binding.host,
++            node=self.binding.node,
++            project_id=self.binding.project_id,
++        )
++        self.state = 1
++        self.xml = XML.replace(uuids.instance, self.instance.uuid)
++        self.guest = mock.Mock(uuid=self.instance.uuid)
++        self.guest.get_xml_desc.side_effect = lambda **kw: self.xml
++        self.guest.checkpoint_state.side_effect = lambda: dict(
++            state=self.state, managed_save=False, job=0
++        )
++        self.guest.checkpoint_set_marker.side_effect = self.set_marker
++        self.guest.checkpoint_save.side_effect = self.save
++        self.guest.checkpoint_stop.side_effect = lambda: self.set_state(5)
++        self.guest.resume.side_effect = lambda: self.set_state(1)
++        self.host = mock.Mock()
++        self.host.get_guest.return_value = self.guest
++        self.host.checkpoint_saved_xml.side_effect = lambda path: self.xml
++        self.host.checkpoint_restore.side_effect = self.restore
++        self.inspector = mock.Mock()
++        self.inspector.inspect.return_value = dict(
++            runtime_fingerprint=self.binding.runtime_fingerprint
++        )
++        self.inspector.restore_xml.side_effect = (
++            topology.Topology.restore_xml
++        )
++        self.runtime = runtime.Runtime(
++            self.host, self.staging, self.inspector
++        )
++        self.snapshot = dict(
++            runtime_fingerprint=self.binding.runtime_fingerprint
++        )
++
++    def set_state(self, state):
++        self.state = state
++
++    def set_marker(self, marker):
++        root = topology.document(self.xml)
++        from lxml import etree
++
++        metadata = root.find('metadata')
++        if metadata is not None:
++            root.remove(metadata)
++        metadata = etree.SubElement(root, 'metadata')
++        metadata.append(etree.fromstring(marker.encode()))
++        self.xml = etree.tostring(root, encoding='unicode')
++
++    def save(self, path, xml):
++        # The native writer reopens this path; verify the FD pins the workspace
++        # and the unrepeatable artifact UUID remains part of the suffix.
++        self.assertRegex(
++            path, r'^/proc/[0-9]+/fd/[0-9]+/artifacts/[0-9a-f-]+/data$'
++        )
++        with open(path, 'wb') as stream:
++            stream.write(b'libvirt-complete-save-image')
++        self.xml = xml
++        self.state = 5
++
++    def restore(self, path, xml):
++        self.assertTrue(Path(path).is_file())
++        self.xml = xml
++        self.state = 3
++
++    def new_save(self):
++        return self.save_child
++
++    def restored(self):
++        self.state = 5
++        parent = self.parent('runtime_restore_current', [])
++        child = self.claim(parent, 'restore_paused')
++        result = self.runtime.restore_paused(
++            self.ctx,
++            self.instance,
++            child,
++            self.source,
++            self.workspace,
++            self.xml,
++        )
++        return parent, child, result
++
++
++class SaveRuntimeTest(RuntimeBase):
++    seed_saved_source = False
++
++    def test_save_has_backend_receipt_and_query_never_reissues(self):
++        child = self.new_save()
++        result = self.runtime.save(
++            self.ctx, self.instance, child, self.workspace, self.snapshot
++        )
++        self.assertEqual('succeeded', result.status)
++        self.assertTrue(result.evidence['writes_stopped'])
++        observed = self.runtime.query(self.ctx, self.instance, child)
++        self.assertEqual(result, observed)
++        self.assertEqual(1, self.guest.checkpoint_save.call_count)
++        self.assertEqual(
++            result,
++            self.runtime.save(
++                self.ctx,
++                self.instance,
++                child,
++                self.workspace,
++                self.snapshot,
++            ),
++        )
++        self.assertEqual(1, self.guest.checkpoint_save.call_count)
++
++    def test_save_call_reply_loss_even_complete_image_is_unknown(self):
++        child = self.new_save()
++
++        def lost(path, xml):
++            self.save(path, xml)
++            raise RuntimeError('connection lost')
++
++        self.guest.checkpoint_save.side_effect = lost
++        result = self.runtime.save(
++            self.ctx, self.instance, child, self.workspace, self.snapshot
++        )
++        self.assertEqual('unknown', result.status)
++        self.assertEqual(
++            'unknown',
++            self.runtime.query(self.ctx, self.instance, child).status,
++        )
++        self.runtime.save(
++            self.ctx, self.instance, child, self.workspace, self.snapshot
++        )
++        self.assertEqual(1, self.guest.checkpoint_save.call_count)
++        self.guest.resume.assert_not_called()
++
++    def test_active_job_or_managed_save_prevents_new_save(self):
++        child = self.new_save()
++        for state in (
++            dict(state=1, job=1, managed_save=False),
++            dict(state=1, job=0, managed_save=True),
++        ):
++            self.guest.checkpoint_state.side_effect = lambda: state
++            self.assertEqual(
++                'unknown',
++                self.runtime.save(
++                    self.ctx,
++                    self.instance,
++                    child,
++                    self.workspace,
++                    self.snapshot,
++                ).status,
++            )
++        self.guest.checkpoint_save.assert_not_called()
++
++
++class RuntimeTest(RuntimeBase):
++    def test_stop_has_completion_receipt_and_never_detaches(self):
++        parent = self.parent('runtime_stop', [])
++        child = self.claim(parent, 'stop')
++        result = self.runtime.stop(
++            self.ctx, self.instance, child, self.snapshot
++        )
++        self.assertEqual('succeeded', result.status)
++        self.assertEqual(
++            result, self.runtime.query(self.ctx, self.instance, child)
++        )
++        self.guest.checkpoint_stop.assert_called_once_with()
++        self.guest.resume.assert_not_called()
++
++    def test_receipts_are_removed_only_after_closed_runtime_and_artifacts(
++        self,
++    ):
++        parent, restored, result = self.restored()
++        objects.CheckpointEffect.observe(
++            self.ctx, restored.id, 1, result.to_primitive()
++        )
++        child = self.claim(parent, 'unpause')
++        result = self.runtime.unpause(
++            self.ctx, self.instance, child, self.binding
++        )
++        self.assertEqual(
++            self.binding.db_fingerprint, result.evidence['fingerprint']
++        )
++        objects.CheckpointEffect.observe(
++            self.ctx, child.id, 1, result.to_primitive()
++        )
++        cleanup = self.parent(
++            'staging_cleanup',
++            [
++                dict(
++                    id=self.source.id,
++                    kind='ram',
++                    location='staging',
++                    upper_bound=fixtures.LIMIT,
++                )
++            ],
++        )
++        deletion = self.claim(cleanup, 'delete')
++        result = self.staging.cleanup(self.ctx, self.binding, deletion)
++        self.assertEqual('succeeded', result.status)
++        objects.CheckpointEffect.observe(
++            self.ctx, deletion.id, 1, result.to_primitive()
++        )
++        release = self.claim(cleanup, 'release_staging')
++        self.assertEqual(
++            'succeeded',
++            self.staging.cleanup(self.ctx, self.binding, release).status,
++        )
++        self.assertFalse(Path(self.workspace['path']).exists())
++
++    def test_seal_and_shutoff_without_runtime_receipt_are_unknown(self):
++        self.state = 5
++        self.assertEqual(
++            'unknown',
++            self.runtime.query(
++                self.ctx, self.instance, self.save_child
++            ).status,
++        )
++        self.guest.checkpoint_save.assert_not_called()
++
++    def test_restore_always_paused_and_query_requires_receipt(self):
++        parent, child, result = self.restored()
++        self.assertEqual('succeeded', result.status)
++        self.assertEqual('PAUSED', result.evidence['power_state'])
++        self.assertEqual(
++            result, self.runtime.query(self.ctx, self.instance, child)
++        )
++        self.guest.resume.assert_not_called()
++        self.assertEqual(1, self.host.checkpoint_restore.call_count)
++
++    def test_restore_reply_loss_marker_and_paused_state_are_insufficient(
++        self,
++    ):
++        def lost(path, xml):
++            self.restore(path, xml)
++            raise RuntimeError('connection lost')
++
++        self.host.checkpoint_restore.side_effect = lost
++        parent, child, result = self.restored()
++        self.assertEqual(3, self.state)
++        self.assertEqual('unknown', result.status)
++        self.assertEqual(
++            'unknown',
++            self.runtime.query(self.ctx, self.instance, child).status,
++        )
++        self.guest.resume.assert_not_called()
++
++    def test_unpause_revalidates_then_has_recoverable_receipt(self):
++        parent, restored, result = self.restored()
++        objects.CheckpointEffect.observe(
++            self.ctx, restored.id, 1, result.to_primitive()
++        )
++        child = self.claim(parent, 'unpause')
++        result = self.runtime.unpause(
++            self.ctx, self.instance, child, self.binding
++        )
++        self.assertEqual('succeeded', result.status)
++        self.assertEqual('RUNNING', result.evidence['power_state'])
++        self.assertEqual(
++            result, self.runtime.query(self.ctx, self.instance, child)
++        )
++        self.guest.resume.assert_called_once_with()
++
++    def test_changed_topology_prevents_unpause(self):
++        parent, restored, result = self.restored()
++        objects.CheckpointEffect.observe(
++            self.ctx, restored.id, 1, result.to_primitive()
++        )
++        child = self.claim(parent, 'unpause')
++        self.inspector.inspect.side_effect = ValueError(
++            'port or key changed'
++        )
++        self.assertEqual(
++            'unknown',
++            self.runtime.unpause(
++                self.ctx, self.instance, child, self.binding
++            ).status,
++        )
++        self.guest.resume.assert_not_called()
++        self.assertEqual(3, self.state)
++
++    def test_guest_dies_during_unpause_is_unknown(self):
++        parent, restored, result = self.restored()
++        objects.CheckpointEffect.observe(
++            self.ctx, restored.id, 1, result.to_primitive()
++        )
++        child = self.claim(parent, 'unpause')
++        self.guest.resume.side_effect = lambda: self.set_state(5)
++        self.assertEqual(
++            'unknown',
++            self.runtime.unpause(
++                self.ctx, self.instance, child, self.binding
++            ).status,
++        )
++        self.assertEqual(
++            'unknown',
++            self.runtime.query(self.ctx, self.instance, child).status,
++        )
++
++    def test_unpause_reply_loss_does_not_resume_twice(self):
++        parent, restored, result = self.restored()
++        objects.CheckpointEffect.observe(
++            self.ctx, restored.id, 1, result.to_primitive())
++        child = self.claim(parent, 'unpause')
++
++        def lost():
++            self.set_state(1)
++            raise RuntimeError('libvirt reply lost')
++
++        self.guest.resume.side_effect = lost
++        self.assertEqual('unknown', self.runtime.unpause(
++            self.ctx, self.instance, child, self.binding).status)
++        self.assertEqual('unknown', self.runtime.query(
++            self.ctx, self.instance, child).status)
++        self.runtime.unpause(self.ctx, self.instance, child, self.binding)
++        self.guest.resume.assert_called_once_with()
++
++    def test_foreign_uuid_or_marker_invalidates_completion(self):
++        parent, child, result = self.restored()
++        self.guest.uuid = uuids.foreign
++        self.assertEqual(
++            'unknown',
++            self.runtime.query(self.ctx, self.instance, child).status,
++        )
++        self.guest.uuid = self.instance.uuid
++        self.xml = self.xml.replace(child.id, uuids.foreign)
++        self.assertEqual(
++            'unknown',
++            self.runtime.query(self.ctx, self.instance, child).status,
++        )
++
++    def test_staging_cannot_be_deleted_with_unknown_restore_reader(self):
++        parent, child, result = self.restored()
++        # SQL still says dispatching: external ownership is unresolved.
++        cleanup = self.parent(
++            'staging_cleanup',
++            [
++                dict(
++                    id=self.source.id,
++                    kind='ram',
++                    location='staging',
++                    upper_bound=fixtures.LIMIT,
++                )
++            ],
++        )
++        deletion = self.claim(cleanup, 'delete')
++        self.assertEqual(
++            'unknown',
++            self.staging.cleanup(self.ctx, self.binding, deletion).status,
++        )
++        with self.staging.reader(self.ctx, self.binding, self.source) as (
++            fd,
++            info,
++        ):
++            self.assertGreater(os.fstat(fd).st_size, 0)
+diff --git a/nova/tests/unit/virt/libvirt/checkpoints/test_topology.py b/nova/tests/unit/virt/libvirt/checkpoints/test_topology.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c11515516224f2f61c0e384880303f71e546237
+--- /dev/null
++++ b/nova/tests/unit/virt/libvirt/checkpoints/test_topology.py
+@@ -0,0 +1,407 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import copy
++from types import SimpleNamespace
++from unittest import mock
++
++import ddt
++from lxml import etree
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import contracts as c
++from nova import context
++from nova import objects
++from nova import test
++from nova.virt.libvirt.checkpoints import profiles
++from nova.virt.libvirt.checkpoints import topology
++
++
++XML = '''<domain type="kvm">
++<name>instance-000001</name>
++<uuid>{instance}</uuid>
++<memory unit="KiB">524288</memory>
++<currentMemory unit="KiB">524288</currentMemory>
++<vcpu>1</vcpu>
++<os>
++<type arch="x86_64" machine="pc-q35-9.2">hvm</type>
++</os>
++<cpu mode="custom" match="exact">
++<model>Skylake-Client</model>
++<feature policy="require" name="ssse3"/>
++</cpu>
++<devices>
++<emulator>/usr/bin/qemu-system-x86_64</emulator>
++<disk type="block" device="disk">
++<driver name="qemu" type="raw" cache="none"/>
++<source dev="/dev/mapper/disk-original"/>
++<target dev="vda" bus="virtio"/>
++<serial>{volume}</serial>
++<address type="pci"
++ domain="0x0000" bus="0x00" slot="0x05" function="0x0"/>
++</disk>
++<interface type="bridge">
++<mac address="fa:16:3e:00:00:01"/>
++<model type="virtio"/>
++<source bridge="br-current"/>
++<target dev="tap-current"/>
++<address type="pci"
++ domain="0x0000" bus="0x00" slot="0x03" function="0x0"/>
++</interface>
++<controller type="pci" model="pcie-root" index="0"/>
++<memballoon model="virtio"/>
++</devices>
++</domain>'''.format(
++    instance=uuids.instance, volume=uuids.volume
++)
++
++
++def manifest():
++    return dict(
++        instance_uuid=uuids.instance,
++        host='compute',
++        node='node',
++        flavor=dict(
++            memory_mb=512,
++            vcpus=1,
++            root_gb=0,
++            ephemeral_gb=0,
++            swap=0,
++            extra_specs={},
++        ),
++        image_properties={},
++        config_drive=None,
++        disks=[
++            dict(
++                uuid=uuids.bdm,
++                volume_id=uuids.volume,
++                serial=uuids.volume,
++                device_name='/dev/vda',
++                boot_index=0,
++                device_properties={},
++            )
++        ],
++        ports=[
++            dict(
++                uuid=uuids.port,
++                mac='fa:16:3e:00:00:01',
++                network_uuid=uuids.network,
++                vnic_type='normal',
++                model='virtio',
++            )
++        ],
++        shares=[],
++        runtime_key_fingerprints=[],
++    )
++
++
++@ddt.ddt
++class TopologyTest(test.NoDBTestCase):
++    def setUp(self):
++        super().setUp()
++        self.ctx = context.RequestContext('actor', 'project')
++        self.instance = SimpleNamespace(
++            uuid=uuids.instance,
++            host='compute',
++            node='node',
++            project_id='project',
++        )
++        self.guest = mock.Mock(uuid=uuids.instance)
++        self.guest.get_xml_desc.return_value = XML
++        self.guest.checkpoint_state.return_value = dict(
++            state=1, job=0, managed_save=False
++        )
++        self.guest.checkpoint_block_job.return_value = {}
++        self.host = mock.Mock()
++        self.host.get_guest.return_value = self.guest
++        self.observed = dict(
++            kind='runtime',
++            libvirt_version=11010000,
++            qemu_version=9002000,
++            architecture='x86_64',
++            machine='pc-q35-9.2',
++            path_access='same-pid-namespace-proc-fd',
++            kvm=True,
++        )
++        self.profile = profiles.ProfileMatch(
++            uuids.runtime,
++            'runtime',
++            c.canonical_payload_hash(self.observed),
++            'a' * 64,
++            self.observed,
++            dict(
++                max_memory_bytes=1024**3,
++                save_bytes_limit=2 * 1024**3,
++                restore_bytes_limit=2 * 1024**3,
++            ),
++        )
++        self.neutron = mock.Mock()
++        self.port = dict(
++            id=uuids.port,
++            device_id=uuids.instance,
++            network_id=uuids.network,
++            mac_address='fa:16:3e:00:00:01',
++            project_id='project',
++            status='ACTIVE',
++            **{
++                'binding:host_id': 'compute',
++                'binding:vnic_type': 'normal',
++                'binding:vif_type': 'ovs',
++            },
++        )
++        self.neutron.show_port.side_effect = lambda ident: {
++            'port': self.port
++        }
++        self.volumes = {
++            uuids.volume: dict(
++                id=uuids.volume,
++                multiattach=False,
++                encrypted=False,
++                attachments=[
++                    dict(
++                        server_id=uuids.instance,
++                        attachment_id=uuids.attachment,
++                    )
++                ],
++            )
++        }
++        self.expected_disk = etree.tostring(
++            topology.document(XML).find('devices/disk'), encoding='unicode'
++        )
++        self.expected_interface = etree.tostring(
++            topology.document(XML).find('devices/interface'),
++            encoding='unicode',
++        )
++        self.inspector = topology.Topology(
++            self.host,
++            profileset=profiles.ProfileSet((self.profile,)),
++            observer=lambda guest, xml: copy.deepcopy(self.observed),
++            neutron_factory=lambda ctx: self.neutron,
++            volume_reader=lambda ctx, ids, purpose, operation_id: self.volumes,
++            source_reader=lambda ctx, instance, disk: self.expected_disk,
++            interface_reader=self.interface_xml,
++        )
++        self.manifest = manifest()
++
++    def interface_xml(self, context, instance, port):
++        return self.expected_interface
++
++    def inspect(self, purpose='create', saved_binding=None):
++        return self.inspector.inspect(
++            self.ctx, self.instance, self.manifest, purpose, saved_binding
++        )
++
++    def test_runtime_identity_is_separate_and_has_no_host_paths(self):
++        result = self.inspect()
++        self.assertEqual(64, len(result['runtime_fingerprint']))
++        self.assertEqual(uuids.runtime, result['runtime_profile_id'])
++        self.assertNotIn('/dev/mapper', str(result))
++        self.assertNotIn('connection_info', str(result))
++        self.neutron.show_port.assert_called_once_with(uuids.port)
++
++    @ddt.data(
++        'ephemeral',
++        'swap',
++        'shares',
++        'multiattach',
++        'uefi',
++        'tpm',
++        'passthrough',
++        'block_job',
++        'managed_save',
++        'local_disk',
++        'writable_config',
++        'foreign_domain',
++        'changed_port',
++        'missing_auth',
++    )
++    def test_unsupported_before_effect(self, condition):
++        if condition in ('ephemeral', 'swap'):
++            self.manifest['flavor'][
++                {'ephemeral': 'ephemeral_gb', 'swap': 'swap'}[condition]
++            ] = 1
++        elif condition == 'shares':
++            self.manifest['shares'] = [uuids.share]
++        elif condition == 'multiattach':
++            self.volumes[uuids.volume]['multiattach'] = True
++        elif condition in ('uefi', 'tpm', 'passthrough'):
++            insertion = {
++                'uefi': '<os firmware="efi"/>',
++                'tpm': '<devices><tpm/></devices>',
++                'passthrough': '<devices><hostdev/></devices>',
++            }[condition]
++            self.guest.get_xml_desc.return_value = XML.replace(
++                '</domain>', insertion + '</domain>'
++            )
++        elif condition == 'block_job':
++            self.guest.checkpoint_block_job.return_value = {'type': 1}
++        elif condition == 'managed_save':
++            self.guest.checkpoint_state.return_value['managed_save'] = True
++        elif condition == 'local_disk':
++            self.guest.get_xml_desc.return_value = XML.replace(
++                '</devices>',
++                '<disk type="file" device="disk">'
++                '<source file="/tmp/root"/></disk></devices>',
++            )
++        elif condition == 'writable_config':
++            self.manifest['config_drive'] = 'True'
++            self.guest.get_xml_desc.return_value = XML.replace(
++                '</devices>',
++                '<disk type="file" device="cdrom">'
++                '<source file="/tmp/config"/></disk></devices>',
++            )
++        elif condition == 'foreign_domain':
++            self.guest.uuid = uuids.foreign
++        elif condition == 'changed_port':
++            self.port['binding:host_id'] = 'other-host'
++        else:
++            self.neutron.show_port.side_effect = RuntimeError(
++                'no credentials'
++            )
++        self.assertRaises(ValueError, self.inspect)
++
++    def test_host_sources_can_change_but_cpu_and_addresses_cannot(self):
++        before = self.inspect()
++        updated = XML.replace(
++            '/dev/mapper/disk-original', '/dev/mapper/disk-new'
++        )
++        updated = updated.replace('br-current', 'br-new').replace(
++            'tap-current', 'tap-new'
++        )
++        self.guest.get_xml_desc.return_value = updated
++        self.expected_disk = self.expected_disk.replace(
++            '/dev/mapper/disk-original', '/dev/mapper/disk-new'
++        )
++        self.expected_interface = self.expected_interface.replace(
++            'br-current', 'br-new'
++        ).replace('tap-current', 'tap-new')
++        after = self.inspect()
++        self.assertEqual(
++            before['runtime_fingerprint'], after['runtime_fingerprint']
++        )
++        for old, new in (
++            ('Skylake-Client', 'EPYC'),
++            ('slot="0x05"', 'slot="0x06"'),
++        ):
++            self.guest.get_xml_desc.return_value = updated.replace(
++                old, new
++            )
++            self.assertNotEqual(
++                before['runtime_fingerprint'],
++                self.inspect()['runtime_fingerprint'],
++            )
++
++    def test_missing_profile_or_expected_shutoff_is_not_running_create(
++        self,
++    ):
++        self.observed['qemu_version'] += 1
++        self.assertRaises(ValueError, self.inspect)
++        self.observed['qemu_version'] -= 1
++        self.guest.checkpoint_state.return_value['state'] = 5
++        self.assertRaises(ValueError, self.inspect)
++        # A later operation-owned phase supplies its saved binding and may
++        # inspect the persistent inactive domain without assuming RUNNING.
++        self.assertRaises(ValueError, self.inspect, 'recover', None)
++
++    def test_source_must_match_current_bdm_volume_driver(self):
++        self.guest.get_xml_desc.return_value = XML.replace(
++            '/dev/mapper/disk-original', '/dev/foreign'
++        )
++        self.assertRaises(ValueError, self.inspect)
++
++    def binding(self):
++        return SimpleNamespace(
++            instance_uuid=uuids.instance,
++            host='compute',
++            node='node',
++            project_id='project',
++            checkpoint_id=uuids.checkpoint,
++            runtime_profile_id=uuids.runtime,
++            runtime_fingerprint=self.inspect()['runtime_fingerprint'],
++        )
++
++    @mock.patch.object(objects.InstanceCheckpoint, 'get_by_uuid')
++    def test_owned_shutoff_allows_down_ports_but_paused_does_not(
++        self, get
++    ):
++        get.return_value = SimpleNamespace(
++            active_operation_id=uuids.operation
++        )
++        binding = self.binding()
++        self.guest.checkpoint_state.return_value['state'] = 5
++        self.port['status'] = 'DOWN'
++        self.assertEqual(
++            binding.runtime_fingerprint,
++            self.inspect('recover', binding)['runtime_fingerprint'],
++        )
++        self.guest.checkpoint_state.return_value['state'] = 3
++        self.assertRaises(ValueError, self.inspect, 'recover', binding)
++
++    def test_changed_neutron_xml_binding_is_rejected(self):
++        self.guest.get_xml_desc.return_value = XML.replace(
++            'br-current', 'br-foreign'
++        )
++        self.assertRaises(ValueError, self.inspect)
++
++    @mock.patch.object(objects.InstanceCheckpoint, 'get_by_uuid')
++    def test_same_secret_uuid_with_changed_key_is_rejected(self, get):
++        get.return_value = SimpleNamespace(
++            active_operation_id=uuids.operation
++        )
++        encrypted = (
++            '<encryption format="luks">'
++            '<secret type="passphrase" uuid="%s"/></encryption>'
++            % uuids.secret
++        )
++        self.guest.get_xml_desc.return_value = XML.replace(
++            '</disk>', encrypted + '</disk>'
++        )
++        self.expected_disk = self.expected_disk.replace(
++            '</disk>', encrypted + '</disk>'
++        )
++        self.volumes[uuids.volume]['encrypted'] = True
++        self.inspector.key_reader = mock.Mock(return_value='c' * 64)
++        binding = self.binding()
++        self.inspector.key_reader.return_value = 'd' * 64
++        self.assertRaises(ValueError, self.inspect, 'recover', binding)
++
++    def test_restore_xml_preserves_guest_identity(self):
++        before = self.inspect()
++        binding = SimpleNamespace(
++            instance_uuid=uuids.instance,
++            runtime_fingerprint=before['runtime_fingerprint'],
++        )
++        changed = XML.replace(
++            '/dev/mapper/disk-original', '/dev/mapper/disk-new'
++        )
++        value = self.inspector.restore_xml(
++            XML,
++            dict(
++                xml=changed,
++                runtime_fingerprint=binding.runtime_fingerprint,
++            ),
++            binding,
++        )
++        self.assertIn('/dev/mapper/disk-new', value)
++        self.assertEqual(
++            topology.guest_identity(XML), topology.guest_identity(value)
++        )
++        self.assertRaises(
++            ValueError,
++            self.inspector.restore_xml,
++            XML,
++            dict(
++                xml=changed.replace('Skylake-Client', 'EPYC'),
++                runtime_fingerprint=binding.runtime_fingerprint,
++            ),
++            binding,
++        )
+diff --git a/nova/virt/libvirt/checkpoints/journal.py b/nova/virt/libvirt/checkpoints/journal.py
+index 216b235ccb22f7755985a846165cc6ff94b5a33c..36438a06b87cb4c0016de4fe2fa7711514df1b8a 100644
+--- a/nova/virt/libvirt/checkpoints/journal.py
++++ b/nova/virt/libvirt/checkpoints/journal.py
+@@ -18,6 +18,21 @@ from nova.checkpoints import contracts as c
+ from nova.checkpoints import contracts_v2 as v2
+ from nova import objects
+ 
++RUNTIME_ACTIONS = frozenset(('save', 'stop', 'restore_paused', 'unpause'))
++
++
++def runtime_children(context, operation_id, require_closed=False):
++    result = []
++    for step in objects.InstanceCheckpointStepList.get_by_operation(
++            context, operation_id):
++        result.extend(row for row in objects.CheckpointEffect.get_children(
++            context, step.uuid) if row['action'] in RUNTIME_ACTIONS)
++    if require_closed:
++        c._require(all(row['status'] in (
++            'succeeded', 'failed_no_effect', 'failed_with_effects')
++            for row in result))
++    return result
++
+ 
+ def authorize(context, binding, child, write=False):
+     c._require(
+diff --git a/nova/virt/libvirt/checkpoints/runtime.py b/nova/virt/libvirt/checkpoints/runtime.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..091f399e45eae310b85bc1ce4f7708e34f633b3a
+--- /dev/null
++++ b/nova/virt/libvirt/checkpoints/runtime.py
+@@ -0,0 +1,301 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Dedicated synchronous libvirt calls with durable, non-inferred completion.
++
++A matching marker, an inactive domain, or an image header alone never closes a
++child. A lost libvirt reply retains the guard and staging quota for recovery.
++"""
++
++import dataclasses
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova import objects
++from nova.virt.libvirt.checkpoints import journal
++from nova.virt.libvirt.checkpoints import topology as xmltools
++
++
++def unknown():
++    return v2.EffectResult('unknown', {}, 'recovery_required')
++
++
++class Runtime:
++    def __init__(self, host, staging, topology):
++        self.host, self.staging, self.topology = host, staging, topology
++
++    def _binding(self, context, instance, child):
++        operation = objects.InstanceCheckpointOperation.get_by_uuid(
++            context, child.operation_id
++        )
++        binding = v2.Binding.from_primitive(operation.binding)
++        c._require(
++            (
++                instance.uuid,
++                instance.project_id,
++                instance.host,
++                instance.node,
++            ) ==
++            (
++                binding.instance_uuid,
++                binding.project_id,
++                binding.host,
++                binding.node,
++            )
++        )
++        journal.authorize(context, binding, child)
++        return binding
++
++    def _state(self, instance, binding, child, expected, marker=True):
++        guest = self.host.get_guest(instance)
++        c._require(guest.uuid == binding.instance_uuid)
++        state = guest.checkpoint_state()
++        c._require(
++            state == dict(state=expected, managed_save=False, job=0)
++        )
++        xml = guest.get_xml_desc(dump_sensitive=True)
++        c._require(
++            xmltools.document(xml).findtext('uuid') == instance.uuid
++        )
++        if marker:
++            c._require(xmltools.matching_marker(xml, binding, child))
++        return guest, xml
++
++    def _revalidate(self, context, instance, binding):
++        manifest = objects.InstanceCheckpointOperation.device_manifest(
++            context, instance.uuid
++        )
++        c._require(
++            c.device_fingerprint(manifest) == binding.db_fingerprint
++        )
++        result = self.topology.inspect(
++            context, instance, manifest, 'recover', binding
++        )
++        c._require(
++            result['runtime_fingerprint'] == binding.runtime_fingerprint
++        )
++        return result
++
++    def _workspace(self, binding, child, workspace):
++        current = self.staging._entry(binding, child.operation_id)
++        c._require(workspace == current)
++
++    def save(self, context, instance, child, workspace, topology):
++        try:
++            c._require(child.action == 'save')
++            binding = self._binding(context, instance, child)
++            with self.staging.runtime_record(
++                context, binding, child, write=True
++            ) as record:
++                if record.started():
++                    return self.query(context, instance, child)
++                self._workspace(binding, child, workspace)
++                c._require(
++                    topology['runtime_fingerprint'] ==
++                    binding.runtime_fingerprint
++                )
++                self._revalidate(context, instance, binding)
++                guest, xml = self._state(
++                    instance, binding, child, 1, marker=False
++                )
++                xml = xmltools.with_marker(xml, binding, child)
++                with self.staging.writer(
++                    context, binding, child
++                ) as writer:
++                    record.start()
++                    guest.checkpoint_set_marker(
++                        xmltools.marker_xml(binding, child)
++                    )
++                    guest.checkpoint_save(writer.pinned_path, xml)
++                    self._state(instance, binding, child, 5)
++                    artifact = writer.finish()
++                result = v2.EffectResult(
++                    'succeeded',
++                    dict(
++                        writes_stopped=True,
++                        artifacts=[artifact.to_primitive()],
++                    ),
++                    None,
++                )
++                record.finish(result)
++                return result
++        except Exception:
++            return unknown()
++
++    def stop(self, context, instance, child, topology):
++        try:
++            c._require(child.action == 'stop')
++            binding = self._binding(context, instance, child)
++            with self.staging.runtime_record(
++                context, binding, child, write=True
++            ) as record:
++                if record.started():
++                    return self.query(context, instance, child)
++                c._require(
++                    topology['runtime_fingerprint'] ==
++                    binding.runtime_fingerprint
++                )
++                self._revalidate(context, instance, binding)
++                guest, xml = self._state(
++                    instance, binding, child, 1, marker=False
++                )
++                record.start()
++                guest.checkpoint_set_marker(
++                    xmltools.marker_xml(binding, child)
++                )
++                guest.checkpoint_stop()
++                self._state(instance, binding, child, 5)
++                result = v2.EffectResult(
++                    'succeeded',
++                    dict(writes_stopped=True, power_state='SHUTOFF'),
++                    None,
++                )
++                record.finish(result)
++                return result
++        except Exception:
++            return unknown()
++
++    def restore_paused(
++        self, context, instance, child, artifact, workspace, xml
++    ):
++        try:
++            c._require(
++                child.action == 'restore_paused' and
++                artifact.kind == 'ram' and
++                artifact.location == 'staging'
++            )
++            binding = self._binding(context, instance, child)
++            with self.staging.runtime_record(
++                context, binding, child, write=True
++            ) as record:
++                if record.started():
++                    return self.query(context, instance, child)
++                self._workspace(binding, child, workspace)
++                observed = self._revalidate(context, instance, binding)
++                guest, current_xml = self._state(
++                    instance, binding, child, 5, marker=False
++                )
++                c._require(
++                    xmltools.guest_identity(xml) ==
++                    xmltools.guest_identity(current_xml)
++                )
++                with self.staging.pinned_reader(
++                    context, binding, artifact
++                ) as (path, fd, info):
++                    saved_xml = self.host.checkpoint_saved_xml(path)
++                    restore_xml = self.topology.restore_xml(
++                        saved_xml, dict(observed, xml=current_xml), binding
++                    )
++                    restore_xml = xmltools.with_marker(
++                        restore_xml, binding, child
++                    )
++                    record.start()
++                    self.host.checkpoint_restore(path, restore_xml)
++                    self._state(instance, binding, child, 3)
++                    self._revalidate(context, instance, binding)
++                result = v2.EffectResult(
++                    'succeeded',
++                    dict(
++                        fingerprint=binding.db_fingerprint,
++                        power_state='PAUSED',
++                    ),
++                    None,
++                )
++                record.finish(result)
++                return result
++        except Exception:
++            return unknown()
++
++    def unpause(self, context, instance, child, binding):
++        try:
++            c._require(
++                child.action == 'unpause' and
++                binding == self._binding(context, instance, child)
++            )
++            with self.staging.runtime_record(
++                context, binding, child, write=True
++            ) as record:
++                if record.started():
++                    return self.query(context, instance, child)
++                rows = objects.CheckpointEffect.get_children(
++                    context, child.parent_step_id
++                )
++                previous = next(
++                    r for r in rows if r['action'] == 'restore_paused'
++                )
++                c._require(
++                    previous['status'] == 'succeeded' and
++                    child.payload['depends_on'] == (previous['id'],)
++                )
++                restored = v2.ChildIntent(
++                    **{
++                        f.name: previous[f.name]
++                        for f in dataclasses.fields(v2.ChildIntent)
++                    }
++                )
++                c._require(
++                    self.query(context, instance, restored).status ==
++                    'succeeded'
++                )
++                self._revalidate(context, instance, binding)
++                guest, xml = self._state(instance, binding, restored, 3)
++                record.start()
++                guest.checkpoint_set_marker(
++                    xmltools.marker_xml(binding, child)
++                )
++                guest.resume()
++                self._state(instance, binding, child, 1)
++                result = v2.EffectResult(
++                    'succeeded',
++                    dict(
++                        fingerprint=binding.db_fingerprint,
++                        power_state='RUNNING',
++                    ),
++                    None,
++                )
++                record.finish(result)
++                return result
++        except Exception:
++            return unknown()
++
++    def query(self, context, instance, child):
++        """Read receipts and current state; never retry a libvirt effect."""
++        try:
++            binding = self._binding(context, instance, child)
++            with self.staging.runtime_record(
++                context, binding, child
++            ) as record:
++                result = record.read()
++                self._state(
++                    instance,
++                    binding,
++                    child,
++                    {
++                        'save': 5,
++                        'stop': 5,
++                        'restore_paused': 3,
++                        'unpause': 1,
++                    }[child.action],
++                )
++                if child.action == 'save':
++                    artifact = self.staging.sealed_save(
++                        context, binding, child
++                    )
++                    c._require(
++                        result.evidence['artifacts'] ==
++                        (artifact.to_primitive(),)
++                    )
++                if child.action in ('restore_paused', 'unpause'):
++                    self._revalidate(context, instance, binding)
++                return result
++        except Exception:
++            return unknown()
+diff --git a/nova/virt/libvirt/checkpoints/staging.py b/nova/virt/libvirt/checkpoints/staging.py
+index 092698931afcf8f63d9632bf0755a7150e49a986..237888069df11f5d5665485861ddaa9f66f9ef85 100644
+--- a/nova/virt/libvirt/checkpoints/staging.py
++++ b/nova/virt/libvirt/checkpoints/staging.py
+@@ -15,6 +15,8 @@
+ import contextlib
+ import os
+ 
++from oslo_serialization import jsonutils
++
+ from nova.checkpoints import contracts as c
+ from nova.checkpoints import contracts_v2 as v2
+ from nova import exception
+@@ -39,11 +41,20 @@ class Writer:
+     """Private writer, sealed only after the backend writer ends."""
+ 
+     def __init__(
+-        self, directory, descriptor, path, binding, child, row, metadata
++        self,
++        directory,
++        descriptor,
++        path,
++        binding,
++        child,
++        row,
++        metadata,
++        pinned_path,
+     ):
+         self.directory, self.fd, self.path = directory, descriptor, path
+         self.binding, self.child, self.row = binding, child, row
+         self.metadata = metadata
++        self.pinned_path = pinned_path
+ 
+     def finish(self):
+         return files.seal(
+@@ -268,10 +279,72 @@ class StagingStore:
+                                 child,
+                                 row,
+                                 self.profile.limits['metadata_bytes'],
++                                self._pinned(workspace_fd, row['id']),
+                             )
+                         finally:
+                             os.close(fd)
+ 
++    @staticmethod
++    def _pinned(workspace_fd, artifact_id):
++        c._uuid(artifact_id)
++        return '/proc/%s/fd/%s/artifacts/%s/data' % (
++            os.getpid(),
++            workspace_fd,
++            artifact_id,
++        )
++
++    @contextlib.contextmanager
++    def pinned_reader(self, context, binding, artifact):
++        row = journal.readable(context, binding, artifact)
++        parts = self._parts(binding, row['operation_id'])
++        with self.fs.directory(parts) as workspace_fd:
++            with self.reader(context, binding, artifact) as (fd, info):
++                yield self._pinned(workspace_fd, artifact.id), fd, info
++
++    @contextlib.contextmanager
++    def runtime_record(self, context, binding, child, write=False):
++        journal.authorize(context, binding, child, write=write)
++        c._require(child.action in journal.RUNTIME_ACTIONS)
++        self._entry(binding, child.operation_id)
++        parts = self._parts(binding, child.operation_id)
++        with self.fs.directory(parts) as directory:
++            with self._io_lock(directory, exclusive=False):
++                yield RuntimeRecord(directory, binding, child)
++                self.fs.check()
++
++    def sealed_save(self, context, binding, child):
++        """Inspect sealed bytes; backend completion needs separate proof."""
++        journal.authorize(context, binding, child)
++        row = journal.reservation(context, binding, child.resource_id)
++        c._require(
++            child.action == 'save' and
++            row['child_id'] == child.id and
++            row['location'] == 'staging'
++        )
++        self._entry(binding, child.operation_id)
++        parts = self._parts(binding, child.operation_id)
++        with self.fs.directory(parts) as workspace_fd:
++            with self._io_lock(workspace_fd, exclusive=False):
++                with self.fs.directory(
++                    parts + ('artifacts', row['id'])
++                ) as directory:
++                    with files.locked(directory, exclusive=False):
++                        owner = files.read_json(directory, 'owner')
++                        files.check_owner(
++                            owner, binding, child, row, self.profile.id
++                        )
++                        ref, info = files.inspect(
++                            directory,
++                            self.profile.limits['metadata_bytes'],
++                        )
++                        c._require(
++                            ref.id == row['id'] and
++                            ref.bytes <= row['upper_bound'] and
++                            (info['device'], info['inode']) ==
++                            (owner['device'], owner['inode'])
++                        )
++                        return ref
++
+     @staticmethod
+     @contextlib.contextmanager
+     def _io_lock(directory, exclusive):
+@@ -416,6 +489,9 @@ class StagingStore:
+             return unknown()
+ 
+     def _release(self, context, binding, child, query=False):
++        runtime_children = journal.runtime_children(
++            context, child.operation_id, require_closed=True
++        )
+         rows = [
+             r
+             for r in journal.reservations(context, binding)
+@@ -445,10 +521,28 @@ class StagingStore:
+                             with self._io_lock(directory, exclusive=True):
+                                 # Artifact delete children remove the leaves
+                                 # before releasing this workspace.
++                                names = set(os.listdir(directory))
++                                allowed = {
++                                    'runtime-%s.%s' % (row['id'], suffix)
++                                    for row in runtime_children
++                                    for suffix in ('intent', 'done')
++                                }
+                                 c._require(
+-                                    set(os.listdir(directory)) <=
+-                                    {'io-lock', 'artifacts'}
++                                    names <=
++                                    {'io-lock', 'artifacts'} | allowed
+                                 )
++                                for name in sorted(names & allowed):
++                                    value = files.read_json(
++                                        directory, name
++                                    )
++                                    c._require(
++                                        value['binding'] ==
++                                        binding.to_primitive() and
++                                        value['child']['operation_id'] ==
++                                        child.operation_id
++                                    )
++                                    os.unlink(name, dir_fd=directory)
++                                os.fsync(directory)
+                                 if 'artifacts' in os.listdir(directory):
+                                     os.rmdir('artifacts', dir_fd=directory)
+                                 os.unlink('io-lock', dir_fd=directory)
+@@ -474,6 +568,9 @@ class StagingStore:
+             c._require(child.action == 'delete')
+             row = journal.reservation(context, binding, child.resource_id)
+             c._require(row['location'] == 'staging')
++            journal.runtime_children(
++                context, row['operation_id'], require_closed=True
++            )
+             peers = [
+                 r
+                 for r in journal.reservations(context, binding)
+@@ -531,6 +628,9 @@ class StagingStore:
+             journal.authorize(context, binding, child)
+             c._require(child.action == 'delete')
+             row = journal.reservation(context, binding, child.resource_id)
++            journal.runtime_children(
++                context, row['operation_id'], require_closed=True
++            )
+             c._require(
+                 row['location'] == 'staging' and
+                 row['writer_state'] in ('closed', 'deleted')
+@@ -570,3 +670,70 @@ class StagingStore:
+             )
+         except ERRORS:
+             return unknown()
++
++
++class RuntimeRecord:
++    """Bounded immutable start/completion receipts inside the XFS quota."""
++
++    def __init__(self, directory, binding, child):
++        self.directory, self.binding, self.child = (
++            directory,
++            binding,
++            child,
++        )
++
++    def _name(self, suffix):
++        return 'runtime-%s.%s' % (self.child.id, suffix)
++
++    def _value(self):
++        return dict(
++            format=2,
++            binding=self.binding.to_primitive(),
++            child=self.child.to_primitive(),
++        )
++
++    def started(self):
++        try:
++            value = files.read_json(self.directory, self._name('intent'))
++        except FileNotFoundError:
++            return False
++        c._require(value == self._value())
++        return True
++
++    def start(self):
++        value = self._value()
++        c._require(len(jsonutils.dump_as_bytes(value)) <= 4096)
++        # O_EXCL is the dispatch fence, including after Nova restarts.
++        files.create_json(self.directory, self._name('intent'), value)
++
++    def finish(self, result):
++        c._require(
++            v2.validate_child_result(
++                self.child.action, result.to_primitive()
++            ) ==
++            result and
++            result.status == 'succeeded'
++        )
++        value = dict(
++            self._value(), call_returned=True, result=result.to_primitive()
++        )
++        c._require(len(jsonutils.dump_as_bytes(value)) <= 4096)
++        files.create_json(self.directory, self._name('done'), value)
++
++    def read(self):
++        intent = files.read_json(self.directory, self._name('intent'))
++        c._require(intent == self._value())
++        value = files.read_json(self.directory, self._name('done'))
++        c._keys(
++            value,
++            ('format', 'binding', 'child', 'call_returned', 'result'),
++        )
++        c._require(
++            {key: value[key] for key in intent} == intent and
++            value['call_returned'] is True
++        )
++        result = v2.validate_child_result(
++            self.child.action, value['result']
++        )
++        c._require(result.status == 'succeeded')
++        return result
+diff --git a/nova/virt/libvirt/checkpoints/topology.py b/nova/virt/libvirt/checkpoints/topology.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a9ed0a0c2590018576ed6c4ab01a250801b1bfe
+--- /dev/null
++++ b/nova/virt/libvirt/checkpoints/topology.py
+@@ -0,0 +1,629 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Closed BIOS/KVM topology, current service-authorized ports and profiles."""
++
++import copy
++import hashlib
++import os
++from pathlib import Path
++from urllib import parse
++
++from lxml import etree
++
++from nova.checkpoints import contracts as c
++from nova import conf
++from nova.network import neutron
++from nova import objects
++from nova.virt.libvirt.checkpoints import files
++from nova.virt.libvirt.checkpoints import profiles
++from nova.volume import checkpoints as cinder
++
++MARKER_NS = 'urn:openstack:nova:checkpoint:2'
++NOVA_NS = 'http://openstack.org/xmlns/libvirt/nova/1.0'
++DEVICE_TAGS = frozenset(
++    (
++        'emulator',
++        'disk',
++        'interface',
++        'controller',
++        'serial',
++        'console',
++        'channel',
++        'input',
++        'graphics',
++        'video',
++        'memballoon',
++        'rng',
++        'watchdog',
++        'audio',
++        'panic',
++    )
++)
++ROOT_TAGS = frozenset(
++    (
++        'name',
++        'uuid',
++        'metadata',
++        'memory',
++        'currentMemory',
++        'maxMemory',
++        'memoryBacking',
++        'vcpu',
++        'vcpus',
++        'cputune',
++        'numatune',
++        'resource',
++        'sysinfo',
++        'os',
++        'features',
++        'cpu',
++        'clock',
++        'on_poweroff',
++        'on_reboot',
++        'on_crash',
++        'devices',
++        'seclabel',
++    )
++)
++
++
++def document(xml):
++    c._require(type(xml) is str and len(xml.encode()) <= 1024 * 1024)
++    root = etree.fromstring(
++        xml.encode(),
++        etree.XMLParser(
++            resolve_entities=False,
++            no_network=True,
++            load_dtd=False,
++            remove_blank_text=True,
++        ),
++    )
++    c._require(
++        root.tag == 'domain' and
++        root.getroottree().docinfo.doctype == '' and
++        all(type(e.tag) is str for e in root.iter())
++    )
++    return root
++
++
++def serialized(node):
++    return etree.tostring(node, method='c14n', with_comments=False)
++
++
++def host_fields(root):
++    """The only XML fields which restoration may substitute."""
++    for disk in root.findall('./devices/disk'):
++        for name in ('source', 'auth'):
++            yield disk, name
++    for interface in root.findall('./devices/interface'):
++        for name in (
++            'source',
++            'target',
++            'virtualport',
++            'filterref',
++            'bandwidth',
++        ):
++            yield interface, name
++    for graphics in root.findall('./devices/graphics'):
++        yield graphics, 'listen'
++    yield root, 'seclabel'
++
++
++def guest_identity(xml):
++    root = document(xml)
++    root.attrib.pop('id', None)
++    for parent, name in host_fields(root):
++        for element in parent.findall(name):
++            parent.remove(element)
++    for graphics in root.findall('./devices/graphics'):
++        for attr in ('port', 'tlsPort', 'websocket', 'listen'):
++            graphics.attrib.pop(attr, None)
++    for metadata in root.findall('metadata'):
++        root.remove(metadata)
++    # Libvirt adds generated aliases to a live XML. Addresses, serials, CPU,
++    # memory and controller attributes remain part of the guest identity.
++    for alias in root.findall('./devices/*/alias'):
++        alias.getparent().remove(alias)
++    return hashlib.sha256(serialized(root)).hexdigest()
++
++
++def marker_xml(binding, child):
++    node = etree.Element(
++        '{%s}checkpoint' % MARKER_NS, nsmap={'checkpoint': MARKER_NS}
++    )
++    for key, value in dict(
++        operation_id=child.operation_id,
++        checkpoint_id=binding.checkpoint_id,
++        instance_uuid=binding.instance_uuid,
++        child_id=child.id,
++        action=child.action,
++        runtime_fingerprint=binding.runtime_fingerprint,
++        payload_hash=child.payload_hash,
++    ).items():
++        node.set(key, value)
++    return etree.tostring(node, encoding='unicode')
++
++
++def with_marker(xml, binding, child):
++    root = document(xml)
++    metadata = root.find('metadata')
++    if metadata is None:
++        metadata = etree.SubElement(root, 'metadata')
++    for old in metadata.findall('{%s}checkpoint' % MARKER_NS):
++        metadata.remove(old)
++    metadata.append(etree.fromstring(marker_xml(binding, child).encode()))
++    return etree.tostring(root, encoding='unicode')
++
++
++def matching_marker(xml, binding, child):
++    root = document(xml)
++    items = root.findall('./metadata/{%s}checkpoint' % MARKER_NS)
++    expected = etree.fromstring(marker_xml(binding, child).encode())
++    return len(items) == 1 and dict(items[0].attrib) == dict(
++        expected.attrib
++    )
++
++
++def _bytes(node):
++    c._require(node is not None)
++    unit = node.get('unit', 'KiB').lower()
++    factors = {
++        'b': 1,
++        'bytes': 1,
++        'kib': 1024,
++        'mib': 1024**2,
++        'gib': 1024**3,
++        'k': 1000,
++        'm': 1000**2,
++        'g': 1000**3,
++    }
++    c._require(unit in factors and node.text.isdecimal())
++    return int(node.text) * factors[unit]
++
++
++def _read_config(path):
++    """Read the original config drive without following links."""
++    parts = Path(path).parts
++    c._require(os.path.isabs(path) and '..' not in parts)
++    fd = os.open('/', files.OPEN_DIR)
++    try:
++        for part in parts[1:-1]:
++            next_fd = os.open(part, files.OPEN_DIR, dir_fd=fd)
++            os.close(fd)
++            fd = next_fd
++        source = os.open(
++            parts[-1], os.O_RDONLY | files.OPEN_FILE, dir_fd=fd
++        )
++        try:
++            observed = files.fingerprint(source, 0)
++            return observed['checksum'], observed['bytes']
++        finally:
++            os.close(source)
++    finally:
++        os.close(fd)
++
++
++class Topology:
++    def __init__(
++        self,
++        host,
++        profileset=None,
++        observer=None,
++        neutron_factory=None,
++        volume_reader=None,
++        source_reader=None,
++        key_reader=None,
++        interface_reader=None,
++    ):
++        self.host = host
++        self.profileset = profileset
++        self.observer = observer or self._observe
++        self.neutron_factory = neutron_factory or (
++            lambda ctx: neutron.get_client(ctx, admin=True)
++        )
++        self.volume_reader = volume_reader or self._volumes
++        self.source_reader = source_reader
++        self.key_reader = key_reader or self._key
++        self.interface_reader = interface_reader
++
++    def _observe(self, guest, xml):
++        conn = self.host.get_connection()
++        uri = conn.getURI()
++        parsed = parse.urlsplit(uri)
++        c._require(
++            parsed.scheme in ('qemu', 'qemu+unix') and
++            not parsed.netloc and
++            parsed.path == '/system'
++        )
++        root = document(xml)
++        cpu = etree.fromstring(conn.getCapabilities().encode()).find(
++            'host/cpu'
++        )
++        c._require(
++            cpu is not None and os.access('/dev/kvm', os.R_OK | os.W_OK)
++        )
++        return dict(
++            kind='runtime',
++            libvirt_version=conn.getLibVersion(),
++            qemu_version=conn.getVersion(),
++            architecture=os.uname().machine,
++            machine=root.find('os/type').get('machine'),
++            host_cpu_sha256=hashlib.sha256(serialized(cpu)).hexdigest(),
++            libvirt_uri=uri,
++            uid=os.geteuid(),
++            gid=os.getegid(),
++            pid_namespace=os.readlink('/proc/self/ns/pid'),
++            mount_namespace=os.readlink('/proc/self/ns/mnt'),
++            path_access='same-pid-namespace-proc-fd',
++            kvm=True,
++        )
++
++    def _key(self, ident):
++        # A private/unavailable secret cannot be guessed from its UUID.
++        value = (
++            self.host.get_connection()
++            .secretLookupByUUIDString(ident)
++            .value(0)
++        )
++        c._require(type(value) is bytes and bool(value))
++        return hashlib.sha256(value).hexdigest()
++
++    @staticmethod
++    def _volumes(context, ids, purpose, operation_id):
++        client = cinder.CheckpointClient()
++        if operation_id is None:
++            return client.preflight_resources(context, tuple(ids), ())[
++                'volumes'
++            ]
++        # C1.1 rejects multiattach; its active scope fences ordinary
++        # topology mutations. Revalidate scope and capabilities per disk.
++        grant = client.get(context, operation_id)
++        c._require(grant['status'] != 'released')
++        result = {}
++        for ident in ids:
++            client.capabilities(context, operation_id, ident)
++            result[ident] = dict(
++                id=ident, multiattach=False, grant_bound=True
++            )
++        return result
++
++    def _ports(self, context, instance, ports, interfaces, inactive=False):
++        c._require(len(ports) == len(interfaces))
++        by_mac = {
++            node.find('mac').get('address').lower(): node
++            for node in interfaces
++        }
++        c._require(len(by_mac) == len(ports))
++        if not ports:
++            return []
++        client = self.neutron_factory(context)
++        observed = []
++        for port in ports:
++            c._require(port['vnic_type'] == 'normal')
++            current = client.show_port(port['uuid'])['port']
++            c._require(
++                current['id'] == port['uuid'] and
++                current['device_id'] == instance.uuid and
++                current.get('project_id', current.get('tenant_id')) ==
++                instance.project_id and
++                current['network_id'] == port['network_uuid'] and
++                current['mac_address'].lower() == port['mac'].lower() and
++                current['binding:host_id'] == instance.host and
++                current['binding:vnic_type'] == 'normal' and
++                current['binding:vif_type'] in ('ovs', 'bridge') and
++                current['status']
++                in (('ACTIVE', 'DOWN') if inactive else ('ACTIVE',))
++            )
++            interface = by_mac[port['mac'].lower()]
++            c._require(
++                interface.get('type') == 'bridge' and
++                interface.find('model').get('type') == port['model']
++            )
++            c._require(self.interface_reader is not None)
++            expected = document(
++                '<domain><devices>' +
++                self.interface_reader(context, instance, port) +
++                '</devices></domain>'
++            ).find('devices/interface')
++            c._require(
++                expected is not None and expected.get('type') == 'bridge'
++            )
++            for name in (
++                'source',
++                'target',
++                'virtualport',
++                'filterref',
++                'bandwidth',
++            ):
++                c._require(
++                    [serialized(n) for n in interface.findall(name)] ==
++                    [serialized(n) for n in expected.findall(name)]
++                )
++            observed.append(
++                {
++                    k: port[k]
++                    for k in (
++                        'uuid',
++                        'mac',
++                        'network_uuid',
++                        'model',
++                        'vnic_type',
++                    )
++                }
++            )
++        return sorted(observed, key=lambda p: p['uuid'])
++
++    def _inspect(
++        self, context, instance, db_manifest, purpose, saved_binding
++    ):
++        c._require(purpose in ('create', 'revert', 'recover'))
++        c._require(
++            db_manifest['instance_uuid'] == instance.uuid and
++            db_manifest['host'] == instance.host and
++            db_manifest['node'] == instance.node and
++            not db_manifest['shares'] and
++            not db_manifest['flavor']['ephemeral_gb'] and
++            not db_manifest['flavor']['swap']
++        )
++        if saved_binding is not None:
++            c._require(
++                (
++                    saved_binding.instance_uuid,
++                    saved_binding.host,
++                    saved_binding.node,
++                    saved_binding.project_id,
++                ) ==
++                (
++                    instance.uuid,
++                    instance.host,
++                    instance.node,
++                    instance.project_id,
++                )
++            )
++        c._require(purpose != 'recover' or saved_binding is not None)
++        guest = self.host.get_guest(instance)
++        c._require(guest.uuid == instance.uuid)
++        state = guest.checkpoint_state()
++        c._require(
++            state['managed_save'] is False and
++            state['job'] == 0 and
++            state['state']
++            in ((1, 3, 5) if purpose == 'recover' else (1,))
++        )
++        xml = guest.get_xml_desc(dump_sensitive=True)
++        root = document(xml)
++        c._require(
++            root.get('type') == 'kvm' and
++            root.findtext('uuid') == instance.uuid and
++            all(node.tag in ROOT_TAGS for node in root) and
++            len(root.findall('os')) == 1 and
++            len(root.findall('devices')) == 1 and
++            len(root.findall('cpu')) == 1 and
++            len(root.findall('uuid')) == 1 and
++            len(root.findall('vcpu')) == 1
++        )
++        os_element = root.find('os')
++        os_type = root.find('os/type')
++        c._require(
++            os_element.get('firmware') in (None, 'bios') and
++            os_type is not None and
++            os_type.text == 'hvm' and
++            os_type.get('arch') == 'x86_64' and
++            os_type.get('machine', '').startswith('pc') and
++            not root.findall('.//loader') and
++            not root.findall('.//nvram') and
++            not root.findall('.//backingStore') and
++            not root.findall('.//shareable')
++        )
++        c._require(all(n.tag in DEVICE_TAGS for n in root.find('devices')))
++        for node in root.iter():
++            c._require(
++                not set(node.attrib) & {'passwd', 'password', 'key'}
++            )
++        for node in root.findall('./metadata/*'):
++            c._require(etree.QName(node).namespace in (NOVA_NS, MARKER_NS))
++        observed = self.observer(guest, xml)
++        profile = (
++            self.profileset or
++            profiles.load(conf.CONF.checkpoint.profile_file)
++        ).match(observed)
++        c._require(
++            profile is not None and
++            profile.kind == 'runtime' and
++            observed['kvm'] is True
++        )
++        memory = max(
++            _bytes(root.find('memory')),
++            (
++                _bytes(root.find('maxMemory'))
++                if root.find('maxMemory') is not None
++                else 0
++            ),
++        )
++        c._require(
++            0 < memory <= profile.limits['max_memory_bytes'] and
++            _bytes(root.find('currentMemory')) <= memory and
++            int(root.findtext('vcpu')) ==
++            db_manifest['flavor']['vcpus']
++        )
++        disks = db_manifest['disks']
++        ids = [d['volume_id'] for d in disks]
++        c._ids(ids, nonempty=True)
++        operation_id = None
++        if purpose == 'recover':
++            checkpoint = objects.InstanceCheckpoint.get_by_uuid(
++                context, saved_binding.checkpoint_id
++            )
++            operation_id = checkpoint.active_operation_id
++            c._uuid(operation_id)
++        volumes = self.volume_reader(context, ids, purpose, operation_id)
++        c._require(
++            set(volumes) == set(ids) and
++            all(v['multiattach'] is False for v in volumes.values())
++        )
++        xml_disks = root.findall('./devices/disk')
++        writable = [d for d in xml_disks if d.find('readonly') is None]
++        c._require(len(writable) == len(disks))
++        serials = {d.findtext('serial'): d for d in writable}
++        c._require(len(serials) == len(disks))
++        keys = []
++        for disk in disks:
++            node = serials[disk['serial']]
++            target = node.find('target')
++            c._require(
++                node.get('device') == 'disk' and
++                node.get('type') in ('block', 'network') and
++                target.get('dev') ==
++                disk['device_name'].removeprefix('/dev/') and
++                target.get('bus') in ('virtio', 'scsi') and
++                node.find('driver').get('type') == 'raw' and
++                node.find('driver').get('cache')
++                in ('none', 'directsync')
++            )
++            c._require(guest.checkpoint_block_job(target.get('dev')) == {})
++            # source_reader derives XML from the current protected BDM through
++            # the existing volume driver. Production cannot infer it from the
++            # domain being checked; injected readers are test-only boundaries.
++            c._require(self.source_reader is not None)
++            expected = document(
++                '<domain><devices>' +
++                self.source_reader(context, instance, disk) +
++                '</devices></domain>'
++            ).find('devices/disk')
++            c._require(
++                expected is not None and
++                serialized(node.find('source')) ==
++                serialized(expected.find('source'))
++            )
++            for name in ('auth', 'encryption'):
++                c._require(
++                    [
++                        serialized(item)
++                        for item in node.findall('.//' + name)
++                    ] ==
++                    [
++                        serialized(item)
++                        for item in expected.findall('.//' + name)
++                    ]
++                )
++            encryption = node.findall('.//encryption/secret')
++            if volumes[disk['volume_id']].get('encrypted'):
++                c._require(bool(encryption))
++            for secret in encryption:
++                ident = secret.get('uuid')
++                c._uuid(ident)
++                digest = self.key_reader(ident)
++                c._digest(digest)
++                keys.append(
++                    dict(
++                        volume_id=disk['volume_id'],
++                        secret_id=ident,
++                        sha256=digest,
++                    )
++                )
++        readonly = [d for d in xml_disks if d.find('readonly') is not None]
++        config_hash, config_bytes = None, 0
++        c._require(
++            len(readonly) == (1 if db_manifest['config_drive'] else 0)
++        )
++        if readonly:
++            node = readonly[0]
++            path = os.path.join(
++                conf.CONF.instances_path, instance.uuid, 'disk.config'
++            )
++            c._require(
++                node.get('type') == 'file' and
++                node.get('device') == 'cdrom' and
++                node.find('source').get('file') == path
++            )
++            config_hash, config_bytes = _read_config(path)
++        ports = self._ports(
++            context,
++            instance,
++            db_manifest['ports'],
++            root.findall('./devices/interface'),
++            inactive=purpose == 'recover' and state['state'] == 5,
++        )
++        manifest = dict(
++            xml_sha256=guest_identity(xml),
++            runtime_profile_id=profile.id,
++            runtime_identity=profile.identity_sha256,
++            memory_bytes=memory,
++            ports=ports,
++            config_sha256=config_hash,
++            key_fingerprints=sorted(keys, key=lambda k: k['volume_id']),
++            instance_key_fingerprints=db_manifest[
++                'runtime_key_fingerprints'
++            ],
++        )
++        fingerprint = c.canonical_payload_hash(manifest)
++        if saved_binding is not None:
++            c._require(
++                fingerprint == saved_binding.runtime_fingerprint and
++                profile.id == saved_binding.runtime_profile_id
++            )
++        return dict(
++            runtime_manifest=manifest,
++            runtime_fingerprint=fingerprint,
++            runtime_profile_id=profile.id,
++            config_bytes=config_bytes,
++            save_bytes_limit=profile.limits['save_bytes_limit'],
++            restore_bytes_limit=profile.limits['restore_bytes_limit'],
++        )
++
++    def inspect(
++        self, context, instance, db_manifest, purpose, saved_binding=None
++    ):
++        try:
++            return self._inspect(
++                context, instance, db_manifest, purpose, saved_binding
++            )
++        except Exception:
++            # Never expose XML, connection details, keys or backend exceptions.
++            raise ValueError(
++                'Checkpoint runtime identity unverified'
++            ) from None
++
++    @staticmethod
++    def restore_xml(saved_xml, current, binding):
++        saved, actual = document(saved_xml), document(current['xml'])
++        c._require(
++            current['runtime_fingerprint'] == binding.runtime_fingerprint and
++            saved.findtext('uuid') ==
++            actual.findtext('uuid') ==
++            binding.instance_uuid and
++            guest_identity(saved_xml) == guest_identity(current['xml'])
++        )
++        old_fields, new_fields = list(host_fields(saved)), list(
++            host_fields(actual)
++        )
++        c._require(len(old_fields) == len(new_fields))
++        for (old_parent, name), (new_parent, new_name) in zip(
++            old_fields, new_fields
++        ):
++            c._require(name == new_name)
++            for node in old_parent.findall(name):
++                old_parent.remove(node)
++            for node in new_parent.findall(name):
++                old_parent.append(copy.deepcopy(node))
++        for old, new in zip(
++            saved.findall('./devices/graphics'),
++            actual.findall('./devices/graphics'),
++        ):
++            for attr in ('port', 'tlsPort', 'websocket', 'listen'):
++                old.attrib.pop(attr, None)
++                if attr in new.attrib:
++                    old.set(attr, new.get(attr))
++        value = etree.tostring(saved, encoding='unicode')
++        c._require(guest_identity(value) == guest_identity(saved_xml))
++        return value
+diff --git a/nova/virt/libvirt/guest.py b/nova/virt/libvirt/guest.py
+index 78ea60b39ef757311c722fe0de6e6a3d52c8c7e0..369095605d0bffbc1f1c8ab188b044f42615e04f 100644
+--- a/nova/virt/libvirt/guest.py
++++ b/nova/virt/libvirt/guest.py
+@@ -481,6 +481,35 @@ class Guest(object):
+         flags |= dump_migratable and libvirt.VIR_DOMAIN_XML_MIGRATABLE or 0
+         return self._domain.XMLDesc(flags=flags)
+ 
++    def checkpoint_state(self):
++        """Observe checkpoint state without error-to-idle fallback."""
++        state, reason = self._domain.state(0)
++        managed = bool(self._domain.hasManagedSaveImage(0))
++        # Inactive domains cannot have an active domain job. This is only a
++        # state observation; the runtime adapter also requires its receipt.
++        job = (libvirt.VIR_DOMAIN_JOB_NONE if state ==
++               libvirt.VIR_DOMAIN_SHUTOFF else
++               self._domain.jobStats(0)['type'])
++        return dict(state=state, managed_save=managed, job=job)
++
++    def checkpoint_block_job(self, disk):
++        if self._domain.state(0)[0] == libvirt.VIR_DOMAIN_SHUTOFF:
++            return {}
++        return self._domain.blockJobInfo(disk, 0)
++
++    def checkpoint_set_marker(self, marker):
++        """Set only the checkpoint namespace, without logging domain XML."""
++        self._domain.setMetadata(
++            libvirt.VIR_DOMAIN_METADATA_ELEMENT, marker, 'checkpoint',
++            'urn:openstack:nova:checkpoint:2',
++            libvirt.VIR_DOMAIN_AFFECT_LIVE | libvirt.VIR_DOMAIN_AFFECT_CONFIG)
++
++    def checkpoint_save(self, path, xml):
++        self._domain.saveFlags(path, xml, 0)
++
++    def checkpoint_stop(self):
++        self._domain.destroyFlags(0)
++
+     def save_memory_state(self):
+         """Saves the domain's memory state. Requires running domain.
+ 
+diff --git a/nova/virt/libvirt/host.py b/nova/virt/libvirt/host.py
+index 8a5ac9029e72ce20c7bec64a23c29691d2001aee..086302bd47f1de4cbc0b778ab06fbf13a3988411 100644
+--- a/nova/virt/libvirt/host.py
++++ b/nova/virt/libvirt/host.py
+@@ -648,6 +648,15 @@ class Host(object):
+         return self._version_check(
+             lv_ver=lv_ver, hv_ver=hv_ver, hv_type=hv_type, op=operator.ne)
+ 
++    def checkpoint_restore(self, path, xml):
++        """Restore dedicated RAM state paused; validation precedes unpause."""
++        self.get_connection().restoreFlags(
++            path, xml, libvirt.VIR_DOMAIN_SAVE_PAUSED)
++
++    def checkpoint_saved_xml(self, path):
++        return self.get_connection().saveImageGetXMLDesc(
++            path, libvirt.VIR_DOMAIN_XML_SECURE)
++
+     def get_guest(self, instance):
+         """Retrieve libvirt guest object for an instance.
+ 

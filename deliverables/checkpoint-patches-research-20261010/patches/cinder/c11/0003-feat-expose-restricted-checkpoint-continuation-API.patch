@@ -1,0 +1,767 @@
+From 4050dea20e9ec70b5f14f6bf29b8dca41e70d8e9 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 16:13:13 +0300
+Subject: [PATCH 3/7] feat: expose restricted checkpoint continuation API
+
+---
+ cinder/api/microversions.py                   |   1 +
+ cinder/api/openstack/api_version_request.py   |   3 +-
+ .../openstack/rest_api_version_history.rst    |  10 +
+ cinder/api/schemas/checkpoint_continuation.py |  32 +++
+ cinder/api/v3/checkpoint_continuation.py      |  49 ++++
+ cinder/api/v3/checkpoints.py                  |  18 +-
+ cinder/api/v3/router.py                       |  13 ++
+ cinder/api/v3/views/checkpoints.py            |  13 +-
+ cinder/checkpoints/api.py                     |   4 +
+ cinder/checkpoints/continuation.py            |   8 +
+ cinder/checkpoints/continuation_api.py        |  84 +++++++
+ cinder/db/api.py                              |  16 ++
+ cinder/db/sqlalchemy/api.py                   |  19 ++
+ .../db/sqlalchemy/checkpoint_continuation.py  |  47 ++++
+ cinder/db/sqlalchemy/checkpoints.py           |  12 +
+ .../api/v3/test_checkpoint_continuation.py    | 210 ++++++++++++++++++
+ 16 files changed, 535 insertions(+), 4 deletions(-)
+ create mode 100644 cinder/api/schemas/checkpoint_continuation.py
+ create mode 100644 cinder/api/v3/checkpoint_continuation.py
+ create mode 100644 cinder/checkpoints/continuation_api.py
+ create mode 100644 cinder/tests/unit/api/v3/test_checkpoint_continuation.py
+
+diff --git a/cinder/api/microversions.py b/cinder/api/microversions.py
+index 07e4c02..644af3d 100644
+--- a/cinder/api/microversions.py
++++ b/cinder/api/microversions.py
+@@ -183,6 +183,7 @@ EXTEND_VOLUME_COMPLETION = '3.71'
+ 
+ # Private fork extension: not an upstream 3.72 compatibility claim.
+ CHECKPOINT_CONTRACT = '3.72'
++CHECKPOINT_CONTINUATION = '3.73'
+ 
+ 
+ def get_mv_header(version):
+diff --git a/cinder/api/openstack/api_version_request.py b/cinder/api/openstack/api_version_request.py
+index b363c39..ec9bcd5 100644
+--- a/cinder/api/openstack/api_version_request.py
++++ b/cinder/api/openstack/api_version_request.py
+@@ -158,13 +158,14 @@ REST_API_VERSION_HISTORY = """
+     * 3.70 - Support encrypted volume transfers
+     * 3.71 - Support 'os-extend_volume_completion' volume action
+     * 3.72 - Private native checkpoint service contract (fork extension)
++    * 3.73 - Private scoped checkpoint continuation (fork extension)
+ """
+ 
+ # The minimum and maximum versions of the API supported
+ # The default api version request is defined to be the
+ # minimum version of the API supported.
+ _MIN_API_VERSION = "3.0"
+-_MAX_API_VERSION = "3.72"
++_MAX_API_VERSION = "3.73"
+ UPDATED = "2023-08-31T00:00:00Z"
+ 
+ 
+diff --git a/cinder/api/openstack/rest_api_version_history.rst b/cinder/api/openstack/rest_api_version_history.rst
+index ac5ac08..da3b615 100644
+--- a/cinder/api/openstack/rest_api_version_history.rst
++++ b/cinder/api/openstack/rest_api_version_history.rst
+@@ -550,3 +550,13 @@ capabilities and operation actions. Access requires a verified service token
+ and an explicit Nova service-user allowlist, in addition to project policy.
+ New checkpoint creation is disabled by default. This private version does
+ not assert compatibility with an upstream OpenStack microversion.
++
++3.73 (private fork extension)
++-----------------------------
++
++Adds explicit service continuation to the initial dual-identity checkpoint
++reservation. The original actor and owner remain immutable. Dedicated routes
++allow the authenticated service subject to continue only its delegated
++operation, subject to the service role, allowlist, policy and durable grant.
++Service-only credentials cannot reserve a new operation. Released grants are
++read-only tombstones. Existing 3.72 request and response semantics remain.
+diff --git a/cinder/api/schemas/checkpoint_continuation.py b/cinder/api/schemas/checkpoint_continuation.py
+new file mode 100644
+index 0000000..4f58e8f
+--- /dev/null
++++ b/cinder/api/schemas/checkpoint_continuation.py
+@@ -0,0 +1,32 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Additive schemas for the private 3.73 continuation protocol."""
++
++import copy
++
++from cinder.api.schemas import checkpoints
++from cinder.api.validation import parameter_types
++
++
++payload = copy.deepcopy(checkpoints.payload)
++payload['properties'].update({
++    'nova_operation_id': parameter_types.uuid,
++    'allow_service_continuation': {'type': 'boolean', 'enum': [True]},
++})
++payload['dependencies'] = {
++    'nova_operation_id': ['allow_service_continuation'],
++    'allow_service_continuation': ['nova_operation_id'],
++}
++create = copy.deepcopy(checkpoints.create)
++create['properties']['checkpoint_operation'] = payload
++action = copy.deepcopy(checkpoints.action)
+diff --git a/cinder/api/v3/checkpoint_continuation.py b/cinder/api/v3/checkpoint_continuation.py
+new file mode 100644
+index 0000000..3db7537
+--- /dev/null
++++ b/cinder/api/v3/checkpoint_continuation.py
+@@ -0,0 +1,49 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Private service-only routes; no initial reserve or collection methods."""
++
++from http import HTTPStatus
++
++from cinder.api import microversions as mv
++from cinder.api.openstack import wsgi
++from cinder.api.schemas import checkpoint_continuation as schema
++from cinder.api import validation
++from cinder.checkpoints import continuation_api
++
++
++class CheckpointContinuationController(wsgi.Controller):
++    def __init__(self):
++        self.api = continuation_api.ContinuationAPI()
++        super().__init__()
++
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTINUATION)
++    def show(self, req, id):
++        return {'checkpoint_operation': self.api.get(
++            req.environ['cinder.context'], id)}
++
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTINUATION)
++    @wsgi.response(HTTPStatus.ACCEPTED)
++    @validation.schema(schema.action)
++    def operate(self, req, id, body):
++        name, args = next(iter(body.items()))
++        return {'checkpoint_operation': self.api.action(
++            req.environ['cinder.context'], id, name, **args)}
++
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTINUATION)
++    def capabilities(self, req, id, volume_id):
++        return {'checkpoint_capabilities': self.api.capabilities(
++            req.environ['cinder.context'], id, volume_id)}
++
++
++def create_resource():
++    return wsgi.Resource(CheckpointContinuationController())
+diff --git a/cinder/api/v3/checkpoints.py b/cinder/api/v3/checkpoints.py
+index 51d8936..41b75b0 100644
+--- a/cinder/api/v3/checkpoints.py
++++ b/cinder/api/v3/checkpoints.py
+@@ -17,6 +17,7 @@ from http import HTTPStatus
+ from cinder.api import common
+ from cinder.api import microversions as mv
+ from cinder.api.openstack import wsgi
++from cinder.api.schemas import checkpoint_continuation as continuation_schema
+ from cinder.api.schemas import checkpoints as schema
+ from cinder.api.v3.views import checkpoints as views
+ from cinder.api import validation
+@@ -30,7 +31,8 @@ class CheckpointController(wsgi.Controller):
+         self.view = views.ViewBuilder()
+         super().__init__()
+ 
+-    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTRACT)
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTRACT,
++                                 mv.CHECKPOINT_CONTRACT)
+     @wsgi.response(HTTPStatus.ACCEPTED)
+     @validation.schema(schema.create)
+     def create(self, req, body):
+@@ -38,6 +40,20 @@ class CheckpointController(wsgi.Controller):
+                                      body['checkpoint_operation'])
+         return {'checkpoint_operation': self.view.detail(operation)}
+ 
++    @wsgi.Controller.api_version(mv.CHECKPOINT_CONTINUATION)
++    @wsgi.response(HTTPStatus.ACCEPTED)
++    @validation.schema(continuation_schema.create)
++    def create(self, req, body):  # noqa: F811
++        context = req.environ['cinder.context']
++        operation = self.api.reserve_with_continuation(
++            context, body['checkpoint_operation'])
++        if operation.continuation_id is not None:
++            grant = self.api.continuation(context, operation.id)
++            detail = self.view.continuation(operation, grant)
++        else:
++            detail = self.view.detail(operation)
++        return {'checkpoint_operation': detail}
++
+     @wsgi.Controller.api_version(mv.CHECKPOINT_CONTRACT)
+     def show(self, req, id):
+         operation = self.api.get(req.environ['cinder.context'], id)
+diff --git a/cinder/api/v3/router.py b/cinder/api/v3/router.py
+index 8c6846c..ac0487f 100644
+--- a/cinder/api/v3/router.py
++++ b/cinder/api/v3/router.py
+@@ -23,6 +23,7 @@ from cinder.api import extensions
+ import cinder.api.openstack
+ from cinder.api.v3 import attachments
+ from cinder.api.v3 import backups
++from cinder.api.v3 import checkpoint_continuation
+ from cinder.api.v3 import checkpoints
+ from cinder.api.v3 import clusters
+ from cinder.api.v3 import consistencygroups
+@@ -68,7 +69,19 @@ class APIRouter(cinder.api.openstack.APIRouter):
+         self.resources['checkpoint-operations'] = checkpoint_controller
+         mapper.resource('checkpoint_operation', 'checkpoint-operations',
+                         controller=checkpoint_controller)
++        continuation_controller = checkpoint_continuation.create_resource()
++        self.resources['checkpoint-service-operations'] = (
++            continuation_controller)
+         for prefix in ['/{project_id}', '']:
++            for suffix, action, method in (
++                    ('', 'show', 'GET'), ('/action', 'operate', 'POST'),
++                    ('/volumes/{volume_id}/capabilities',
++                     'capabilities', 'GET')):
++                mapper.connect(
++                    'checkpoint_service_' + action,
++                    prefix + '/checkpoint-service-operations/{id}' + suffix,
++                    controller=continuation_controller, action=action,
++                    conditions={'method': [method]})
+             mapper.connect(
+                 'checkpoint_action',
+                 prefix + '/checkpoint-operations/{id}/action',
+diff --git a/cinder/api/v3/views/checkpoints.py b/cinder/api/v3/views/checkpoints.py
+index f536ccb..dd9f2f9 100644
+--- a/cinder/api/v3/views/checkpoints.py
++++ b/cinder/api/v3/views/checkpoints.py
+@@ -24,12 +24,21 @@ class ViewBuilder(common.ViewBuilder):
+         result['resources'] = [
+             {key: resource[key] for key in (
+                 'id', 'volume_id', 'snapshot_id', 'volume_size', 'status')}
+-            for resource in operation.resources]
++            for resource in operation['resources']]
+         result['steps'] = [
+             {key: step[key] for key in (
+                 'id', 'resource_id', 'phase', 'generation', 'status',
+                 'error_code')}
+-            for step in operation.steps]
++            for step in operation['steps']]
++        return result
++
++    @classmethod
++    def continuation(cls, operation, grant):
++        result = cls.detail(operation)
++        result['continuation'] = dict(version=1, **{
++            key: grant[key] for key in (
++                'nova_operation_id', 'owner_project_id', 'actor_user_id',
++                'executor_service_user_id', 'generation')})
+         return result
+ 
+     def index(self, request, operations):
+diff --git a/cinder/checkpoints/api.py b/cinder/checkpoints/api.py
+index 603c1d7..3416466 100644
+--- a/cinder/checkpoints/api.py
++++ b/cinder/checkpoints/api.py
+@@ -148,6 +148,10 @@ class API:
+         self._authorize(context)
+         return self._object(context, db.checkpoint_get(context, operation_id))
+ 
++    def continuation(self, context, operation_id):
++        self._authorize(context)
++        return db.checkpoint_continuation_for_owner(context, operation_id)
++
+     def list(self, context, filters, marker=None, limit=None):
+         self._authorize(context)
+         if set(filters) - {'checkpoint_id', 'instance_uuid', 'status'}:
+diff --git a/cinder/checkpoints/continuation.py b/cinder/checkpoints/continuation.py
+index 58230b0..9447435 100644
+--- a/cinder/checkpoints/continuation.py
++++ b/cinder/checkpoints/continuation.py
+@@ -13,6 +13,8 @@
+ """Authenticate the executor independently of the original operation actor."""
+ 
+ from cinder.checkpoints import config
++from cinder.checkpoints import continuation_contracts
++from cinder import db
+ from cinder import exception
+ from cinder.policies import checkpoints as policies
+ 
+@@ -34,3 +36,9 @@ def require_executor(context) -> str:
+                       target={'project_id': context.project_id,
+                               'user_id': subject})
+     return subject
++
++
++def authorize(context, nova_operation_id, generation, action, volume_id=None):
++    primitive = db.checkpoint_continuation_scope(
++        context, nova_operation_id, generation, action, volume_id)
++    return continuation_contracts.ContinuationScope.from_primitive(primitive)
+diff --git a/cinder/checkpoints/continuation_api.py b/cinder/checkpoints/continuation_api.py
+new file mode 100644
+index 0000000..a304f30
+--- /dev/null
++++ b/cinder/checkpoints/continuation_api.py
+@@ -0,0 +1,84 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Service orchestration restricted to a previously delegated operation."""
++
++from cinder.api.schemas import checkpoint_continuation as schema
++from cinder.api.v3.views import checkpoints as views
++from cinder.api.validation import validators
++from cinder.checkpoints import continuation
++from cinder.checkpoints import continuation_contracts
++from cinder.checkpoints import contracts
++from cinder import db
++from cinder import exception
++from cinder import objects
++from cinder.volume import rpcapi
++
++
++def _id(value):
++    try:
++        return continuation_contracts._uuid(value)
++    except ValueError:
++        raise exception.InvalidInput(reason='invalid_checkpoint_identifier')
++
++
++class ContinuationAPI:
++    def __init__(self, rpc=None):
++        self.rpc = rpc if rpc is not None else rpcapi.VolumeAPI()
++
++    def get(self, context, nova_operation_id):
++        row = db.checkpoint_continuation_get(context, _id(nova_operation_id))
++        return views.ViewBuilder.continuation(row['operation'], row)
++
++    def _volumes(self, context, scope, action):
++        rows = db.checkpoint_continuation_volumes(
++            context, scope.nova_operation_id, scope.generation, action)
++        return [objects.Volume._from_db_object(
++            context, objects.Volume(context), row) for row in rows]
++
++    def action(self, context, nova_operation_id, name, generation,
++               outcome=None):
++        args = {'generation': generation}
++        if outcome is not None:
++            args['outcome'] = outcome
++        validators._SchemaValidator(schema.action).validate({name: args})
++        scope = continuation.authorize(context, _id(nova_operation_id),
++                                       generation, name)
++        if name in ('release', 'cleanup'):
++            db.checkpoint_continuation_transition(
++                context, nova_operation_id, generation, name, outcome)
++            if name == 'release':
++                return self.get(context, nova_operation_id)
++        volumes = self._volumes(context, scope, name)
++        for volume in volumes:
++            self.rpc.assert_checkpoint_continuation_ready(context, volume)
++        hosts = sorted({volume.service_topic_queue for volume in volumes})
++        method = (self.rpc.reconcile_checkpoint_continuation if
++                  name == 'reconcile' else
++                  self.rpc.execute_checkpoint_continuation)
++        for host in hosts:
++            method(context, nova_operation_id, generation, host)
++        return self.get(context, nova_operation_id)
++
++    def capabilities(self, context, nova_operation_id, volume_id):
++        scope = continuation.authorize(context, _id(nova_operation_id), 1,
++                                       'capabilities', _id(volume_id))
++        volume = next(v for v in self._volumes(context, scope, 'capabilities')
++                      if v.id == volume_id)
++        self.rpc.assert_checkpoint_continuation_ready(context, volume)
++        result = self.rpc.get_checkpoint_continuation_capabilities(
++            context, nova_operation_id, volume_id, volume.service_topic_queue)
++        try:
++            return contracts.validate_capabilities(result)
++        except exception.CheckpointNotSupported:
++            return contracts.unsupported_capabilities(
++                'unverified_capabilities')
+diff --git a/cinder/db/api.py b/cinder/db/api.py
+index de066e9..3bf27f2 100644
+--- a/cinder/db/api.py
++++ b/cinder/db/api.py
+@@ -2007,6 +2007,22 @@ def checkpoint_continuation_scope(context, nova_operation_id, generation,
+         context, nova_operation_id, generation, action, volume_id)
+ 
+ 
++def checkpoint_continuation_for_owner(context, operation_id):
++    return IMPL.checkpoint_continuation_for_owner(context, operation_id)
++
++
++def checkpoint_continuation_volumes(context, nova_operation_id, generation,
++                                    action):
++    return IMPL.checkpoint_continuation_volumes(
++        context, nova_operation_id, generation, action)
++
++
++def checkpoint_continuation_transition(context, nova_operation_id, generation,
++                                       action, outcome=None):
++    return IMPL.checkpoint_continuation_transition(
++        context, nova_operation_id, generation, action, outcome)
++
++
+ def checkpoint_get(context, operation_id):
+     return IMPL.checkpoint_get(context, operation_id)
+ 
+diff --git a/cinder/db/sqlalchemy/api.py b/cinder/db/sqlalchemy/api.py
+index c092b5f..414d148 100644
+--- a/cinder/db/sqlalchemy/api.py
++++ b/cinder/db/sqlalchemy/api.py
+@@ -8759,6 +8759,25 @@ def checkpoint_continuation_scope(context, nova_operation_id, generation,
+         context, nova_operation_id, generation, action, volume_id)
+ 
+ 
++def checkpoint_continuation_for_owner(context, operation_id):
++    from cinder.db.sqlalchemy import checkpoint_continuation
++    return checkpoint_continuation.for_owner(context, operation_id)
++
++
++def checkpoint_continuation_volumes(context, nova_operation_id, generation,
++                                    action):
++    from cinder.db.sqlalchemy import checkpoint_continuation
++    return checkpoint_continuation.volumes(
++        context, nova_operation_id, generation, action)
++
++
++def checkpoint_continuation_transition(context, nova_operation_id, generation,
++                                       action, outcome=None):
++    from cinder.db.sqlalchemy import checkpoint_continuation
++    return checkpoint_continuation.transition(
++        context, nova_operation_id, generation, action, outcome)
++
++
+ def checkpoint_get(context, operation_id):
+     from cinder.db.sqlalchemy import checkpoints
+     return checkpoints.get(context, operation_id)
+diff --git a/cinder/db/sqlalchemy/checkpoint_continuation.py b/cinder/db/sqlalchemy/checkpoint_continuation.py
+index 8628d24..ad9794f 100644
+--- a/cinder/db/sqlalchemy/checkpoint_continuation.py
++++ b/cinder/db/sqlalchemy/checkpoint_continuation.py
+@@ -18,6 +18,7 @@ from oslo_utils import uuidutils
+ 
+ from cinder.checkpoints import continuation
+ from cinder.checkpoints import continuation_contracts as contracts
++from cinder.checkpoints import guards
+ from cinder.db.sqlalchemy import api
+ from cinder.db.sqlalchemy import checkpoints as journal
+ from cinder.db.sqlalchemy import models
+@@ -160,3 +161,49 @@ def _scope(context, nova_operation_id, generation, action, volume_id=None):
+ def scope(context, nova_operation_id, generation, action, volume_id=None):
+     return _scope(context, nova_operation_id, generation, action,
+                   volume_id).to_primitive()
++
++
++@api.require_context
++@api.main_context_manager.reader
++def for_owner(context, operation_id):
++    guards.require_service(context)
++    operation = journal._operation(context, operation_id)
++    grant = journal._query(context, models.CheckpointContinuationGrant).\
++        filter_by(id=operation.continuation_id,
++                  operation_id=operation.id).first()
++    if grant is None:
++        raise exception.CheckpointOperationNotFound()
++    _bound_operation(context, grant)
++    return dict(grant)
++
++
++def _volumes(context, scope):
++    return [journal._query(context, models.Volume).filter_by(
++        id=volume_id, project_id=scope.owner_project_id).one()
++        for volume_id in scope.volume_ids]
++
++
++@api.require_context
++@api.main_context_manager.writer
++def volumes(context, nova_operation_id, generation, action):
++    authorized = _scope(context, nova_operation_id, generation, action)
++    return [dict(row) for row in _volumes(context, authorized)]
++
++
++@api.require_context
++@api.main_context_manager.writer
++def transition(context, nova_operation_id, generation, action, outcome=None):
++    if action not in ('release', 'cleanup') or (
++            action == 'release' and outcome not in ('commit', 'abort')):
++        raise exception.InvalidInput(reason='invalid_continuation_action')
++    authorized = _scope(context, nova_operation_id, generation, action)
++    grant = _grant(context, nova_operation_id,
++                   authorized.executor_service_user_id)
++    operation = _bound_operation(context, grant)
++    if action == 'cleanup':
++        return journal._cleanup(context, operation)
++    instance = journal._query(context, models.CheckpointInstance).filter_by(
++        instance_uuid=operation.instance_uuid,
++        project_id=authorized.owner_project_id).one()
++    return journal._release(context, operation, instance,
++                            _volumes(context, authorized), outcome)
+diff --git a/cinder/db/sqlalchemy/checkpoints.py b/cinder/db/sqlalchemy/checkpoints.py
+index 77d99c9..40c529a 100644
+--- a/cinder/db/sqlalchemy/checkpoints.py
++++ b/cinder/db/sqlalchemy/checkpoints.py
+@@ -482,6 +482,12 @@ def release(context, operation_id, generation, outcome):
+         raise exception.InvalidInput(reason='invalid_release_outcome')
+     operation, instance, volumes = _locked_operation(
+         context, operation_id, generation)
++    return _release(context, operation, instance, volumes, outcome)
++
++
++def _release(context, operation, instance, volumes, outcome):
++    """Release rows already locked and authorized by the calling wrapper."""
++    operation_id, generation = operation.id, operation.generation
+     if operation.status == 'released':
+         if outcome != operation.release_outcome:
+             _conflict('release_outcome_changed')
+@@ -578,6 +584,12 @@ def _release_quota(context, resource):
+ def cleanup(context, operation_id, generation):
+     operation, instance, volumes = _locked_operation(
+         context, operation_id, generation)
++    return _cleanup(context, operation)
++
++
++def _cleanup(context, operation):
++    """Compensate an operation already locked and authorized by its wrapper."""
++    operation_id, generation = operation.id, operation.generation
+     if operation.status == 'released':
+         return _as_dict(context, operation)
+     if operation.kind != 'create':
+diff --git a/cinder/tests/unit/api/v3/test_checkpoint_continuation.py b/cinder/tests/unit/api/v3/test_checkpoint_continuation.py
+new file mode 100644
+index 0000000..6cd9df8
+--- /dev/null
++++ b/cinder/tests/unit/api/v3/test_checkpoint_continuation.py
+@@ -0,0 +1,210 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from unittest import mock
++
++from oslo_serialization import jsonutils
++from oslo_utils.fixture import uuidsentinel as uuids
++import webob
++
++from cinder.api.middleware import fault
++from cinder.api.v3 import router
++from cinder.checkpoints import api
++from cinder.checkpoints import continuation_api
++from cinder import db
++from cinder.db.sqlalchemy import models
++from cinder.tests.unit.api import fakes
++from cinder.tests.unit.checkpoints import test_continuation_db
++from cinder.tests.unit.checkpoints import test_contracts
++from cinder.tests.unit.checkpoints import test_db
++from cinder.tests.unit import test
++
++
++class CheckpointContinuationAPITest(test_continuation_db.ContinuationHelpers,
++                                    test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_continuation()
++        self.operation = self.api.reserve_with_continuation(
++            self.ctxt, self.payload)
++        self.service_path = ('/checkpoint-service-operations/' +
++                             uuids.nova_operation)
++        self.reserve_body = {'checkpoint_operation': self.payload}
++        self.service_rpc = mock.Mock(spec=[
++            'assert_checkpoint_continuation_ready',
++            'get_checkpoint_continuation_capabilities',
++            'execute_checkpoint_continuation',
++            'reconcile_checkpoint_continuation'])
++        query = self.service_rpc.get_checkpoint_continuation_capabilities
++        query.return_value = test_contracts.supported_capabilities()
++        self.service_api = continuation_api.ContinuationAPI(
++            rpc=self.service_rpc)
++        self.mock_object(api, 'API', return_value=self.api)
++        self.mock_object(continuation_api, 'ContinuationAPI',
++                         return_value=self.service_api)
++        self.application = fakes.urlmap.URLMap()
++        self.application['/v3'] = router.APIRouter()
++        self.application = fault.FaultWrapper(self.application)
++        self.foreign_service = self.service_ctx.deepcopy()
++        self.foreign_service.user_id = uuids.foreign_service
++        self.flags(nova_service_user_ids=[test_db.SERVICE_ID,
++                                          uuids.foreign_service],
++                   group='checkpoint')
++
++    def request_as(self, ctx, method, path, body=None, version='3.73'):
++        request = webob.Request.blank('/v3' + path)
++        request.method = method
++        request.headers['Content-Type'] = 'application/json'
++        request.headers['OpenStack-API-Version'] = 'volume ' + version
++        request.environ['cinder.context'] = ctx
++        if body is not None:
++            request.body = jsonutils.dump_as_bytes(body)
++        return request.get_response(self.application)
++
++    def test_service_lookup_keeps_original_owner_and_hides_journal(self):
++        response = self.request_as(self.service_ctx, 'GET', self.service_path)
++        self.assertEqual(200, response.status_int, response.text)
++        operation = response.json['checkpoint_operation']
++        self.assertEqual(self.operation.id, operation['id'])
++        self.assertEqual(dict(version=1,
++                              nova_operation_id=uuids.nova_operation,
++                              owner_project_id=self.ctxt.project_id,
++                              actor_user_id=self.ctxt.user_id,
++                              executor_service_user_id=test_db.SERVICE_ID,
++                              generation=1), operation['continuation'])
++        for name in ('payload_hash', 'backend_reference', 'capabilities_json',
++                     'quota_reservations', 'connection_info'):
++            self.assertNotIn(name, response.text)
++
++    def test_foreign_service_cannot_read_grant(self):
++        response = self.request_as(self.foreign_service, 'GET',
++                                   self.service_path)
++        self.assertEqual(404, response.status_int, response.text)
++        self.rpc.execute_checkpoint_step.assert_not_called()
++        self.service_rpc.execute_checkpoint_continuation.assert_not_called()
++
++    def test_service_cannot_reserve_new_operation(self):
++        response = self.request_as(self.service_ctx, 'POST',
++                                   '/checkpoint-operations', self.reserve_body)
++        self.assertEqual(403, response.status_int, response.text)
++        self.assertEqual(1, self.count(models.CheckpointOperation))
++
++    def test_373_reserve_replay_returns_the_same_continuation(self):
++        response = self.request_as(self.ctxt, 'POST', '/checkpoint-operations',
++                                   self.reserve_body)
++        self.assertEqual(202, response.status_int, response.text)
++        result = response.json['checkpoint_operation']
++        self.assertEqual(self.operation.id, result['id'])
++        self.assertEqual(uuids.nova_operation,
++                         result['continuation']['nova_operation_id'])
++        self.assertEqual(1, self.count(models.CheckpointContinuationGrant))
++        self.assertEqual(2, self.usage()['snapshots']['in_use'])
++
++    def test_372_has_no_new_routes_or_delegation_fields(self):
++        response = self.request_as(self.ctxt, 'POST', '/checkpoint-operations',
++                                   self.reserve_body, version='3.72')
++        self.assertEqual(400, response.status_int, response.text)
++        response = self.request_as(self.service_ctx, 'GET', self.service_path,
++                                   version='3.72')
++        self.assertEqual(404, response.status_int, response.text)
++
++    def test_373_without_delegation_keeps_legacy_path(self):
++        db.checkpoint_release(self.ctxt, self.operation.id, 1, 'abort')
++        legacy = {key: value for key, value in self.payload.items()
++                  if key not in ('nova_operation_id',
++                                 'allow_service_continuation')}
++        legacy.update(request_id=uuids.legacy_request,
++                      checkpoint_id=uuids.legacy_checkpoint)
++        response = self.request_as(self.ctxt, 'POST', '/checkpoint-operations',
++                                   {'checkpoint_operation': legacy})
++        self.assertEqual(202, response.status_int, response.text)
++        self.assertNotIn('continuation', response.json['checkpoint_operation'])
++        self.assertEqual(1, self.count(models.CheckpointContinuationGrant))
++
++    def test_unknown_uuid_and_foreign_volume_do_not_dispatch(self):
++        paths = ['/checkpoint-service-operations/' + uuids.unknown,
++                 self.service_path + '/volumes/' + uuids.foreign_volume +
++                 '/capabilities']
++        for path in paths:
++            response = self.request_as(self.service_ctx, 'GET', path)
++            self.assertEqual(404, response.status_int, response.text)
++        self.service_rpc.get_checkpoint_continuation_capabilities.\
++            assert_not_called()
++        self.assertEqual(2, len(self.locks()))
++
++    def test_capabilities_use_scoped_rpc(self):
++        path = (self.service_path + '/volumes/' + self.volumes[0] +
++                '/capabilities')
++        response = self.request_as(self.service_ctx, 'GET', path)
++        self.assertEqual(200, response.status_int, response.text)
++        self.assertTrue(response.json['checkpoint_capabilities']['supported'])
++        query = self.service_rpc.get_checkpoint_continuation_capabilities
++        args = query.call_args.args
++        self.assertEqual((self.service_ctx, uuids.nova_operation,
++                          self.volumes[0]), args[:3])
++
++    def test_changed_generation_and_closed_action_shape(self):
++        for body, status in (({'execute': {'generation': 2}}, 409),
++                             ({'execute': {'generation': True}}, 400),
++                             ({'execute': {'generation': 1, 'force': True}},
++                              400), ({'release': {'generation': 1}}, 400)):
++            response = self.request_as(self.service_ctx, 'POST',
++                                       self.service_path + '/action', body)
++            self.assertEqual(status, response.status_int, response.text)
++        self.service_rpc.execute_checkpoint_continuation.assert_not_called()
++
++    def test_execute_uses_continuation_rpc_with_service_subject(self):
++        response = self.request_as(self.service_ctx, 'POST',
++                                   self.service_path + '/action',
++                                   {'execute': {'generation': 1}})
++        self.assertEqual(202, response.status_int, response.text)
++        execute = self.service_rpc.execute_checkpoint_continuation
++        self.assertTrue(execute.called)
++        for call in execute.call_args_list:
++            self.assertEqual((self.service_ctx, uuids.nova_operation, 1),
++                             call.args[:3])
++        self.rpc.execute_checkpoint_step.assert_not_called()
++
++    def test_release_reply_loss_is_resolved_by_read_only_tombstone(self):
++        response = self.request_as(self.service_ctx, 'POST',
++                                   self.service_path + '/action',
++                                   {'release': {'generation': 1,
++                                                'outcome': 'abort'}})
++        self.assertEqual(202, response.status_int, response.text)
++        response = self.request_as(self.service_ctx, 'GET', self.service_path)
++        self.assertEqual(200, response.status_int, response.text)
++        self.assertEqual('released',
++                         response.json['checkpoint_operation']['status'])
++        for action in ('execute', 'reconcile', 'cleanup'):
++            response = self.request_as(self.service_ctx, 'POST',
++                                       self.service_path + '/action',
++                                       {action: {'generation': 1}})
++            self.assertEqual(409, response.status_int, response.text)
++        self.assertEqual(0, self.usage()['snapshots']['in_use'])
++        self.assertEqual([], self.locks())
++
++    def test_service_project_url_does_not_select_owner(self):
++        response = self.request_as(self.service_ctx, 'GET',
++                                   '/' + self.service_ctx.project_id +
++                                   self.service_path)
++        self.assertEqual(200, response.status_int, response.text)
++        response = self.request_as(self.service_ctx, 'GET',
++                                   '/' + self.ctxt.project_id +
++                                   self.service_path)
++        self.assertEqual(400, response.status_int, response.text)
++
++    def test_no_service_collection_or_unbound_resource_routes(self):
++        for path in ('/checkpoint-service-operations',
++                     self.service_path + '/volumes',
++                     self.service_path + '/attachments'):
++            response = self.request_as(self.service_ctx, 'GET', path)
++            self.assertEqual(404, response.status_int, response.text)

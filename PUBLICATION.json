@@ -1,0 +1,770 @@
+{
+  "date": "2026-10-11",
+  "repository": "https://github.com/lebtmalorny-rgb/snapshots.git",
+  "scope": "checkpoint_research_specs_plans_and_product_patches",
+  "product_patch_count": {
+    "nova": 23,
+    "cinder": 17
+  },
+  "source_bundle": "deliverables/checkpoint-patches-research-20261010",
+  "research_note": "All four research reports and their JSON appendices are included in the compact bundle; research_provenance in its MANIFEST.json maps original workspace files to packaged reports.",
+  "historical_plan_note": "Dated specifications and execution plans retain their original scope; current implementation and qualification boundaries are in the bundle research/STATUS.md. Links to included research point to the compact bundle; links to unpublished local sources or historical evidence are rendered as source paths, with transformations recorded per file.",
+  "files": [
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/APPLY.md",
+      "published": "deliverables/checkpoint-patches-research-20261010/APPLY.md",
+      "source_sha256": "16e60fc8f70b8e8f3b5e8423c80aeffb6cfb06915dc412dabc83b9c367ad6bfe",
+      "sha256": "16e60fc8f70b8e8f3b5e8423c80aeffb6cfb06915dc412dabc83b9c367ad6bfe"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/MANIFEST.json",
+      "published": "deliverables/checkpoint-patches-research-20261010/MANIFEST.json",
+      "source_sha256": "0ea0c6abbba119f279118e892a7165b9d489e650a2a4b84794d617a9d4fe489c",
+      "sha256": "0ea0c6abbba119f279118e892a7165b9d489e650a2a4b84794d617a9d4fe489c"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/README.md",
+      "published": "deliverables/checkpoint-patches-research-20261010/README.md",
+      "source_sha256": "b30af43cb33d9784e030c68a7a89dcca63ff8d1d50e1a7d7f5c776ee326d2e41",
+      "sha256": "b30af43cb33d9784e030c68a7a89dcca63ff8d1d50e1a7d7f5c776ee326d2e41"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/SHA256SUMS",
+      "published": "deliverables/checkpoint-patches-research-20261010/SHA256SUMS",
+      "source_sha256": "381c126611cf9a7cfbd30dd92f7970d652d0c435d83862c57a311a6e92ac4a33",
+      "sha256": "381c126611cf9a7cfbd30dd92f7970d652d0c435d83862c57a311a6e92ac4a33"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/VERIFICATION.json",
+      "published": "deliverables/checkpoint-patches-research-20261010/VERIFICATION.json",
+      "source_sha256": "e3f74641284dd31247587aba0877a07d64c1cdcb7323d6045d41bfb015ee9b01",
+      "sha256": "e3f74641284dd31247587aba0877a07d64c1cdcb7323d6045d41bfb015ee9b01"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/BASE_TREE",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/BASE_TREE",
+      "source_sha256": "44582453ec833cfd5b3ccc32c17c324a0c05cb45c89742075b5dadbe9f656944",
+      "sha256": "44582453ec833cfd5b3ccc32c17c324a0c05cb45c89742075b5dadbe9f656944"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/HEAD_TREE",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/HEAD_TREE",
+      "source_sha256": "4174ba6f7f095d17743e42bad9c085f53a840ed46c0c2ece03d6b91f8a80c8e6",
+      "sha256": "4174ba6f7f095d17743e42bad9c085f53a840ed46c0c2ece03d6b91f8a80c8e6"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/SOURCE_SHA256",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/SOURCE_SHA256",
+      "source_sha256": "a2fb4dc2db010b4923e4923b87285d661e785e781ad2b4c86d5c5a5773a74d4e",
+      "sha256": "a2fb4dc2db010b4923e4923b87285d661e785e781ad2b4c86d5c5a5773a74d4e"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0001-feat-define-native-Cinder-checkpoint-driver-contract.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0001-feat-define-native-Cinder-checkpoint-driver-contract.patch",
+      "source_sha256": "c04b02ef031868257f0d98a970df0400656777eed8428a3be716488247f02249",
+      "sha256": "c04b02ef031868257f0d98a970df0400656777eed8428a3be716488247f02249"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0002-feat-persist-checkpoint-operations-and-resource-rese.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0002-feat-persist-checkpoint-operations-and-resource-rese.patch",
+      "source_sha256": "8d96fe13b8b02697f3259e2b17827743c77ae9573c7a2e76760ff6ae7a9ebde5",
+      "sha256": "8d96fe13b8b02697f3259e2b17827743c77ae9573c7a2e76760ff6ae7a9ebde5"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0003-feat-guard-checkpoint-resources-across-Cinder-mutati.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0003-feat-guard-checkpoint-resources-across-Cinder-mutati.patch",
+      "source_sha256": "faa3e4391aaced604a71b0757ee47715ac6a513b4a480c993dc7fa25111a5c2c",
+      "sha256": "faa3e4391aaced604a71b0757ee47715ac6a513b4a480c993dc7fa25111a5c2c"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0004-feat-expose-authenticated-checkpoint-reservation-API.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0004-feat-expose-authenticated-checkpoint-reservation-API.patch",
+      "source_sha256": "95ca29e2a9a1e9c7ebbef5c47a16255757808155b769565232a1772bc928d594",
+      "sha256": "95ca29e2a9a1e9c7ebbef5c47a16255757808155b769565232a1772bc928d594"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0005-feat-execute-and-reconcile-native-checkpoint-steps-o.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0005-feat-execute-and-reconcile-native-checkpoint-steps-o.patch",
+      "source_sha256": "ad35ed3f562499c3cf8508d4701d15e6f5399900b79bec96fd00151f20fd4496",
+      "sha256": "ad35ed3f562499c3cf8508d4701d15e6f5399900b79bec96fd00151f20fd4496"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0006-feat-authorize-checkpoint-scoped-volume-reconnection.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0006-feat-authorize-checkpoint-scoped-volume-reconnection.patch",
+      "source_sha256": "02694b05849ab701a544e9bff29ac52cfccd166194c5d225b505141e183c62ce",
+      "sha256": "02694b05849ab701a544e9bff29ac52cfccd166194c5d225b505141e183c62ce"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0007-feat-recover-interrupted-checkpoint-operations-witho.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0007-feat-recover-interrupted-checkpoint-operations-witho.patch",
+      "source_sha256": "5277ffa7824e2b7b1c3c8fc26d655503dd15bcc1289b1a1db823f1eb9a256c61",
+      "sha256": "5277ffa7824e2b7b1c3c8fc26d655503dd15bcc1289b1a1db823f1eb9a256c61"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0008-style-wrap-checkpoint-quota-regression-test-line.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0008-style-wrap-checkpoint-quota-regression-test-line.patch",
+      "source_sha256": "0656dd4263be06abaa30e49016659087caca730ab8b1afd0fe94e3e3ad65e3db",
+      "sha256": "0656dd4263be06abaa30e49016659087caca730ab8b1afd0fe94e3e3ad65e3db"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0009-test-cover-and-document-the-Cinder-checkpoint-contra.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0009-test-cover-and-document-the-Cinder-checkpoint-contra.patch",
+      "source_sha256": "4234077b05ebc886dd645699b4ee1b38f90a962b58ed401af3228472fe7abb20",
+      "sha256": "4234077b05ebc886dd645699b4ee1b38f90a962b58ed401af3228472fe7abb20"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0010-fix-close-checkpoint-worker-and-quota-admission-race.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c1/0010-fix-close-checkpoint-worker-and-quota-admission-race.patch",
+      "source_sha256": "c1ab82ef32709abb60266ff648e96297c815cf8b5506c3b0a6b6ceeae0022426",
+      "sha256": "c1ab82ef32709abb60266ff648e96297c815cf8b5506c3b0a6b6ceeae0022426"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0001-feat-define-scoped-checkpoint-continuation-contract.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0001-feat-define-scoped-checkpoint-continuation-contract.patch",
+      "source_sha256": "335bdff56e5fd46843ad6687707d3b979531ce7bc91fb8276b3c142d0d2f87e7",
+      "sha256": "335bdff56e5fd46843ad6687707d3b979531ce7bc91fb8276b3c142d0d2f87e7"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0002-feat-persist-checkpoint-continuation-grants-atomical.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0002-feat-persist-checkpoint-continuation-grants-atomical.patch",
+      "source_sha256": "aa594fb981dfbef4e771cb702e50be05f8814f7ff0c9097736edde6afa1588ec",
+      "sha256": "aa594fb981dfbef4e771cb702e50be05f8814f7ff0c9097736edde6afa1588ec"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0003-feat-expose-restricted-checkpoint-continuation-API.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0003-feat-expose-restricted-checkpoint-continuation-API.patch",
+      "source_sha256": "4a1d1face22aba7480037135477465df5d74890052184e5c7b41004f362ed98a",
+      "sha256": "4a1d1face22aba7480037135477465df5d74890052184e5c7b41004f362ed98a"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0004-feat-journal-checkpoint-attachment-requests.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0004-feat-journal-checkpoint-attachment-requests.patch",
+      "source_sha256": "23002f90136445162314b716eaf45db489ca360b713140789217265cc808715a",
+      "sha256": "23002f90136445162314b716eaf45db489ca360b713140789217265cc808715a"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0005-feat-enforce-checkpoint-continuation-at-worker-bound.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0005-feat-enforce-checkpoint-continuation-at-worker-bound.patch",
+      "source_sha256": "65f192de5d882cd3a3099ad1f84d218170c170ee2460888f9f7ef394cf7662e2",
+      "sha256": "65f192de5d882cd3a3099ad1f84d218170c170ee2460888f9f7ef394cf7662e2"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0006-test-verify-checkpoint-continuation-lifecycle-and-au.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0006-test-verify-checkpoint-continuation-lifecycle-and-au.patch",
+      "source_sha256": "9082cc3d545af6a7cbf56275701cdf9a82083eeec6756edaf40670162e5e475d",
+      "sha256": "9082cc3d545af6a7cbf56275701cdf9a82083eeec6756edaf40670162e5e475d"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0007-fix-preserve-checkpoint-abort-protection-and-continu.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/c11/0007-fix-preserve-checkpoint-abort-protection-and-continu.patch",
+      "source_sha256": "246dff4aee870811bda38d5d99a97a26fecd887556708b065dc661c080c83ab8",
+      "sha256": "246dff4aee870811bda38d5d99a97a26fecd887556708b065dc661c080c83ab8"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/cinder/series",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/cinder/series",
+      "source_sha256": "40d9f0fdbbc65691fd143b61757f055f576cbde1db7e017dd2f9bc363141e8b3",
+      "sha256": "40d9f0fdbbc65691fd143b61757f055f576cbde1db7e017dd2f9bc363141e8b3"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/BASE_TREE",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/BASE_TREE",
+      "source_sha256": "6cf98f35b1372ac9848d2a6b02bba67ca8153f0a91f480d6810c9a88b739be8f",
+      "sha256": "6cf98f35b1372ac9848d2a6b02bba67ca8153f0a91f480d6810c9a88b739be8f"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/HEAD_TREE",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/HEAD_TREE",
+      "source_sha256": "ca8acfe011ca658f682a3400062ea44885e15b86fcbdd42530cadbbb411cc6b7",
+      "sha256": "ca8acfe011ca658f682a3400062ea44885e15b86fcbdd42530cadbbb411cc6b7"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/SOURCE_SHA256",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/SOURCE_SHA256",
+      "source_sha256": "2f2bcca5556bd6778dfb063bb1d79241ec6b13d70bfd8387d034f23bee06bf39",
+      "sha256": "2f2bcca5556bd6778dfb063bb1d79241ec6b13d70bfd8387d034f23bee06bf39"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/fixes/0001-fix-normalize-checkpoint-attachment-connection-information.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/fixes/0001-fix-normalize-checkpoint-attachment-connection-information.patch",
+      "source_sha256": "6ea133f0bdf5bd9476e45f2ef9234831bcb307dd5d66dec012bdf82cf634ddde",
+      "sha256": "6ea133f0bdf5bd9476e45f2ef9234831bcb307dd5d66dec012bdf82cf634ddde"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/fixes/0002-fix-query-claimed-checkpoint-children-behind-ready-parents.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/fixes/0002-fix-query-claimed-checkpoint-children-behind-ready-parents.patch",
+      "source_sha256": "e94e67fb4d480dee688ba16441d3bd2483c16d4746815b8a75f3938cdfe7a923",
+      "sha256": "e94e67fb4d480dee688ba16441d3bd2483c16d4746815b8a75f3938cdfe7a923"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/fixes/0003-fix-let-libvirt-bind-checkpoint-metadata-namespace.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/fixes/0003-fix-let-libvirt-bind-checkpoint-metadata-namespace.patch",
+      "source_sha256": "643bbb1c579ebe4dc6bc8fb47a6c1428230b6b17534034aa6cb6018b9eafef38",
+      "sha256": "643bbb1c579ebe4dc6bc8fb47a6c1428230b6b17534034aa6cb6018b9eafef38"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0001-feat-define-Nova-checkpoint-contracts-and-safe-defau.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0001-feat-define-Nova-checkpoint-contracts-and-safe-defau.patch",
+      "source_sha256": "e2060ad7815ace047cca5be9dbc09738b7fc43318fcfd57736db2152f0ce0db7",
+      "sha256": "e2060ad7815ace047cca5be9dbc09738b7fc43318fcfd57736db2152f0ce0db7"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0002-feat-persist-cell-checkpoint-journal-and-admission-c.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0002-feat-persist-cell-checkpoint-journal-and-admission-c.patch",
+      "source_sha256": "4afaad92de4e0466c36b7793ef38e06f7f5446d25e330d904b509f311f9d35c7",
+      "sha256": "4afaad92de4e0466c36b7793ef38e06f7f5446d25e330d904b509f311f9d35c7"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0003-feat-reserve-checkpoint-quotas-across-cells-with-dur.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0003-feat-reserve-checkpoint-quotas-across-cells-with-dur.patch",
+      "source_sha256": "4031be48d787c877e14e2171d4576c3a9b83aa0a7e2f675e8057d65e4b1d359b",
+      "sha256": "4031be48d787c877e14e2171d4576c3a9b83aa0a7e2f675e8057d65e4b1d359b"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0004-feat-guard-checkpoint-instances-against-ordinary-mut.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0004-feat-guard-checkpoint-instances-against-ordinary-mut.patch",
+      "source_sha256": "9964d2f499a09d74fe6c78eef343784bb118d6ade5dee9ca963a5edf2418f292",
+      "sha256": "9964d2f499a09d74fe6c78eef343784bb118d6ade5dee9ca963a5edf2418f292"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0005-feat-add-gated-checkpoint-RPC-and-durable-execution-.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0005-feat-add-gated-checkpoint-RPC-and-durable-execution-.patch",
+      "source_sha256": "cd593ac98e5598e9770fcccec7be90b250526d09167266e6315c2d903515fdff",
+      "sha256": "cd593ac98e5598e9770fcccec7be90b250526d09167266e6315c2d903515fdff"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0006-feat-expose-cell-aware-Nova-checkpoint-API.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0006-feat-expose-cell-aware-Nova-checkpoint-API.patch",
+      "source_sha256": "d65bfcdc478d7e76b432f6dd03519f9c910841bc6b868bc94a0402bf4e068093",
+      "sha256": "d65bfcdc478d7e76b432f6dd03519f9c910841bc6b868bc94a0402bf4e068093"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0007-feat-reconcile-checkpoint-journals-without-destructi.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0007-feat-reconcile-checkpoint-journals-without-destructi.patch",
+      "source_sha256": "97d416bea0c3646c06f2b17bbe2e9c483f392ff54850b96e02cbbf30a2c7d834",
+      "sha256": "97d416bea0c3646c06f2b17bbe2e9c483f392ff54850b96e02cbbf30a2c7d834"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0008-test-exercise-checkpoint-lifecycle-across-Nova-cells.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0008-test-exercise-checkpoint-lifecycle-across-Nova-cells.patch",
+      "source_sha256": "e9d5cdc497608b7e68e2c5a6e7613f6501573b1e3bebaa3d878d3a9d8e814f9a",
+      "sha256": "e9d5cdc497608b7e68e2c5a6e7613f6501573b1e3bebaa3d878d3a9d8e814f9a"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0009-docs-document-Nova-checkpoint-model-and-recovery-bou.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0009-docs-document-Nova-checkpoint-model-and-recovery-bou.patch",
+      "source_sha256": "1b2d7aaf64a3f13b5263b8edc12af352704c8a2bf452bd34be3a57f8e5201993",
+      "sha256": "1b2d7aaf64a3f13b5263b8edc12af352704c8a2bf452bd34be3a57f8e5201993"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0010-fix-preserve-checkpoint-ownership-across-ordinary-op.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n1/0010-fix-preserve-checkpoint-ownership-across-ordinary-op.patch",
+      "source_sha256": "fb134c3f221f076e9224f53b786783e521bcf83f75d0ae8ed5211a8bea0b84e3",
+      "sha256": "fb134c3f221f076e9224f53b786783e521bcf83f75d0ae8ed5211a8bea0b84e3"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0001-feat-define-checkpoint-executor-v2-contracts.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0001-feat-define-checkpoint-executor-v2-contracts.patch",
+      "source_sha256": "cfd1841648e4ea6a70df2e9e15287bc51b641360b6b3634b74eefab7954746bf",
+      "sha256": "cfd1841648e4ea6a70df2e9e15287bc51b641360b6b3634b74eefab7954746bf"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0002-feat-journal-checkpoint-child-effects-and-partial-re.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0002-feat-journal-checkpoint-child-effects-and-partial-re.patch",
+      "source_sha256": "2a997b0683174037bf5307b9d560c0fe401b6fe740984615c8290de50132b56f",
+      "sha256": "2a997b0683174037bf5307b9d560c0fe401b6fe740984615c8290de50132b56f"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0003-feat-account-checkpoint-staging-with-temporary-quota.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0003-feat-account-checkpoint-staging-with-temporary-quota.patch",
+      "source_sha256": "d89d3988674459ebe0c03d53de1608aaeb5f5de04c5bc32ef36391dc830d62ef",
+      "sha256": "d89d3988674459ebe0c03d53de1608aaeb5f5de04c5bc32ef36391dc830d62ef"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0004-feat-add-shared-checkpoint-artifacts-and-bounded-sta.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0004-feat-add-shared-checkpoint-artifacts-and-bounded-sta.patch",
+      "source_sha256": "a15432493f7696a082b1fadd11973312165b364eb94f0dc1f147772b30d15b3b",
+      "sha256": "a15432493f7696a082b1fadd11973312165b364eb94f0dc1f147772b30d15b3b"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0005-feat-integrate-scoped-Cinder-checkpoint-continuation.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0005-feat-integrate-scoped-Cinder-checkpoint-continuation.patch",
+      "source_sha256": "2897ecb3c6b8f6a094042c514dfad293882f14eb2bd701f362596fbb0c6f4032",
+      "sha256": "2897ecb3c6b8f6a094042c514dfad293882f14eb2bd701f362596fbb0c6f4032"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0006-feat-implement-guarded-libvirt-checkpoint-runtime-ef.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0006-feat-implement-guarded-libvirt-checkpoint-runtime-ef.patch",
+      "source_sha256": "60ce1f2da41de9f97b50d0dac9fcd468a3ee28cff66a244dde089a71c7487a1b",
+      "sha256": "60ce1f2da41de9f97b50d0dac9fcd468a3ee28cff66a244dde089a71c7487a1b"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0007-feat-reconnect-checkpoint-volumes-through-scoped-att.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0007-feat-reconnect-checkpoint-volumes-through-scoped-att.patch",
+      "source_sha256": "b4e45f6e2cf02317556e80166599b34ad3a6a720d50851635d40d7266793c27d",
+      "sha256": "b4e45f6e2cf02317556e80166599b34ad3a6a720d50851635d40d7266793c27d"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0008-feat-orchestrate-libvirt-checkpoints-with-durable-co.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0008-feat-orchestrate-libvirt-checkpoints-with-durable-co.patch",
+      "source_sha256": "fa5fff392526a65a43026f083f2bb22e120af4ac7edc9147d2f22bed7d4de4a4",
+      "sha256": "fa5fff392526a65a43026f083f2bb22e120af4ac7edc9147d2f22bed7d4de4a4"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0009-test-qualify-checkpoint-executor-and-document-operat.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0009-test-qualify-checkpoint-executor-and-document-operat.patch",
+      "source_sha256": "e48f2e55ec33ea1d2f2b7db6f539098190f98eae21d9b60180bff26be5077f98",
+      "sha256": "e48f2e55ec33ea1d2f2b7db6f539098190f98eae21d9b60180bff26be5077f98"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0010-fix-close-checkpoint-review-gaps-in-capacity-and-net.patch",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/n2/0010-fix-close-checkpoint-review-gaps-in-capacity-and-net.patch",
+      "source_sha256": "433c4eb504278919f4e4300c73687c8cd1e45b4a696711d74a6a31a02c669cfd",
+      "sha256": "433c4eb504278919f4e4300c73687c8cd1e45b4a696711d74a6a31a02c669cfd"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/patches/nova/series",
+      "published": "deliverables/checkpoint-patches-research-20261010/patches/nova/series",
+      "source_sha256": "104bdd4c50814d628b199748ded35253f4ddc75ed01b5a8111c3ff1dbd0a5b66",
+      "sha256": "104bdd4c50814d628b199748ded35253f4ddc75ed01b5a8111c3ff1dbd0a5b66"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/research/2026-10-08-checkpoint-vendor-profile.template.json",
+      "published": "deliverables/checkpoint-patches-research-20261010/research/2026-10-08-checkpoint-vendor-profile.template.json",
+      "source_sha256": "a8fe0f74fb62d151594bde09e8c8ec50c0923a83b5d8a4ef1870949eb2da6408",
+      "sha256": "a8fe0f74fb62d151594bde09e8c8ec50c0923a83b5d8a4ef1870949eb2da6408"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/research/2026-10-08-checkpoint-vendor-readiness.md",
+      "published": "deliverables/checkpoint-patches-research-20261010/research/2026-10-08-checkpoint-vendor-readiness.md",
+      "source_sha256": "30b91374c63f9c100cf99502375859c2c40756764097e2dfbab6664fd48e0a80",
+      "sha256": "30b91374c63f9c100cf99502375859c2c40756764097e2dfbab6664fd48e0a80"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/research/2026-10-08-checkpoint-vendor-source-evidence.json",
+      "published": "deliverables/checkpoint-patches-research-20261010/research/2026-10-08-checkpoint-vendor-source-evidence.json",
+      "source_sha256": "1e3e570a904bfde2267d4a89db95c9894050a5e5e68eb0a0975ed883b1727d13",
+      "sha256": "1e3e570a904bfde2267d4a89db95c9894050a5e5e68eb0a0975ed883b1727d13"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/research/2026-10-08-dorado-without-hardware.evidence.json",
+      "published": "deliverables/checkpoint-patches-research-20261010/research/2026-10-08-dorado-without-hardware.evidence.json",
+      "source_sha256": "7f969981a4cec612ef5515c919fc7997eb0a15875718b5a11cb2755671e4f390",
+      "sha256": "7f969981a4cec612ef5515c919fc7997eb0a15875718b5a11cb2755671e4f390"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/research/2026-10-08-dorado-without-hardware.md",
+      "published": "deliverables/checkpoint-patches-research-20261010/research/2026-10-08-dorado-without-hardware.md",
+      "source_sha256": "50ef2d10092b7d78ba4d008063e25ac220f3d84d20871727c82dda4e9f601a47",
+      "sha256": "50ef2d10092b7d78ba4d008063e25ac220f3d84d20871727c82dda4e9f601a47"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/research/STATUS.md",
+      "published": "deliverables/checkpoint-patches-research-20261010/research/STATUS.md",
+      "source_sha256": "392af86ab71e89a8ea29ea1fe5785e3a6dbf9f1f83762c9f70de7cd6d863e46b",
+      "sha256": "392af86ab71e89a8ea29ea1fe5785e3a6dbf9f1f83762c9f70de7cd6d863e46b"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/research/openstack_ram_checkpoint_dorado_tatlin_conclusion.md",
+      "published": "deliverables/checkpoint-patches-research-20261010/research/openstack_ram_checkpoint_dorado_tatlin_conclusion.md",
+      "source_sha256": "926e27ed1e4845af12b6d946fc3f89531d9f3650f3924e6540ec456f97b8bf4c",
+      "sha256": "926e27ed1e4845af12b6d946fc3f89531d9f3650f3924e6540ec456f97b8bf4c"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/research/openstack_vm_snapshot_ram_nova_extension.md",
+      "published": "deliverables/checkpoint-patches-research-20261010/research/openstack_vm_snapshot_ram_nova_extension.md",
+      "source_sha256": "cf4d9c5d79bd96107f9f9e538ef4698a70c5cba74e6a5fbbbd50503a83ed87a3",
+      "sha256": "cf4d9c5d79bd96107f9f9e538ef4698a70c5cba74e6a5fbbbd50503a83ed87a3"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010/research/validation-summary.json",
+      "published": "deliverables/checkpoint-patches-research-20261010/research/validation-summary.json",
+      "source_sha256": "f5e85bdbed6999408c5f5658ef7232b63417b4426986af9eaa3cb6c71ab7339b",
+      "sha256": "f5e85bdbed6999408c5f5658ef7232b63417b4426986af9eaa3cb6c71ab7339b"
+    },
+    {
+      "source": "docs/superpowers/plans/2026-10-06-cinder-checkpoint-contract.md",
+      "published": "docs/superpowers/plans/2026-10-06-cinder-checkpoint-contract.md",
+      "source_sha256": "f74f26b20e69ee11d5426c2c3a988142f62418219f818e312c2446eb0e7adfc1",
+      "sha256": "8d26675797dee9bc615d3eeef40c41723733b46b6c2baca7ad99cee17a84359b",
+      "link_updates": [
+        {
+          "original_target": "../../../deliverables/cinder-checkpoint-contract-c1/README.md",
+          "rendered_as_source_path": "deliverables/cinder-checkpoint-contract-c1/README.md"
+        }
+      ]
+    },
+    {
+      "source": "docs/superpowers/plans/2026-10-06-cinder-checkpoint-execution-status.md",
+      "published": "docs/superpowers/plans/2026-10-06-cinder-checkpoint-execution-status.md",
+      "source_sha256": "4097f4093d6efd398013ff415329366d23d8728bce91b650ebf20c59480be2a0",
+      "sha256": "c4629e84bea581207bbdeb06e748bcca6d14ded4446845b221aa71005ec46a85",
+      "link_updates": [
+        {
+          "original_target": "../../../deliverables/cinder-checkpoint-contract-c1/README.md",
+          "rendered_as_source_path": "deliverables/cinder-checkpoint-contract-c1/README.md"
+        },
+        {
+          "original_target": "../../../deliverables/cinder-checkpoint-contract-c1/evidence/progress.md",
+          "rendered_as_source_path": "deliverables/cinder-checkpoint-contract-c1/evidence/progress.md"
+        }
+      ]
+    },
+    {
+      "source": "docs/superpowers/plans/2026-10-07-cinder-checkpoint-continuation-c11.md",
+      "published": "docs/superpowers/plans/2026-10-07-cinder-checkpoint-continuation-c11.md",
+      "source_sha256": "197b121678aa80ca47c38db9ac68d425de629fe9c9d01f3e9469454b2cc3a9df",
+      "sha256": "5fe1d256a188aa3c2f0fadcf26ff7602ed0dfa3bcaf72436efb65c12fd69e839",
+      "link_updates": [
+        {
+          "original_target": "../../../deliverables/cinder-checkpoint-contract-c1/VALIDATION.md",
+          "rendered_as_source_path": "deliverables/cinder-checkpoint-contract-c1/VALIDATION.md"
+        }
+      ]
+    },
+    {
+      "source": "docs/superpowers/plans/2026-10-07-nova-checkpoint-executor-n2.md",
+      "published": "docs/superpowers/plans/2026-10-07-nova-checkpoint-executor-n2.md",
+      "source_sha256": "f02870360b6dee623f785522e24c08cecfc48deee8f38d8aa6f52df7c26d1354",
+      "sha256": "3cc17f26d4c12f4929dae44d0982bde6388b4e472cd3e4c2901ba51ff38e9cd9",
+      "link_updates": [
+        {
+          "original_target": "../../../deliverables/nova-checkpoint-model-n1/VALIDATION.md",
+          "rendered_as_source_path": "deliverables/nova-checkpoint-model-n1/VALIDATION.md"
+        }
+      ]
+    },
+    {
+      "source": "docs/superpowers/plans/2026-10-07-nova-checkpoint-model-n1.md",
+      "published": "docs/superpowers/plans/2026-10-07-nova-checkpoint-model-n1.md",
+      "source_sha256": "798d67d08d227af0b2fb993c2e9da22d3d76c1fb92bdad689883c0db8367f054",
+      "sha256": "798d67d08d227af0b2fb993c2e9da22d3d76c1fb92bdad689883c0db8367f054"
+    },
+    {
+      "source": "docs/superpowers/plans/2026-10-08-checkpoint-local-integration-l1.md",
+      "published": "docs/superpowers/plans/2026-10-08-checkpoint-local-integration-l1.md",
+      "source_sha256": "dfcab5ed5e3e3616d3fc363c3d7efa530a6b0edb77fe229e1e11f01b8a0515a8",
+      "sha256": "dfcab5ed5e3e3616d3fc363c3d7efa530a6b0edb77fe229e1e11f01b8a0515a8"
+    },
+    {
+      "source": "docs/superpowers/plans/2026-10-09-checkpoint-l1-real-ram.md",
+      "published": "docs/superpowers/plans/2026-10-09-checkpoint-l1-real-ram.md",
+      "source_sha256": "cb3d946c9be17b75aa273eb05d02bf73c7ef033886363178882a2b629e783af0",
+      "sha256": "cb3d946c9be17b75aa273eb05d02bf73c7ef033886363178882a2b629e783af0"
+    },
+    {
+      "source": "docs/superpowers/plans/2026-10-09-dorado-checkpoint-protocol.md",
+      "published": "docs/superpowers/plans/2026-10-09-dorado-checkpoint-protocol.md",
+      "source_sha256": "cc5a164c7010c5ec627dc2cf4c5319dc59501d3385edaa45580824270f37e128",
+      "sha256": "cc5a164c7010c5ec627dc2cf4c5319dc59501d3385edaa45580824270f37e128"
+    },
+    {
+      "source": "docs/superpowers/specs/2026-10-06-instance-checkpoints-dorado-tatlin-design.md",
+      "published": "docs/superpowers/specs/2026-10-06-instance-checkpoints-dorado-tatlin-design.md",
+      "source_sha256": "d352d7ae27dff20c4a7c00e868c5fa3395f9173acafdb3e0ad0607591a8b24dd",
+      "sha256": "b6f5ac3d6debdbdff4dbb154c8c0407c743e6069fb0deada610d818c0a1e8791",
+      "link_updates": [
+        {
+          "original_target": "../../../openstack_vm_snapshot_ram_nova_extension.md",
+          "published_target": "../../../deliverables/checkpoint-patches-research-20261010/research/openstack_vm_snapshot_ram_nova_extension.md"
+        },
+        {
+          "original_target": "../../../openstack_ram_checkpoint_dorado_tatlin_conclusion.md",
+          "published_target": "../../../deliverables/checkpoint-patches-research-20261010/research/openstack_ram_checkpoint_dorado_tatlin_conclusion.md"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/compute/api.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/compute/api.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/compute/manager.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/compute/manager.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/volume/cinder.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/volume/cinder.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/virt/libvirt/guest.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/virt/libvirt/guest.py"
+        },
+        {
+          "original_target": "../../../sources/cinder-pvs/cinder/volume/api.py",
+          "rendered_as_source_path": "sources/cinder-pvs/cinder/volume/api.py"
+        },
+        {
+          "original_target": "../../../sources/cinder-pvs/cinder/volume/manager.py",
+          "rendered_as_source_path": "sources/cinder-pvs/cinder/volume/manager.py"
+        },
+        {
+          "original_target": "../../../sources/cinder-pvs/cinder/api/v3/volumes.py",
+          "rendered_as_source_path": "sources/cinder-pvs/cinder/api/v3/volumes.py"
+        }
+      ]
+    },
+    {
+      "source": "docs/superpowers/specs/2026-10-07-nova-checkpoint-executor-n2-design.md",
+      "published": "docs/superpowers/specs/2026-10-07-nova-checkpoint-executor-n2-design.md",
+      "source_sha256": "0b0182ed00feb84da98395b05acd12391968d78fda1581945913788cd7296e97",
+      "sha256": "ecccad7eb9df93b395b6d778ffafb057101d2b006d0d7f05f1c7fd9d6f041a0c",
+      "link_updates": [
+        {
+          "original_target": "../../../deliverables/nova-checkpoint-model-n1/README.md",
+          "rendered_as_source_path": "deliverables/nova-checkpoint-model-n1/README.md"
+        },
+        {
+          "original_target": "../../../deliverables/cinder-checkpoint-contract-c1/README.md",
+          "rendered_as_source_path": "deliverables/cinder-checkpoint-contract-c1/README.md"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoints/nova/checkpoints/contracts.py",
+          "rendered_as_source_path": "work/nova-checkpoints/nova/checkpoints/contracts.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoints/nova/checkpoints/workflow.py",
+          "rendered_as_source_path": "work/nova-checkpoints/nova/checkpoints/workflow.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoints/nova/checkpoints/compute.py",
+          "rendered_as_source_path": "work/nova-checkpoints/nova/checkpoints/compute.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoints/nova/checkpoints/coordinator.py",
+          "rendered_as_source_path": "work/nova-checkpoints/nova/checkpoints/coordinator.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoints/nova/db/main/checkpoints.py",
+          "rendered_as_source_path": "work/nova-checkpoints/nova/db/main/checkpoints.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoints/nova/checkpoints/quota.py",
+          "rendered_as_source_path": "work/nova-checkpoints/nova/checkpoints/quota.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoints/nova/db/api/checkpoints.py",
+          "rendered_as_source_path": "work/nova-checkpoints/nova/db/api/checkpoints.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoints/nova/volume/cinder.py",
+          "rendered_as_source_path": "work/nova-checkpoints/nova/volume/cinder.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoints/nova/virt/libvirt/guest.py",
+          "rendered_as_source_path": "work/nova-checkpoints/nova/virt/libvirt/guest.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoints/nova/virt/libvirt/driver.py",
+          "rendered_as_source_path": "work/nova-checkpoints/nova/virt/libvirt/driver.py"
+        },
+        {
+          "original_target": "../../../work/cinder-checkpoints/cinder/checkpoints/api.py",
+          "rendered_as_source_path": "work/cinder-checkpoints/cinder/checkpoints/api.py"
+        },
+        {
+          "original_target": "../../../work/cinder-checkpoints/cinder/checkpoints/guards.py",
+          "rendered_as_source_path": "work/cinder-checkpoints/cinder/checkpoints/guards.py"
+        },
+        {
+          "original_target": "../../../work/cinder-checkpoints/cinder/db/sqlalchemy/checkpoints.py",
+          "rendered_as_source_path": "work/cinder-checkpoints/cinder/db/sqlalchemy/checkpoints.py"
+        },
+        {
+          "original_target": "../../../work/cinder-checkpoints/cinder/checkpoints/manager.py",
+          "rendered_as_source_path": "work/cinder-checkpoints/cinder/checkpoints/manager.py"
+        }
+      ]
+    },
+    {
+      "source": "docs/superpowers/specs/2026-10-07-nova-checkpoint-model-n1-design.md",
+      "published": "docs/superpowers/specs/2026-10-07-nova-checkpoint-model-n1-design.md",
+      "source_sha256": "e9ec7f5aa139ea9ed311a6ef6fa827a95eb041664e7a279c8e827f9a17deeb62",
+      "sha256": "20a64fd62c5018defad472843058da1d354079803108be2b8ffd0a2afc1b4d3d",
+      "link_updates": [
+        {
+          "original_target": "../../../deliverables/cinder-checkpoint-contract-c1/README.md",
+          "rendered_as_source_path": "deliverables/cinder-checkpoint-contract-c1/README.md"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/api/openstack/compute/routes.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/api/openstack/compute/routes.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/api/openstack/compute/server_shares.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/api/openstack/compute/server_shares.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/api/openstack/api_version_request.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/api/openstack/api_version_request.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/policies/base.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/policies/base.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/compute/api.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/compute/api.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/db/main/api.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/db/main/api.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/db/main/models.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/db/main/models.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/objects/instance.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/objects/instance.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/db/api/models.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/db/api/models.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/objects/instance_mapping.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/objects/instance_mapping.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/quota.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/quota.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/limit/local.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/limit/local.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/compute/rpcapi.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/compute/rpcapi.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/conductor/rpcapi.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/conductor/rpcapi.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/objects/service.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/objects/service.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/compute/manager.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/compute/manager.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/conductor/manager.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/conductor/manager.py"
+        },
+        {
+          "original_target": "../../../sources/nova-pvs/nova/volume/cinder.py",
+          "rendered_as_source_path": "sources/nova-pvs/nova/volume/cinder.py"
+        },
+        {
+          "original_target": "../../../work/cinder-checkpoints/cinder/checkpoints/api.py",
+          "rendered_as_source_path": "work/cinder-checkpoints/cinder/checkpoints/api.py"
+        }
+      ]
+    },
+    {
+      "source": "docs/superpowers/specs/2026-10-08-checkpoint-local-integration-l1-design.md",
+      "published": "docs/superpowers/specs/2026-10-08-checkpoint-local-integration-l1-design.md",
+      "source_sha256": "4bce190929f8d10883365a31db59169d4263cc6b025fa5452776b294e1978105",
+      "sha256": "54e72cff2387c0b81b1021d04d08b1456aa6c31244fa370e2f324e2e70911b18",
+      "link_updates": [
+        {
+          "original_target": "../../../deliverables/nova-checkpoint-executor-n2/README.md",
+          "rendered_as_source_path": "deliverables/nova-checkpoint-executor-n2/README.md"
+        },
+        {
+          "original_target": "../../../deliverables/cinder-checkpoint-continuation-c11/README.md",
+          "rendered_as_source_path": "deliverables/cinder-checkpoint-continuation-c11/README.md"
+        },
+        {
+          "original_target": "../../../deliverables/nova-checkpoint-executor-n2/VALIDATION.md",
+          "rendered_as_source_path": "deliverables/nova-checkpoint-executor-n2/VALIDATION.md"
+        },
+        {
+          "original_target": "../../../deliverables/cinder-checkpoint-continuation-c11/VALIDATION.md",
+          "rendered_as_source_path": "deliverables/cinder-checkpoint-continuation-c11/VALIDATION.md"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoint-executor/nova/tests/fixtures/checkpoints_v2.py",
+          "rendered_as_source_path": "work/nova-checkpoint-executor/nova/tests/fixtures/checkpoints_v2.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoint-executor/nova/tests/functional/test_checkpoint_cinder_contract.py",
+          "rendered_as_source_path": "work/nova-checkpoint-executor/nova/tests/functional/test_checkpoint_cinder_contract.py"
+        },
+        {
+          "original_target": "../../../work/cinder-checkpoint-continuation/cinder/tests/functional/checkpoint_continuation_fixture.py",
+          "rendered_as_source_path": "work/cinder-checkpoint-continuation/cinder/tests/functional/checkpoint_continuation_fixture.py"
+        },
+        {
+          "original_target": "../../../work/cinder-checkpoint-continuation/cinder/tests/unit/checkpoints/fake_driver.py",
+          "rendered_as_source_path": "work/cinder-checkpoint-continuation/cinder/tests/unit/checkpoints/fake_driver.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoint-executor/nova/tests/functional/test_checkpoint_store.py",
+          "rendered_as_source_path": "work/nova-checkpoint-executor/nova/tests/functional/test_checkpoint_store.py"
+        }
+      ]
+    },
+    {
+      "source": "docs/superpowers/specs/2026-10-09-checkpoint-l1-real-ram-design.md",
+      "published": "docs/superpowers/specs/2026-10-09-checkpoint-l1-real-ram-design.md",
+      "source_sha256": "dfddd4b728998ebc7173877ff4beadae6e5585530a8795b068cec072aa54c191",
+      "sha256": "ad65827fd38791c135befe4aa14df5a520a28c1d262f6167173fce21b7e6ab19",
+      "link_updates": [
+        {
+          "original_target": "../../../deliverables/qemu-libvirt-ram-spike-20261009/artifact-validation.json",
+          "rendered_as_source_path": "deliverables/qemu-libvirt-ram-spike-20261009/artifact-validation.json"
+        },
+        {
+          "original_target": "../../../work/checkpoint-local-integration/checkpoint_lab/nova/adapters.py",
+          "rendered_as_source_path": "work/checkpoint-local-integration/checkpoint_lab/nova/adapters.py"
+        },
+        {
+          "original_target": "../../../work/checkpoint-local-integration/checkpoint_lab/nova/runtime.py",
+          "rendered_as_source_path": "work/checkpoint-local-integration/checkpoint_lab/nova/runtime.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoint-recovery-fix/nova/virt/libvirt/checkpoints/topology.py",
+          "rendered_as_source_path": "work/nova-checkpoint-recovery-fix/nova/virt/libvirt/checkpoints/topology.py"
+        },
+        {
+          "original_target": "../../../work/nova-checkpoint-recovery-fix/nova/virt/libvirt/checkpoints/runtime.py",
+          "rendered_as_source_path": "work/nova-checkpoint-recovery-fix/nova/virt/libvirt/checkpoints/runtime.py"
+        },
+        {
+          "original_target": "../../../work/checkpoint-local-integration/tools/prepare_environments.py",
+          "rendered_as_source_path": "work/checkpoint-local-integration/tools/prepare_environments.py"
+        }
+      ]
+    },
+    {
+      "source": "docs/superpowers/specs/2026-10-09-dorado-checkpoint-protocol-design.md",
+      "published": "docs/superpowers/specs/2026-10-09-dorado-checkpoint-protocol-design.md",
+      "source_sha256": "077cfa6455782c1823825020d1cd608cadba93292e681df115a9522173ceb580",
+      "sha256": "b680b056dcc71796008f78a73db8920c887145b4da175a29f97a1d6c3c273041",
+      "link_updates": [
+        {
+          "original_target": "../../research/2026-10-08-dorado-without-hardware.md",
+          "published_target": "../../../deliverables/checkpoint-patches-research-20261010/research/2026-10-08-dorado-without-hardware.md"
+        },
+        {
+          "original_target": "../../research/2026-10-08-dorado-without-hardware.evidence.json",
+          "published_target": "../../../deliverables/checkpoint-patches-research-20261010/research/2026-10-08-dorado-without-hardware.evidence.json"
+        }
+      ]
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010.zip",
+      "published": "deliverables/checkpoint-patches-research-20261010.zip",
+      "source_sha256": "7dd39a46a560eb57354bd07760f764ad1a836a0a14a0c14b8333e9359565899b",
+      "sha256": "7dd39a46a560eb57354bd07760f764ad1a836a0a14a0c14b8333e9359565899b"
+    },
+    {
+      "source": "deliverables/checkpoint-patches-research-20261010.zip.sha256",
+      "published": "deliverables/checkpoint-patches-research-20261010.zip.sha256",
+      "source_sha256": "d8974f303e7c2a8df0d975fc619f80760460530f8e7cc22aa4bc937c584feaca",
+      "sha256": "d8974f303e7c2a8df0d975fc619f80760460530f8e7cc22aa4bc937c584feaca"
+    }
+  ]
+}

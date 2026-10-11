@@ -1,0 +1,1193 @@
+From 13d6f43064dc01661eb50e9209b92b93481c7ef5 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 16:40:58 +0300
+Subject: [PATCH 5/7] feat: enforce checkpoint continuation at worker
+ boundaries
+
+---
+ cinder/checkpoints/api.py                     |   2 +
+ cinder/checkpoints/continuation_api.py        |  14 +-
+ cinder/checkpoints/continuation_manager.py    | 228 ++++++++++++
+ cinder/checkpoints/manager.py                 |   2 +
+ cinder/context.py                             |   7 +-
+ cinder/db/api.py                              |  30 ++
+ cinder/db/sqlalchemy/api.py                   |  35 ++
+ .../db/sqlalchemy/checkpoint_continuation.py  | 149 +++++++-
+ cinder/db/sqlalchemy/checkpoints.py           |  13 +
+ .../api/v3/test_checkpoint_continuation.py    |   4 +-
+ cinder/tests/unit/checkpoints/test_api.py     |   3 +-
+ .../unit/checkpoints/test_continuation_db.py  |   1 +
+ .../checkpoints/test_continuation_manager.py  | 346 ++++++++++++++++++
+ cinder/volume/manager.py                      |  27 ++
+ cinder/volume/rpcapi.py                       |  62 +++-
+ 15 files changed, 911 insertions(+), 12 deletions(-)
+ create mode 100644 cinder/checkpoints/continuation_manager.py
+ create mode 100644 cinder/tests/unit/checkpoints/test_continuation_manager.py
+
+diff --git a/cinder/checkpoints/api.py b/cinder/checkpoints/api.py
+index 3416466..d4fa828 100644
+--- a/cinder/checkpoints/api.py
++++ b/cinder/checkpoints/api.py
+@@ -109,6 +109,8 @@ class API:
+                                for v in volumes}
+         values['capabilities'] = {}
+         for volume in volumes:
++            if 'nova_operation_id' in values:
++                self.rpc.assert_checkpoint_continuation_ready(context, volume)
+             self.rpc.assert_checkpoint_ready(context, volume)
+             result = self.rpc.get_checkpoint_capabilities(
+                 context, volume.id, volume.service_topic_queue)
+diff --git a/cinder/checkpoints/continuation_api.py b/cinder/checkpoints/continuation_api.py
+index 593a9d6..7d00819 100644
+--- a/cinder/checkpoints/continuation_api.py
++++ b/cinder/checkpoints/continuation_api.py
+@@ -101,9 +101,17 @@ class ContinuationAPI:
+         scope = continuation.authorize(
+             context, _id(nova_operation_id), request.generation, 'attachment',
+             request.volume_id)
+-        return self._attachment_result(
+-            attachment_intents.AttachmentIntents().submit(
+-                context, scope, request))
++        volume = next(v for v in self._volumes(context, scope, 'attachment')
++                      if v.id == request.volume_id)
++        self.rpc.assert_checkpoint_continuation_ready(context, volume)
++        result = attachment_intents.AttachmentIntents().submit(
++            context, scope, request)
++        if (result.status == 'prepared' and
++                request.action in ('update', 'delete')):
++            self.rpc.execute_checkpoint_attachment(
++                context, nova_operation_id, request.id, request.generation,
++                volume.service_topic_queue)
++        return self._attachment_result(result)
+ 
+     def get_attachment_request(self, context, nova_operation_id, child_id):
+         scope = continuation.authorize(context, _id(nova_operation_id), 1,
+diff --git a/cinder/checkpoints/continuation_manager.py b/cinder/checkpoints/continuation_manager.py
+new file mode 100644
+index 0000000..31b4f59
+--- /dev/null
++++ b/cinder/checkpoints/continuation_manager.py
+@@ -0,0 +1,228 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Grant-checked workers; backend effects are dispatched at most once."""
++
++import dataclasses
++import json
++
++from cinder.checkpoints import continuation
++from cinder.checkpoints import continuation_contracts as envelopes
++from cinder.checkpoints import contracts
++from cinder import db
++from cinder import exception
++from cinder import objects
++from cinder.volume import volume_utils
++
++
++class ContinuationManager:
++    def __init__(self, volume_manager):
++        self.owner = volume_manager
++
++    def _scope(self, context, nova_operation_id, generation, action):
++        reference = context.checkpoint_continuation_id
++        if reference is not None and reference != nova_operation_id:
++            raise exception.CheckpointOperationNotFound()
++        return continuation.authorize(context, nova_operation_id, generation,
++                                      action)
++
++    def _volume(self, context, scope, volume_id, data=None):
++        if data is None:
++            data = db.checkpoint_continuation_resources(
++                context, scope.to_primitive())
++        row = data['volumes'].get(volume_id)
++        if row is None:
++            raise exception.CheckpointOperationNotFound()
++        if (volume_utils.extract_host(row['host'] or '') !=
++                volume_utils.extract_host(self.owner.host)):
++            raise exception.CheckpointConflict(reason='wrong_backend_worker')
++        if not self.owner.driver.initialized:
++            raise exception.CheckpointBackendUnavailable()
++        volume = objects.Volume._from_db_object(
++            context, objects.Volume(context), row,
++            expected_attrs=['metadata', 'volume_type',
++                            'volume_type.extra_specs', 'glance_metadata'])
++        # The stock admin-metadata loader may delete a legacy temporary key.
++        # Read the explicit scoped data without invoking that migration.
++        volume.admin_metadata = {item['key']: item['value'] for item in
++                                 row['volume_admin_metadata']}
++        if row.get('volume_type') is None:
++            volume.volume_type = None
++        volume.obj_reset_changes()
++        return volume
++
++    def capabilities(self, context, nova_operation_id, volume_id):
++        scope = self._scope(context, nova_operation_id, 1, 'capabilities')
++        volume = self._volume(context, scope, volume_id)
++        return self._capabilities(context, volume)
++
++    def _capabilities(self, context, volume):
++        try:
++            return contracts.validate_capabilities(
++                self.owner.driver.get_checkpoint_capabilities(context, volume))
++        except Exception:
++            return contracts.unsupported_capabilities(
++                'unverified_capabilities')
++
++    def _preflight(self, context, scope, volume, resource):
++        current = contracts.validate_capabilities(
++            self._capabilities(context, volume))
++        saved = json.loads(resource['capabilities_json'])
++        if current['driver_identity'] != saved['driver_identity']:
++            raise exception.CheckpointConflict(reason='driver_profile_changed')
++        if volume.size != resource['volume_size']:
++            raise exception.CheckpointConflict(reason='snapshot_mismatch')
++
++    def _run(self, context, nova_operation_id, generation, query):
++        action = 'reconcile' if query else 'execute'
++        scope = self._scope(context, nova_operation_id, generation, action)
++        operation = db.checkpoint_continuation_get(
++            context, nova_operation_id)['operation']
++        data = db.checkpoint_continuation_resources(
++            context, scope.to_primitive())
++        resources = {r['id']: r for r in operation['resources']}
++        for step in operation['steps']:
++            statuses = ('dispatching', 'pending', 'unknown') if query else (
++                'prepared',)
++            if step['status'] not in statuses:
++                continue
++            resource = resources[step['resource_id']]
++            volume_row = data['volumes'][resource['volume_id']]
++            if (volume_utils.extract_host(volume_row['host'] or '') !=
++                    volume_utils.extract_host(self.owner.host)):
++                continue
++            volume = self._volume(context, scope, resource['volume_id'], data)
++            self._preflight(context, scope, volume, resource)
++            row = data['snapshots'].get(resource['snapshot_id'])
++            if (row is None or row['volume_size'] != volume.size or
++                    (step['phase'] == 'revert' and
++                     row['status'] != 'available')):
++                raise exception.CheckpointConflict(reason='snapshot_mismatch')
++            snapshot = objects.Snapshot._from_db_object(
++                context, objects.Snapshot(context), row,
++                expected_attrs=['metadata'])
++            snapshot.volume = volume
++            if query:
++                # Read-only query may confirm the original request ID, but
++                # must never claim prepared work or dispatch a new effect.
++                try:
++                    result = self.owner.driver.checkpoint_query_operation(
++                        context, volume, snapshot, step['id'], step['phase'])
++                except Exception:
++                    result = {'status': 'unknown',
++                              'error_code': 'query_exception'}
++            else:
++                if not db.checkpoint_continuation_step_claim(
++                        context, scope.to_primitive(), step['id'],
++                        self.owner.host):
++                    continue
++                method = {
++                    'snapshot': self.owner.driver.checkpoint_create_snapshot,
++                    'revert': self.owner.driver.checkpoint_revert_to_snapshot,
++                    'delete_snapshot':
++                        self.owner.driver.checkpoint_delete_snapshot,
++                }[step['phase']]
++                try:
++                    result = method(context, volume, snapshot, step['id'])
++                except Exception:
++                    result = {'status': 'unknown',
++                              'error_code': 'driver_exception'}
++            db.checkpoint_continuation_step_finish(
++                context, scope.to_primitive(), step['id'], result)
++
++    def execute(self, context, nova_operation_id, generation):
++        self._run(context, nova_operation_id, generation, False)
++
++    def reconcile(self, context, nova_operation_id, generation):
++        self._run(context, nova_operation_id, generation, True)
++
++    def query_attachment(self, context, nova_operation_id, child_id,
++                         generation):
++        scope = self._scope(context, nova_operation_id, generation, 'read')
++        result = db.checkpoint_attachment_intent_get(
++            context, scope.to_primitive(), child_id)
++        self._volume(context, scope, result['volume_id'])
++        return result
++
++    def execute_attachment(self, context, nova_operation_id, child_id,
++                           generation):
++        scope = self._scope(context, nova_operation_id, generation,
++                            'attachment')
++        result = envelopes.AttachmentResult.from_primitive(
++            db.checkpoint_attachment_intent_get(
++                context, scope.to_primitive(), child_id))
++        volume = self._volume(context, scope, result.volume_id)
++        if result.status != 'prepared':
++            return
++        operation = db.checkpoint_continuation_get(
++            context, nova_operation_id)['operation']
++        resource = next(r for r in operation['resources']
++                        if r['volume_id'] == volume.id)
++        self._preflight(context, scope, volume, resource)
++        attachment = db.checkpoint_continuation_attachment(
++            context, scope.to_primitive(), result.attachment_id)
++        intent = db.checkpoint_attachment_intent_claim(
++            context, child_id, self.owner.host)
++        if intent is None:
++            return
++        try:
++            if result.action == 'update':
++                connector = json.loads(intent['connector_json'])
++                connector['mode'] = 'rw'
++                self.owner.driver.validate_connector(connector)
++                model_update = self.owner.driver.create_export(
++                    context, volume, connector)
++                if model_update:
++                    db.checkpoint_continuation_export_update(
++                        context, scope.to_primitive(), child_id,
++                        self.owner.host, model_update)
++                    volume.update(model_update)
++                connection = self.owner.driver.initialize_connection(
++                    volume, connector)
++                if (not isinstance(connection, dict) or
++                        not isinstance(connection.get('data'), dict) or
++                        not isinstance(connection.get('driver_volume_type'),
++                                       str) or
++                        not connection['driver_volume_type']):
++                    raise ValueError('invalid_connection_info')
++                connection = self.owner._parse_connection_options(
++                    context, volume, connection)
++                data = connection.pop('data')
++                data.update(connection)
++                data['attachment_id'] = result.attachment_id
++                data['enforce_multipath'] = connector.get(
++                    'enforce_multipath', False)
++            elif result.action == 'delete':
++                connector = json.loads(attachment['connector']) if (
++                    attachment['connector']) else None
++                if not connector:
++                    # An attached VM disk without its original connector is
++                    # not proof that there is no backend connection.
++                    raise ValueError('original_connector_missing')
++                shared = self.owner.driver.terminate_connection(
++                    volume, connector, force=False)
++                if shared is True:
++                    raise ValueError('unexpected_shared_connection')
++                self.owner.driver.remove_export(context, volume)
++                data = None
++            else:
++                raise ValueError('invalid_attachment_action')
++            db.checkpoint_attachment_intent_success(
++                context, scope.to_primitive(), child_id, self.owner.host, data)
++        except Exception:
++            # No compensation and no second dispatch after an uncertain I/O.
++            # Never journal or log an exception message or connection secrets.
++            unknown = dataclasses.replace(
++                result, status='unknown',
++                error_code='attachment_result_unknown')
++            db.checkpoint_attachment_intent_finish(
++                context, child_id, unknown.to_primitive())
+diff --git a/cinder/checkpoints/manager.py b/cinder/checkpoints/manager.py
+index ee1185c..c89cfc1 100644
+--- a/cinder/checkpoints/manager.py
++++ b/cinder/checkpoints/manager.py
+@@ -62,6 +62,8 @@ class CheckpointManager:
+         step = objects.CheckpointStep.get_by_id(context, step_id)
+         operation = objects.CheckpointOperation.get_by_id(
+             context, step.operation_id)
++        if operation.continuation_id is not None:
++            db.checkpoint_continuation_for_owner(context, operation.id)
+         if (type(generation) is not int or generation != operation.generation
+                 or generation != step.generation):
+             raise exception.CheckpointConflict(reason='stale_generation')
+diff --git a/cinder/context.py b/cinder/context.py
+index 53e634c..82fc664 100644
+--- a/cinder/context.py
++++ b/cinder/context.py
+@@ -96,6 +96,7 @@ class RequestContext(context.RequestContext):
+                  message_action = None,
+                  checkpoint_operation_id=None,
+                  checkpoint_generation=None,
++                 checkpoint_continuation_id=None,
+                  **kwargs):
+         """Initialize RequestContext.
+ 
+@@ -127,6 +128,7 @@ class RequestContext(context.RequestContext):
+         self.message_action = message_action
+         self.checkpoint_operation_id = checkpoint_operation_id
+         self.checkpoint_generation = checkpoint_generation
++        self.checkpoint_continuation_id = checkpoint_continuation_id
+ 
+         if service_catalog:
+             # Only include required parts of service_catalog
+@@ -188,6 +190,7 @@ class RequestContext(context.RequestContext):
+         result['service_roles'] = self.service_roles
+         result['checkpoint_operation_id'] = self.checkpoint_operation_id
+         result['checkpoint_generation'] = self.checkpoint_generation
++        result['checkpoint_continuation_id'] = self.checkpoint_continuation_id
+         return result
+ 
+     @classmethod
+@@ -215,7 +218,9 @@ class RequestContext(context.RequestContext):
+                    message_action = values.get('message_action'),
+                    checkpoint_operation_id=values.get(
+                        'checkpoint_operation_id'),
+-                   checkpoint_generation=values.get('checkpoint_generation')
++                   checkpoint_generation=values.get('checkpoint_generation'),
++                   checkpoint_continuation_id=values.get(
++                       'checkpoint_continuation_id')
+                    )
+ 
+     def authorize(self,
+diff --git a/cinder/db/api.py b/cinder/db/api.py
+index cc50f2f..003071a 100644
+--- a/cinder/db/api.py
++++ b/cinder/db/api.py
+@@ -2104,3 +2104,33 @@ def checkpoint_cleanup(context, operation_id, generation):
+ 
+ def checkpoint_pending(context, host):
+     return IMPL.checkpoint_pending(context, host)
++
++
++def checkpoint_continuation_resources(
++        context, scope):
++    return IMPL.checkpoint_continuation_resources(
++        context, scope)
++
++
++def checkpoint_continuation_step_claim(
++        context, scope, step_id, executor_id):
++    return IMPL.checkpoint_continuation_step_claim(
++        context, scope, step_id, executor_id)
++
++
++def checkpoint_continuation_step_finish(
++        context, scope, step_id, result):
++    return IMPL.checkpoint_continuation_step_finish(
++        context, scope, step_id, result)
++
++
++def checkpoint_continuation_export_update(
++        context, scope, child_id, executor_id, values):
++    return IMPL.checkpoint_continuation_export_update(
++        context, scope, child_id, executor_id, values)
++
++
++def checkpoint_attachment_intent_success(
++        context, scope, child_id, executor_id, connection_info=None):
++    return IMPL.checkpoint_attachment_intent_success(
++        context, scope, child_id, executor_id, connection_info)
+diff --git a/cinder/db/sqlalchemy/api.py b/cinder/db/sqlalchemy/api.py
+index 4935db6..adc0a8e 100644
+--- a/cinder/db/sqlalchemy/api.py
++++ b/cinder/db/sqlalchemy/api.py
+@@ -8883,3 +8883,38 @@ def checkpoint_cleanup(context, operation_id, generation):
+ 
+ def checkpoint_pending(context, host):
+     return _checkpoint_guards().pending(context, host)
++
++
++def checkpoint_continuation_resources(
++        context, scope):
++    from cinder.db.sqlalchemy import checkpoint_continuation
++    return checkpoint_continuation.resources(
++        context, scope)
++
++
++def checkpoint_continuation_step_claim(
++        context, scope, step_id, executor_id):
++    from cinder.db.sqlalchemy import checkpoint_continuation
++    return checkpoint_continuation.step_claim(
++        context, scope, step_id, executor_id)
++
++
++def checkpoint_continuation_step_finish(
++        context, scope, step_id, result):
++    from cinder.db.sqlalchemy import checkpoint_continuation
++    return checkpoint_continuation.step_finish(
++        context, scope, step_id, result)
++
++
++def checkpoint_continuation_export_update(
++        context, scope, child_id, executor_id, values):
++    from cinder.db.sqlalchemy import checkpoint_continuation
++    return checkpoint_continuation.export_update(
++        context, scope, child_id, executor_id, values)
++
++
++def checkpoint_attachment_intent_success(
++        context, scope, child_id, executor_id, connection_info=None):
++    from cinder.db.sqlalchemy import checkpoint_continuation
++    return checkpoint_continuation.attachment_success(
++        context, scope, child_id, executor_id, connection_info)
+diff --git a/cinder/db/sqlalchemy/checkpoint_continuation.py b/cinder/db/sqlalchemy/checkpoint_continuation.py
+index 33ce102..f0cd069 100644
+--- a/cinder/db/sqlalchemy/checkpoint_continuation.py
++++ b/cinder/db/sqlalchemy/checkpoint_continuation.py
+@@ -15,6 +15,7 @@
+ import json
+ 
+ from oslo_db import api as oslo_db_api
++from oslo_utils import timeutils
+ from oslo_utils import uuidutils
+ 
+ from cinder.checkpoints import continuation
+@@ -419,7 +420,13 @@ def current_attachment(context, scope, attachment_id):
+     volume, row = _attachment_scope(context, scope, row.volume_id,
+                                     'read', attachment_id)
+     # Do not instantiate an attachment OVO here: its loader mutates old specs.
+-    return dict(row)
++    result = dict(row)
++    specs = journal._query(context, models.AttachmentSpecs).filter_by(
++        attachment_id=row.id).all()
++    if specs:
++        result['connector'] = json.dumps(
++            {item.key: item.value for item in specs})
++    return result
+ 
+ 
+ def check_attachment_release(context, operation):
+@@ -434,3 +441,143 @@ def check_attachment_release(context, operation):
+     if any(row.action == 'create' and row.status == 'succeeded' and
+            row.volume_id not in completed for row in intents):
+         journal._conflict('attachment_complete_required')
++
++
++def check_legacy_grant(context, operation):
++    grant = journal._current(journal._query(
++        context, models.CheckpointContinuationGrant).filter_by(
++            id=operation.continuation_id, operation_id=operation.id)).first()
++    _bound_operation(context, grant)
++
++
++def _volume_data(row):
++    data = dict(row)
++    for name in ('volume_metadata', 'volume_admin_metadata',
++                 'volume_glance_metadata'):
++        data[name] = [dict(item) for item in getattr(row, name)
++                      if not item.deleted]
++    if row.volume_type is not None:
++        data['volume_type'] = dict(row.volume_type)
++        data['volume_type']['extra_specs'] = [
++            dict(item) for item in row.volume_type.extra_specs
++            if not item.deleted]
++    return data
++
++
++@api.require_context
++@api.main_context_manager.writer
++def resources(context, scope):
++    scope = _checked_scope(context, scope, 'capabilities')
++    volumes = {row.id: _volume_data(row) for row in _volumes(context, scope)}
++    snapshots = {}
++    for resource in journal._resources(context, scope.checkpoint_id):
++        row = journal._query(context, models.Snapshot).filter_by(
++            id=resource.snapshot_id, volume_id=resource.volume_id,
++            project_id=scope.owner_project_id).first()
++        if row is None:
++            continue
++        snapshots[row.id] = dict(row)
++        snapshots[row.id]['snapshot_metadata'] = [dict(item) for item in
++                                                  row.snapshot_metadata
++                                                  if not item.deleted]
++    return {'volumes': volumes, 'snapshots': snapshots}
++
++
++def _bound_step(context, scope, step_id):
++    step = journal._current(journal._query(
++        context, models.CheckpointStep).filter_by(
++            id=step_id, operation_id=scope.operation_id,
++            generation=scope.generation)).first()
++    if step is None:
++        raise exception.CheckpointOperationNotFound()
++    operation = journal._query(context, models.CheckpointOperation).filter_by(
++        id=scope.operation_id).one()
++    return step, operation
++
++
++@api.require_context
++@api.main_context_manager.writer
++def step_claim(context, scope, step_id, executor_id):
++    scope = _checked_scope(context, scope, 'execute')
++    step, operation = _bound_step(context, scope, step_id)
++    resource = journal._query(context, models.CheckpointResource).filter_by(
++        id=step.resource_id, checkpoint_id=scope.checkpoint_id).one()
++    volume = journal._query(context, models.Volume).filter_by(
++        id=resource.volume_id, project_id=scope.owner_project_id).one()
++    if (not isinstance(executor_id, str) or
++            volume.host.split('#')[0] != executor_id.split('#')[0]):
++        journal._conflict('wrong_backend_worker')
++    return journal._step_claim(context, step, operation, executor_id)
++
++
++@api.require_context
++@api.main_context_manager.writer
++def step_finish(context, scope, step_id, result):
++    scope = _checked_scope(context, scope, 'reconcile')
++    step, operation = _bound_step(context, scope, step_id)
++    return journal._step_finish(context, step, operation, result)
++
++
++def _dispatched_attachment(context, scope, child_id, executor_id):
++    scope = _checked_scope(context, scope)
++    row = _intent(context, scope, child_id)
++    if row.status != 'dispatching' or row.executor_id != executor_id:
++        journal._conflict('attachment_not_dispatched')
++    volume, attachment = _attachment_scope(
++        context, scope, row.volume_id, row.action, row.target_attachment_id)
++    if volume.host.split('#')[0] != executor_id.split('#')[0]:
++        journal._conflict('wrong_backend_worker')
++    return row, volume, attachment
++
++
++@api.require_context
++@api.main_context_manager.writer
++def export_update(context, scope, child_id, executor_id, values):
++    row, volume, attachment = _dispatched_attachment(
++        context, scope, child_id, executor_id)
++    # Export providers may update these normal volume fields. Never accept
++    # generic model updates that could change ownership or admission state.
++    if (row.action != 'update' or not isinstance(values, dict) or
++            set(values) - {'provider_location', 'provider_auth', 'provider_id'}
++            or any(value is not None and not isinstance(value, str)
++                   for value in values.values())):
++        raise exception.InvalidInput(reason='invalid_export_update')
++    volume.update(values)
++    context.session.flush()
++    return _volume_data(volume)
++
++
++@api.require_context
++@api.main_context_manager.writer
++def attachment_success(context, scope, child_id, executor_id,
++                       connection_info=None):
++    row, volume, attachment = _dispatched_attachment(
++        context, scope, child_id, executor_id)
++    if row.action == 'update':
++        if (not isinstance(connection_info, dict) or
++                not connection_info.get('driver_volume_type')):
++            raise exception.InvalidInput(reason='invalid_connection_info')
++        attachment.connection_info = json.dumps(connection_info,
++                                                allow_nan=False)
++        attachment.connector = row.connector_json
++        attachment.mountpoint = row.mountpoint
++        attachment.attached_host = json.loads(row.connector_json).get('host')
++        attachment.attach_status = 'attaching'
++        attachment.attach_time = timeutils.utcnow()
++        volume.attach_status = 'attaching'
++    elif row.action == 'delete' and connection_info is None:
++        attachment.deleted = True
++        attachment.deleted_at = timeutils.utcnow()
++        attachment.detach_time = timeutils.utcnow()
++        attachment.attach_status = 'detached'
++        attachment.connection_info = None
++        attachment.connector = None
++        volume.status = 'available'
++        volume.attach_status = 'detached'
++    else:
++        raise exception.InvalidInput(reason='invalid_attachment_action')
++    row.status = 'succeeded'
++    row.error_code = None
++    row.result_attachment_id = attachment.id
++    context.session.flush()
++    return _result(row)
+diff --git a/cinder/db/sqlalchemy/checkpoints.py b/cinder/db/sqlalchemy/checkpoints.py
+index 1f24867..45cab74 100644
+--- a/cinder/db/sqlalchemy/checkpoints.py
++++ b/cinder/db/sqlalchemy/checkpoints.py
+@@ -117,6 +117,9 @@ def _locked_operation(context, operation_id, generation):
+         context, models.CheckpointOperation).filter_by(id=operation_id)).one())
+     if type(generation) is not int or generation != operation.generation:
+         _conflict('stale_generation')
++    if operation.continuation_id is not None:
++        from cinder.db.sqlalchemy import checkpoint_continuation
++        checkpoint_continuation.check_legacy_grant(context, operation)
+     if operation.status != 'released':
+         if instance.active_operation_id != operation_id:
+             _conflict('operation_not_owner')
+@@ -393,6 +396,10 @@ def _step_operation(context, step_id, generation):
+ @api.main_context_manager.writer
+ def step_claim(context, step_id, generation, executor_id):
+     step, operation = _step_operation(context, step_id, generation)
++    return _step_claim(context, step, operation, executor_id)
++
++
++def _step_claim(context, step, operation, executor_id):
+     if operation.status == 'released' or step.status != 'prepared':
+         return False
+     if not isinstance(executor_id, str) or not 0 < len(executor_id) <= 255:
+@@ -440,6 +447,10 @@ def _update_operation(context, operation):
+ @api.main_context_manager.writer
+ def step_finish(context, step_id, generation, result):
+     step, operation = _step_operation(context, step_id, generation)
++    return _step_finish(context, step, operation, result)
++
++
++def _step_finish(context, step, operation, result):
+     result = contracts.validate_driver_result(result)
+     if operation.status == 'released':
+         return dict(step)
+@@ -661,6 +672,8 @@ def _scope(context, operation_id, generation, volume_id, action,
+     operation = _owned(context, _current(_query(
+         context, models.CheckpointOperation).filter_by(
+             id=operation_id)).first())
++    if operation.continuation_id is not None:
++        _conflict('use_continuation_attachment_requests')
+     lock = _current(_query(context, models.CheckpointVolumeLock).filter_by(
+         volume_id=volume_id)).first()
+     if (type(generation) is not int or generation != operation.generation or
+diff --git a/cinder/tests/unit/api/v3/test_checkpoint_continuation.py b/cinder/tests/unit/api/v3/test_checkpoint_continuation.py
+index 0b3b777..d41dbe7 100644
+--- a/cinder/tests/unit/api/v3/test_checkpoint_continuation.py
++++ b/cinder/tests/unit/api/v3/test_checkpoint_continuation.py
+@@ -223,7 +223,9 @@ class CheckpointAttachmentAPITest(
+         self.service_path = ('/checkpoint-service-operations/' +
+                              uuids.nova_operation)
+         self.requests_path = self.service_path + '/attachment-requests'
+-        self.service_api = continuation_api.ContinuationAPI(rpc=mock.Mock())
++        self.service_api = continuation_api.ContinuationAPI(rpc=mock.Mock(
++            spec=['assert_checkpoint_continuation_ready',
++                  'execute_checkpoint_attachment']))
+         self.mock_object(api, 'API', return_value=self.api)
+         self.mock_object(continuation_api, 'ContinuationAPI',
+                          return_value=self.service_api)
+diff --git a/cinder/tests/unit/checkpoints/test_api.py b/cinder/tests/unit/checkpoints/test_api.py
+index e8975ba..9a12e3c 100644
+--- a/cinder/tests/unit/checkpoints/test_api.py
++++ b/cinder/tests/unit/checkpoints/test_api.py
+@@ -36,7 +36,8 @@ class APIHelpers(test_db.CheckpointDBHelpers):
+         self.flags(enabled=True, nova_service_user_ids=[test_db.SERVICE_ID],
+                    group='checkpoint')
+         self.rpc = mock.Mock(spec=[
+-            'assert_checkpoint_ready', 'get_checkpoint_capabilities',
++            'assert_checkpoint_ready', 'assert_checkpoint_continuation_ready',
++            'get_checkpoint_capabilities',
+             'execute_checkpoint_step', 'reconcile_checkpoint_step'])
+         self.rpc.get_checkpoint_capabilities.return_value = (
+             test_contracts.supported_capabilities())
+diff --git a/cinder/tests/unit/checkpoints/test_continuation_db.py b/cinder/tests/unit/checkpoints/test_continuation_db.py
+index ae33b36..244430c 100644
+--- a/cinder/tests/unit/checkpoints/test_continuation_db.py
++++ b/cinder/tests/unit/checkpoints/test_continuation_db.py
+@@ -249,6 +249,7 @@ class ContinuationRaceSetup(test_db.CheckpointDBHelpers):
+                             nova_operation_id=uuids.nova_operation,
+                             allow_service_continuation=True)
+         rpc = mock.Mock(spec=['assert_checkpoint_ready',
++                              'assert_checkpoint_continuation_ready',
+                               'get_checkpoint_capabilities'])
+         rpc.get_checkpoint_capabilities.return_value = (
+             test_contracts.supported_capabilities())
+diff --git a/cinder/tests/unit/checkpoints/test_continuation_manager.py b/cinder/tests/unit/checkpoints/test_continuation_manager.py
+new file mode 100644
+index 0000000..bf5351a
+--- /dev/null
++++ b/cinder/tests/unit/checkpoints/test_continuation_manager.py
+@@ -0,0 +1,346 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import dataclasses
++import json
++from types import SimpleNamespace
++
++from oslo_utils.fixture import uuidsentinel as uuids
++from oslo_utils import timeutils
++
++from cinder.checkpoints import continuation
++from cinder.checkpoints import continuation_manager
++from cinder.checkpoints import manager
++from cinder import context
++from cinder import db
++from cinder.db.sqlalchemy import api as sqla_api
++from cinder.db.sqlalchemy import models
++from cinder import exception
++from cinder import objects
++from cinder.tests.unit.checkpoints import fake_driver
++from cinder.tests.unit.checkpoints import test_attachment_intents
++from cinder.tests.unit.checkpoints import test_continuation_db
++from cinder.tests.unit import test
++from cinder.volume import manager as volume_manager
++from cinder.volume import rpcapi
++
++
++class WorkerHelpers(test_continuation_db.ContinuationHelpers):
++    def prepare_workers(self):
++        self.prepare_continuation()
++        self.owners = []
++        self.workers = []
++        for index, vid in enumerate(self.volumes):
++            driver = fake_driver.FakeCheckpointDriver()
++            driver.set_initialized()
++            owner = SimpleNamespace(driver=driver,
++                                    host='worker%d@backend' % index)
++            owner._parse_connection_options = (
++                lambda ctx, vol, conn, owner=owner:
++                volume_manager.VolumeManager._parse_connection_options(
++                    owner, ctx, vol, conn))
++            db.volume_update(self.ctxt, vid, {'host': owner.host})
++            self.owners.append(owner)
++            self.workers.append(
++                continuation_manager.ContinuationManager(owner))
++        self.worker = self.workers[0]
++        self.driver = self.owners[0].driver
++        self.service_ctx.checkpoint_continuation_id = uuids.nova_operation
++        self.service_ctx = context.RequestContext.from_dict(
++            self.service_ctx.to_dict())
++
++    def revoke_grant(self):
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            self.ctxt.session.query(models.CheckpointContinuationGrant).filter(
++                models.CheckpointContinuationGrant.nova_operation_id ==
++                uuids.nova_operation).update({'state': 'revoked',
++                                              'revision': 2})
++
++
++class ContinuationWorkerTest(WorkerHelpers, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_workers()
++        self.operation = self.api.reserve_with_continuation(
++            self.ctxt, self.payload)
++
++    def test_two_hosts_duplicate_delivery_dispatch_once(self):
++        for worker in self.workers:
++            for unused in range(2):
++                worker.execute(self.service_ctx, uuids.nova_operation, 1)
++        self.assertEqual('succeeded', self.grant()['operation']['status'])
++        self.assertEqual(
++            [1, 1], [o.driver.native_call_count for o in self.owners])
++        self.assertEqual(uuids.nova_operation,
++                         self.service_ctx.checkpoint_continuation_id)
++
++    def test_unknown_step_query_never_reexecutes(self):
++        self.driver.outcomes['snapshot'].append(TimeoutError('not-public'))
++        self.worker.execute(self.service_ctx, uuids.nova_operation, 1)
++        self.worker.execute(self.service_ctx, uuids.nova_operation, 1)
++        self.worker.reconcile(self.service_ctx, uuids.nova_operation, 1)
++        self.assertEqual(1, self.driver.native_call_count)
++        self.assertEqual(1, len(self.driver.query_calls))
++        self.assertNotIn('not-public', str(self.grant()))
++
++    def test_revoked_grant_blocks_both_service_and_legacy_worker(self):
++        self.revoke_grant()
++        self.assertRaises(exception.CheckpointServiceForbidden,
++                          self.worker.execute, self.service_ctx,
++                          uuids.nova_operation, 1)
++        legacy = manager.CheckpointManager(self.owners[0])
++        self.assertRaises(exception.CheckpointServiceForbidden,
++                          legacy.execute, self.ctxt,
++                          self.operation.steps[0].id, 1)
++        self.assertEqual(0, self.driver.native_call_count)
++
++    def test_late_delivery_after_release_has_no_effect(self):
++        db.checkpoint_continuation_transition(
++            self.service_ctx, uuids.nova_operation, 1, 'release', 'abort')
++        self.assertRaises(exception.CheckpointConflict,
++                          self.worker.execute, self.service_ctx,
++                          uuids.nova_operation, 1)
++        self.assertEqual('released', self.grant()['operation']['status'])
++        self.assertEqual(0, self.driver.native_call_count)
++
++    def test_allowlist_removal_and_stale_generation_prevent_effect(self):
++        self.assertRaises(exception.CheckpointConflict,
++                          self.worker.execute, self.service_ctx,
++                          uuids.nova_operation, 2)
++        self.flags(nova_service_user_ids=[], group='checkpoint')
++        self.assertRaises(exception.CheckpointServiceForbidden,
++                          self.worker.execute, self.service_ctx,
++                          uuids.nova_operation, 1)
++        self.assertEqual(0, self.driver.native_call_count)
++
++    def test_wrong_host_and_uninitialized_capability_are_rejected(self):
++        self.assertRaises(exception.CheckpointConflict,
++                          self.worker.capabilities, self.service_ctx,
++                          uuids.nova_operation, self.volumes[1])
++        self.driver._initialized = False
++        self.assertRaises(exception.CheckpointBackendUnavailable,
++                          self.worker.capabilities, self.service_ctx,
++                          uuids.nova_operation, self.volumes[0])
++
++    def test_forged_scope_cannot_claim_step(self):
++        scope = continuation.authorize(self.service_ctx, uuids.nova_operation,
++                                       1, 'execute')
++        forged = dataclasses.replace(scope, owner_project_id=uuids.attacker)
++        self.assertRaises(exception.CheckpointOperationNotFound,
++                          db.checkpoint_continuation_step_claim,
++                          self.service_ctx, forged.to_primitive(),
++                          self.operation.steps[0].id, self.owners[0].host)
++        self.assertEqual(0, self.driver.native_call_count)
++
++
++class AttachmentWorkerTest(test_attachment_intents.AttachmentHelpers,
++                           WorkerHelpers, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_workers()
++        self.prepare_attachments()
++        self.mock_object(self.driver, 'validate_connector')
++        self.mock_object(self.driver, 'create_export', return_value=None)
++        self.mock_object(self.driver, 'remove_export')
++        self.mock_object(self.driver, 'initialize_connection', return_value={
++            'driver_volume_type': 'fake', 'data': {'auth_password': 'secret'}})
++        self.mock_object(self.driver, 'terminate_connection',
++                         return_value=False)
++
++    def prepare_update(self):
++        self.enter_reconnect()
++        self.created = self.submit(self.create_request)
++        self.updated = self.submit(self.request_for(
++            'update', self.created.attachment_id,
++            connector={'host': 'compute-one'}, mountpoint='/dev/vda'))
++        return self.updated
++
++    def execute_update(self):
++        self.worker.execute_attachment(self.service_ctx, uuids.nova_operation,
++                                       self.updated.id, 1)
++
++    def query_update(self):
++        return self.worker.query_attachment(
++            self.service_ctx, uuids.nova_operation, self.updated.id, 1)
++
++    def test_unknown_update_is_never_redispatched(self):
++        self.prepare_update()
++        self.driver.initialize_connection.side_effect = TimeoutError('secret')
++        self.execute_update()
++        self.execute_update()
++        self.assertEqual('unknown', self.query_update()['status'])
++        self.assertEqual(1, self.driver.initialize_connection.call_count)
++        self.assertEqual(1, self.driver.create_export.call_count)
++        self.driver.remove_export.assert_not_called()
++        self.assertEqual(2, len(self.locks()))
++
++    def test_revocation_between_api_and_worker_prevents_effect(self):
++        self.prepare_update()
++        self.revoke_grant()
++        self.assertRaises(exception.CheckpointServiceForbidden,
++                          self.execute_update)
++        self.driver.initialize_connection.assert_not_called()
++        self.driver.create_export.assert_not_called()
++
++    def test_wrong_host_or_child_operation_cannot_dispatch(self):
++        self.prepare_update()
++        self.assertRaises(exception.CheckpointConflict,
++                          self.workers[1].execute_attachment,
++                          self.service_ctx, uuids.nova_operation,
++                          self.updated.id, 1)
++        self.assertRaises(exception.CheckpointOperationNotFound,
++                          self.worker.execute_attachment,
++                          self.service_ctx, uuids.foreign_operation,
++                          self.updated.id, 1)
++        self.driver.initialize_connection.assert_not_called()
++
++    def test_successful_update_connection_is_only_in_attachment(self):
++        self.prepare_update()
++        self.execute_update()
++        self.execute_update()
++        self.assertEqual('succeeded', self.query_update()['status'])
++        self.assertNotIn('secret', str(self.query_update()))
++        current = self.intents.get_attachment(
++            self.service_ctx, self.scope, self.created.attachment_id)
++        self.assertEqual('secret', current['connection_info']['auth_password'])
++        self.assertEqual('attaching', current['status'])
++        completed = self.submit(self.request_for(
++            'complete', self.created.attachment_id))
++        self.assertEqual('succeeded', completed.status)
++        self.assertEqual('attached', self.intents.get_attachment(
++            self.service_ctx, self.scope,
++            self.created.attachment_id)['status'])
++        self.assertEqual(1, self.driver.initialize_connection.call_count)
++
++    def test_delete_effect_and_result_commit_once(self):
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            self.ctxt.session.query(models.VolumeAttachment).filter_by(
++                id=self.original[0]).update({
++                    'connector': json.dumps({'host': 'compute-one'})})
++        deleted = self.submit(self.request_for('delete', self.original[0]))
++        for unused in range(2):
++            self.worker.execute_attachment(self.service_ctx,
++                                           uuids.nova_operation, deleted.id, 1)
++        result = self.worker.query_attachment(
++            self.service_ctx, uuids.nova_operation, deleted.id, 1)
++        self.assertEqual('succeeded', result['status'])
++        self.assertEqual(0, self.count_volume_attachments(self.volumes[0]))
++        self.assertEqual('available', objects.Volume.get_by_id(
++            self.ctxt, self.volumes[0]).status)
++        self.assertEqual(1, self.driver.terminate_connection.call_count)
++        self.assertEqual(1, self.driver.remove_export.call_count)
++
++    def test_legacy_attachment_path_cannot_bypass_child_journal(self):
++        self.assertRaises(exception.CheckpointConflict,
++                          db.checkpoint_attachment_scope, self.ctxt,
++                          self.operation.id, 1, self.volumes[0], 'disconnect',
++                          self.original[0])
++
++    def test_legacy_connector_specs_are_read_without_migration(self):
++        db.attachment_specs_update_or_create(
++            self.ctxt, self.original[0], {'host': 'compute-one'})
++        deleted = self.submit(self.request_for('delete', self.original[0]))
++        self.worker.execute_attachment(self.service_ctx, uuids.nova_operation,
++                                       deleted.id, 1)
++        self.assertEqual('succeeded', self.worker.query_attachment(
++            self.service_ctx, uuids.nova_operation, deleted.id, 1)['status'])
++        self.driver.terminate_connection.assert_called_once()
++        self.assertEqual({'host': 'compute-one'},
++                         db.attachment_specs_get(self.ctxt, self.original[0]))
++
++    def test_result_commit_loss_does_not_repeat_initialize(self):
++        self.prepare_update()
++        self.mock_object(db, 'checkpoint_attachment_intent_success',
++                         side_effect=RuntimeError('lost commit'))
++        self.execute_update()
++        self.execute_update()
++        self.assertEqual('unknown', self.query_update()['status'])
++        self.assertEqual(1, self.driver.initialize_connection.call_count)
++        self.assertIsNone(self.intents.get_attachment(
++            self.service_ctx, self.scope, self.created.attachment_id)[
++                'connection_info'])
++
++    def test_unknown_delete_never_retries_or_removes_export(self):
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            self.ctxt.session.query(models.VolumeAttachment).filter_by(
++                id=self.original[0]).update({
++                    'connector': json.dumps({'host': 'compute-one'})})
++        self.driver.terminate_connection.side_effect = TimeoutError()
++        deleted = self.submit(self.request_for('delete', self.original[0]))
++        for unused in range(2):
++            self.worker.execute_attachment(self.service_ctx,
++                                           uuids.nova_operation, deleted.id, 1)
++        self.assertEqual('unknown', self.worker.query_attachment(
++            self.service_ctx, uuids.nova_operation, deleted.id, 1)['status'])
++        self.assertEqual(1, self.driver.terminate_connection.call_count)
++        self.driver.remove_export.assert_not_called()
++        self.assertEqual(1, self.count_volume_attachments(self.volumes[0]))
++
++
++class ContinuationRPCGateTest(WorkerHelpers, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_workers()
++        self.real_rpc = rpcapi.VolumeAPI()
++        self.services = [db.service_create(self.ctxt.elevated(), {
++            'host': owner.host, 'binary': 'cinder-volume',
++            'topic': 'cinder-volume', 'disabled': False,
++            'rpc_current_version': '3.22', 'object_current_version': '1.41',
++            'updated_at': timeutils.utcnow()}) for owner in self.owners]
++        self.mock_object(self.real_rpc.client, 'can_send_version',
++                         return_value=True)
++        self.volume = objects.Volume.get_by_id(self.ctxt, self.volumes[0])
++
++    def test_rpc_321_and_objects_140_rejected_before_reserve(self):
++        self.api.rpc = self.real_rpc
++        for fields in ({'rpc_current_version': '3.21'},
++                       {'rpc_current_version': '3.22',
++                        'object_current_version': '1.40'}):
++            db.service_update(
++                self.ctxt.elevated(), self.services[0].id, fields)
++            self.assertRaises(exception.CheckpointNotSupported,
++                              self.api.reserve_with_continuation,
++                              self.ctxt, self.payload)
++            self.assertEqual([], self.locks())
++            self.assertEqual(
++                0, self.count(models.CheckpointContinuationGrant))
++
++    def test_object_cap_and_rpc_cap_are_checked(self):
++        self.mock_object(self.real_rpc, 'determine_obj_version_cap',
++                         return_value='1.40')
++        self.assertRaises(exception.CheckpointNotSupported,
++                          self.real_rpc.assert_checkpoint_continuation_ready,
++                          self.service_ctx, self.volume)
++        self.real_rpc.determine_obj_version_cap.return_value = '1.41'
++        self.real_rpc.client.can_send_version.return_value = False
++        self.assertRaises(exception.CheckpointNotSupported,
++                          self.real_rpc.assert_checkpoint_continuation_ready,
++                          self.service_ctx, self.volume)
++
++    def test_new_rpcs_pin_322_and_preserve_subject(self):
++        client = self.mock_object(self.real_rpc, '_get_cctxt')
++        for method, kind, kwargs in (
++                ('get_checkpoint_continuation_capabilities', 'call',
++                 {'volume_id': self.volume.id}),
++                ('execute_checkpoint_continuation', 'cast', {'generation': 1}),
++                ('reconcile_checkpoint_continuation', 'cast',
++                 {'generation': 1}),
++                ('execute_checkpoint_attachment', 'cast',
++                 {'generation': 1, 'child_id': uuids.child}),
++                ('query_checkpoint_attachment', 'call',
++                 {'generation': 1, 'child_id': uuids.child})):
++            kwargs['nova_operation_id'] = uuids.nova_operation
++            getattr(self.real_rpc, method)(
++                self.service_ctx, host=self.owners[0].host, **kwargs)
++            client.assert_called_with(self.owners[0].host, version='3.22')
++            getattr(client.return_value, kind).assert_called_with(
++                self.service_ctx, method, **kwargs)
+diff --git a/cinder/volume/manager.py b/cinder/volume/manager.py
+index 5cca128..9dbaf57 100644
+--- a/cinder/volume/manager.py
++++ b/cinder/volume/manager.py
+@@ -59,6 +59,7 @@ from taskflow import exceptions as tfe
+ 
+ from cinder.backup import rpcapi as backup_rpcapi
+ from cinder.checkpoints import config as checkpoint_config
++from cinder.checkpoints import continuation_manager
+ from cinder.checkpoints import guards as checkpoint_guards
+ from cinder.checkpoints import manager as checkpoint_manager
+ from cinder.common import constants
+@@ -249,6 +250,32 @@ class VolumeManager(manager.CleanableManager,
+         'consistencygroup', 'volume_attachment', 'group', 'snapshots',
+         'use_quota'}
+ 
++    def get_checkpoint_continuation_capabilities(
++            self, ctxt, nova_operation_id, volume_id):
++        return continuation_manager.ContinuationManager(self).capabilities(
++            ctxt, nova_operation_id, volume_id)
++
++    def execute_checkpoint_continuation(
++            self, ctxt, nova_operation_id, generation):
++        return continuation_manager.ContinuationManager(self).execute(
++            ctxt, nova_operation_id, generation)
++
++    def reconcile_checkpoint_continuation(
++            self, ctxt, nova_operation_id, generation):
++        return continuation_manager.ContinuationManager(self).reconcile(
++            ctxt, nova_operation_id, generation)
++
++    def execute_checkpoint_attachment(
++            self, ctxt, nova_operation_id, child_id, generation):
++        worker = continuation_manager.ContinuationManager(self)
++        return worker.execute_attachment(
++            ctxt, nova_operation_id, child_id, generation)
++
++    def query_checkpoint_attachment(
++            self, ctxt, nova_operation_id, child_id, generation):
++        return continuation_manager.ContinuationManager(self).query_attachment(
++            ctxt, nova_operation_id, child_id, generation)
++
+     def get_checkpoint_capabilities(self, ctxt, volume_id):
+         return checkpoint_manager.CheckpointManager(self).capabilities(
+             ctxt, volume_id)
+diff --git a/cinder/volume/rpcapi.py b/cinder/volume/rpcapi.py
+index bd9b392..51062c6 100644
+--- a/cinder/volume/rpcapi.py
++++ b/cinder/volume/rpcapi.py
+@@ -145,9 +145,10 @@ class VolumeAPI(rpc.RPCAPI):
+         3.19 - Add extend_volume_completion method
+         3.20 - Add image_snap parameter to reimage method
+         3.21 - Native checkpoint execution, query and scoped attachments
++        3.22 - Durable service continuation and attachment requests
+     """
+ 
+-    RPC_API_VERSION = '3.21'
++    RPC_API_VERSION = '3.22'
+     RPC_DEFAULT_VERSION = '3.0'
+     TOPIC = constants.VOLUME_TOPIC
+     BINARY = constants.VOLUME_BINARY
+@@ -585,6 +586,13 @@ class VolumeAPI(rpc.RPCAPI):
+             cctxt.cast(ctxt, 'reimage', volume=volume, image_meta=image_meta)
+ 
+     def assert_checkpoint_ready(self, ctxt, volume):
++        self._assert_checkpoint_versions(ctxt, volume, '3.21', '1.40')
++
++    def assert_checkpoint_continuation_ready(self, ctxt, volume):
++        self._assert_checkpoint_versions(ctxt, volume, '3.22', '1.41')
++
++    def _assert_checkpoint_versions(self, ctxt, volume, rpc_version,
++                                    object_version):
+         services = objects.ServiceList.get_all_by_binary(
+             ctxt.elevated(), self.BINARY)
+         target = volume_utils.extract_host(volume.service_topic_queue or '')
+@@ -594,7 +602,7 @@ class VolumeAPI(rpc.RPCAPI):
+         if not matching or not any(
+                 s.is_up and not s.disabled for s in matching):
+             raise exception.CheckpointBackendUnavailable()
+-        if not self.client.can_send_version('3.21'):
++        if not self.client.can_send_version(rpc_version):
+             raise exception.CheckpointNotSupported(
+                 reason='rpc_upgrade_required')
+         # Read actual service advertisements, not fallback-to-local or cached
+@@ -602,9 +610,10 @@ class VolumeAPI(rpc.RPCAPI):
+         for service in services:
+             try:
+                 ready = (versionutils.is_compatible(
+-                    '3.21', service.rpc_current_version or '', same_major=True)
++                    rpc_version, service.rpc_current_version or '',
++                    same_major=True)
+                     and versionutils.is_compatible(
+-                        '1.40', service.object_current_version or '',
++                        object_version, service.object_current_version or '',
+                         same_major=True))
+             except (ValueError, TypeError):
+                 ready = False
+@@ -612,7 +621,8 @@ class VolumeAPI(rpc.RPCAPI):
+                 raise exception.CheckpointNotSupported(
+                     reason='service_upgrade_required')
+         if not versionutils.is_compatible(
+-                '1.40', self.determine_obj_version_cap(), same_major=True):
++                object_version, self.determine_obj_version_cap(),
++                same_major=True):
+             raise exception.CheckpointNotSupported(reason='object_cap_too_old')
+ 
+     @rpc.assert_min_rpc_version('3.21')
+@@ -635,3 +645,45 @@ class VolumeAPI(rpc.RPCAPI):
+         cctxt = self._get_cctxt(host, version='3.21')
+         cctxt.cast(ctxt, 'reconcile_checkpoint_step', step_id=step_id,
+                    generation=generation)
++
++    @rpc.assert_min_rpc_version('3.22')
++    def get_checkpoint_continuation_capabilities(
++            self, ctxt, nova_operation_id, volume_id, host):
++        cctxt = self._get_cctxt(host, version='3.22')
++        return cctxt.call(
++            ctxt, 'get_checkpoint_continuation_capabilities',
++            nova_operation_id=nova_operation_id, volume_id=volume_id)
++
++    @rpc.assert_min_rpc_version('3.22')
++    def execute_checkpoint_continuation(
++            self, ctxt, nova_operation_id, generation, host):
++        cctxt = self._get_cctxt(host, version='3.22')
++        return cctxt.cast(
++            ctxt, 'execute_checkpoint_continuation',
++            nova_operation_id=nova_operation_id, generation=generation)
++
++    @rpc.assert_min_rpc_version('3.22')
++    def reconcile_checkpoint_continuation(
++            self, ctxt, nova_operation_id, generation, host):
++        cctxt = self._get_cctxt(host, version='3.22')
++        return cctxt.cast(
++            ctxt, 'reconcile_checkpoint_continuation',
++            nova_operation_id=nova_operation_id, generation=generation)
++
++    @rpc.assert_min_rpc_version('3.22')
++    def execute_checkpoint_attachment(
++            self, ctxt, nova_operation_id, child_id, generation, host):
++        cctxt = self._get_cctxt(host, version='3.22')
++        return cctxt.cast(
++            ctxt, 'execute_checkpoint_attachment',
++            nova_operation_id=nova_operation_id, child_id=child_id,
++            generation=generation)
++
++    @rpc.assert_min_rpc_version('3.22')
++    def query_checkpoint_attachment(
++            self, ctxt, nova_operation_id, child_id, generation, host):
++        cctxt = self._get_cctxt(host, version='3.22')
++        return cctxt.call(
++            ctxt, 'query_checkpoint_attachment',
++            nova_operation_id=nova_operation_id, child_id=child_id,
++            generation=generation)

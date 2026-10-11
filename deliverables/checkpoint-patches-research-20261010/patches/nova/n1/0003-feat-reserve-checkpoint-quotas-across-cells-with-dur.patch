@@ -1,0 +1,1551 @@
+From 72a77167459e9900ed931dc8943b0973a8981c4d Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 10:02:22 +0300
+Subject: [PATCH 03/10] feat: reserve checkpoint quotas across cells with
+ durable tickets
+
+---
+ nova/checkpoints/quota.py                     | 164 ++++++
+ nova/db/api/checkpoints.py                    | 315 ++++++++++++
+ ...1be90d2c402_add_checkpoint_quota_ledger.py |  71 +++
+ nova/db/api/models.py                         |  33 ++
+ nova/db/main/checkpoints.py                   |  84 +++-
+ .../4a8c2d7e9101_add_instance_checkpoints.py  |   3 +
+ nova/db/main/models.py                        |   3 +
+ nova/objects/checkpoint.py                    |  61 +++
+ .../functional/db/test_checkpoint_quota.py    | 115 +++++
+ nova/tests/unit/checkpoints/test_cell_db.py   |  14 +-
+ nova/tests/unit/checkpoints/test_quota.py     | 472 ++++++++++++++++++
+ nova/tests/unit/db/api/test_migrations.py     |   9 +
+ nova/tests/unit/objects/test_objects.py       |   6 +-
+ 13 files changed, 1341 insertions(+), 9 deletions(-)
+ create mode 100644 nova/checkpoints/quota.py
+ create mode 100644 nova/db/api/checkpoints.py
+ create mode 100644 nova/db/api/migrations/versions/71be90d2c402_add_checkpoint_quota_ledger.py
+ create mode 100644 nova/tests/functional/db/test_checkpoint_quota.py
+ create mode 100644 nova/tests/unit/checkpoints/test_quota.py
+
+diff --git a/nova/checkpoints/quota.py b/nova/checkpoints/quota.py
+new file mode 100644
+index 0000000..3832e84
+--- /dev/null
++++ b/nova/checkpoints/quota.py
+@@ -0,0 +1,164 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Two-database checkpoint admission and resource accounting.
++
++API DB writers never span cell/RPC calls. An absent row is not refund evidence:
++the cell must first fence late admission with an immutable cancellation.
++"""
++
++from nova.checkpoints import contracts as c
++from nova import context as nova_context
++from nova.db.api import checkpoints as db
++from nova import exception
++from nova import objects
++
++
++class QuotaLedger:
++    @staticmethod
++    def _object(context, row):
++        return objects.CheckpointQuotaTicket._from_row(context, row)
++
++    @staticmethod
++    def _cell(context, ticket):
++        cell = objects.CellMapping.get_by_uuid(context, ticket.cell_uuid)
++        if cell.is_cell0():
++            raise exception.CheckpointUnavailable(reason='cell_unavailable')
++        return nova_context.target_cell(context, cell)
++
++    def get(self, context, ticket_id):
++        return self._object(context, db.get(context, ticket_id))
++
++    def reserve(self, context, admission):
++        return self._object(context, db.reserve(context, admission))
++
++    def confirm(self, context, ticket_id):
++        ticket = self.get(context, ticket_id)
++        with self._cell(context, ticket) as ctx:
++            operation = objects.InstanceCheckpointOperation.get_by_uuid(
++                ctx, ticket.operation_id
++            )
++        if (
++            operation.admission != ticket.admission or
++            operation.quota_ticket_id != ticket.id or
++            operation.kind != 'create' or
++            operation.state in ('failed', 'released')
++        ):
++            raise exception.CheckpointConflict()
++        confirmed = self._object(context, db._confirm(context, ticket_id))
++        if not operation.quota_ready:
++            with self._cell(context, confirmed) as ctx:
++                objects.InstanceCheckpointOperation.set_artifact_budget(
++                    ctx,
++                    confirmed.operation_id,
++                    confirmed.version,
++                    confirmed.reserved_bytes,
++                )
++        return confirmed
++
++    def grow(self, context, ticket_id, expected_version, total_bytes):
++        ticket = self._object(
++            context,
++            db._grow(context, ticket_id, expected_version, total_bytes),
++        )
++        with self._cell(context, ticket) as ctx:
++            objects.InstanceCheckpointOperation.set_artifact_budget(
++                ctx, ticket.operation_id, ticket.version, ticket.reserved_bytes
++            )
++        return ticket
++
++    def settle(self, context, ticket_id):
++        ticket = self.get(context, ticket_id)
++        with self._cell(context, ticket) as ctx:
++            proof = objects.InstanceCheckpointOperation.artifact_usage_proof(
++                ctx, ticket.operation_id
++            )
++        if proof is None:
++            raise exception.CheckpointConflict(reason='resources_remaining')
++        return self._object(context, db._settle(context, ticket_id, proof))
++
++    def release(self, context, ticket_id):
++        ticket = self.get(context, ticket_id)
++        if ticket.state == 'released':
++            return ticket
++        with self._cell(context, ticket) as ctx:
++            primitive = objects.InstanceCheckpointOperation.close_proof(
++                ctx, ticket.operation_id
++            )
++        if primitive is None:
++            raise exception.CheckpointConflict(reason='resources_remaining')
++        proof = c.CloseProof.from_primitive(primitive)
++        return self._object(context, db._release(context, ticket_id, proof))
++
++    def _reconcile_ticket(self, context, ticket):
++        operation = None
++        with self._cell(context, ticket) as ctx:
++            proof = objects.InstanceCheckpointOperation.close_proof(
++                ctx, ticket.operation_id
++            )
++            if proof is None and ticket.state in ('held', 'confirmed'):
++                try:
++                    operation = (
++                        objects.InstanceCheckpointOperation.get_by_uuid(
++                            ctx, ticket.operation_id
++                        )
++                    )
++                except exception.NotFound:
++                    if ticket.state != 'held':
++                        raise
++                    proof = (
++                        objects.InstanceCheckpointOperation.cancel_admission(
++                            ctx, ticket.admission
++                        )
++                    )
++        if proof:
++            self.release(context, ticket.id)
++            close = c.CloseProof.from_primitive(proof)
++            if close.kind == 'resources_deleted':
++                with self._cell(context, ticket) as ctx:
++                    objects.InstanceCheckpointOperation.mark_quota_released(
++                        ctx, close.closing_operation_id, ticket.id
++                    )
++                    objects.InstanceCheckpointOperation.finalize(
++                        ctx, close.closing_operation_id, 1, 'succeeded'
++                    )
++        elif operation and (
++            ticket.state == 'held' or not operation.quota_ready
++        ):
++            self.confirm(context, ticket.id)
++            with self._cell(context, ticket) as ctx:
++                objects.InstanceCheckpointOperation.mark_quota_ready(
++                    ctx, ticket.operation_id, ticket.id
++                )
++        elif operation and ticket.state == 'confirmed':
++            with self._cell(context, ticket) as ctx:
++                checkpoint = objects.InstanceCheckpoint.get_by_uuid(
++                    ctx, ticket.checkpoint_id)
++                if checkpoint.artifact_budget_version < ticket.version:
++                    objects.InstanceCheckpointOperation.set_artifact_budget(
++                        ctx, ticket.operation_id, ticket.version,
++                        ticket.reserved_bytes)
++
++    def reconcile(self, context, limit=100, marker=None):
++        rows = db.list_tickets(context, marker=marker, limit=limit)
++        report = dict(processed=0, failed=0, next_marker=None)
++        for row in rows:
++            try:
++                self._reconcile_ticket(context, self._object(context, row))
++                report['processed'] += 1
++            except Exception:
++                # Keep charge/ownership. No token, traceback, or backend text
++                # is stored in the public journal as a diagnostic reason.
++                report['failed'] += 1
++        if len(rows) == limit:
++            report['next_marker'] = rows[-1]['id']
++        return report
+diff --git a/nova/db/api/checkpoints.py b/nova/db/api/checkpoints.py
+new file mode 100644
+index 0000000..8cd0c06
+--- /dev/null
++++ b/nova/db/api/checkpoints.py
+@@ -0,0 +1,315 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Project checkpoint charges in the API database.
++
++No method in this module calls a cell, RPC, driver or external service. Proofs
++are fetched and checked by QuotaLedger before entering these transactions.
++"""
++
++import functools
++
++from oslo_db import api as oslo_db_api
++from oslo_db import exception as db_exc
++from oslo_serialization import jsonutils
++from oslo_utils import uuidutils
++
++from nova.checkpoints import contracts as c
++from nova import conf
++from nova import context as nova_context
++from nova.db.api import api as db
++from nova.db.api import models as m
++from nova.db.utils import require_context
++from nova import exception
++
++CONF = conf.CONF
++
++
++def _transaction(mode):
++    def decorate(fn):
++        @functools.wraps(fn)
++        def wrapped(context, *args, **kwargs):
++            # Never join a caller's cell transaction via oslo.db context state.
++            ctx = nova_context.RequestContext.from_dict(context.to_dict())
++            with getattr(db.context_manager, mode).using(ctx):
++                return fn(ctx, *args, **kwargs)
++
++        return wrapped
++
++    return decorate
++
++
++_writer = _transaction('writer')
++_reader = _transaction('reader')
++_retry = oslo_db_api.wrap_db_retry(
++    max_retries=5,
++    retry_on_deadlock=True,
++    exception_checker=lambda exc: isinstance(exc, db_exc.DBDuplicateEntry),
++)
++
++
++def _conflict():
++    raise exception.CheckpointConflict()
++
++
++def _authorize(context, project_id):
++    if not context.is_admin and context.project_id != project_id:
++        raise exception.NotFound()
++
++
++def _row(row):
++    values = {
++        column.name: getattr(row, column.name)
++        for column in row.__table__.columns
++    }
++    if 'admission' in values:
++        values['admission'] = jsonutils.loads(values['admission'])
++    return values
++
++
++def _ticket(context, ticket_id):
++    ticket = context.session.get(m.CheckpointQuotaTicket, ticket_id)
++    if ticket is None:
++        raise exception.NotFound()
++    _authorize(context, ticket.project_id)
++    return ticket
++
++
++def _usage(context, project_id):
++    _authorize(context, project_id)
++    query = context.session.query(m.CheckpointProjectUsage).filter_by(
++        project_id=project_id
++    )
++    query.update(
++        {
++            m.CheckpointProjectUsage.version: m.CheckpointProjectUsage.version,
++            m.CheckpointProjectUsage.updated_at:
++                m.CheckpointProjectUsage.updated_at,
++        },
++        synchronize_session=False,
++    )
++    row = query.with_for_update().first()
++    if row is None:
++        row = m.CheckpointProjectUsage(
++            project_id=project_id,
++            checkpoint_count=0,
++            artifact_bytes=0,
++            version=1,
++        )
++        context.session.add(row)
++        context.session.flush()
++    return row
++
++
++def _locked_ticket(context, ticket_id):
++    ticket = _ticket(context, ticket_id)
++    usage = _usage(context, ticket.project_id)
++    context.session.refresh(ticket, with_for_update=True)
++    return usage, ticket
++
++
++def _charge(usage, count, byte_count):
++    if (
++        count > CONF.checkpoint.max_checkpoints_per_project or
++        byte_count > CONF.checkpoint.max_artifact_bytes_per_project or
++        byte_count > c.MAX_BYTES or
++        count > c.MAX_BYTES
++    ):
++        raise exception.CheckpointQuotaExceeded()
++    if count < 0 or byte_count < 0:
++        _conflict()
++    usage.checkpoint_count = count
++    usage.artifact_bytes = byte_count
++    usage.version += 1
++
++
++@require_context
++@_reader
++def get(context, ticket_id):
++    return _row(_ticket(context, ticket_id))
++
++
++@require_context
++@_reader
++def get_usage(context, project_id):
++    _authorize(context, project_id)
++    usage = context.session.get(m.CheckpointProjectUsage, project_id)
++    if usage is None:
++        return dict(
++            project_id=project_id,
++            checkpoint_count=0,
++            artifact_bytes=0,
++            version=0,
++        )
++    return _row(usage)
++
++
++@require_context
++@_retry
++@_writer
++def reserve(context, admission):
++    a = admission
++    if a.key.kind != 'create':
++        _conflict()
++    _authorize(context, a.key.project_id)
++    if not context.is_admin and context.user_id != a.key.actor_user_id:
++        raise exception.NotFound()
++    usage = _usage(context, a.key.project_id)
++    ticket = (
++        context.session.query(m.CheckpointQuotaTicket)
++        .filter_by(
++            project_id=a.key.project_id,
++            instance_uuid=a.key.instance_uuid,
++            request_id=a.key.request_id,
++        )
++        .first()
++    )
++    if ticket:
++        if ticket.actor_user_id != a.key.actor_user_id:
++            raise exception.NotFound()
++        if ticket.payload_hash != a.key.payload_hash:
++            _conflict()
++        return _row(ticket)
++    _charge(
++        usage,
++        usage.checkpoint_count + 1,
++        usage.artifact_bytes + a.artifact_upper_bound,
++    )
++    ticket = m.CheckpointQuotaTicket(
++        id=uuidutils.generate_uuid(),
++        operation_id=a.operation_id,
++        checkpoint_id=a.checkpoint_id,
++        project_id=a.key.project_id,
++        instance_uuid=a.key.instance_uuid,
++        actor_user_id=a.key.actor_user_id,
++        request_id=a.key.request_id,
++        payload_hash=a.key.payload_hash,
++        cell_uuid=a.cell_uuid,
++        reserved_bytes=a.artifact_upper_bound,
++        state='held',
++        version=1,
++        settled_proof_revision=0,
++        admission=jsonutils.dumps(a.to_primitive(), sort_keys=True),
++    )
++    context.session.add(ticket)
++    context.session.flush()
++    return _row(ticket)
++
++
++@require_context
++@_retry
++@_writer
++def _confirm(context, ticket_id):
++    usage, ticket = _locked_ticket(context, ticket_id)
++    if ticket.state == 'released':
++        _conflict()
++    if ticket.state == 'held':
++        ticket.state = 'confirmed'
++        ticket.version += 1
++    context.session.flush()
++    return _row(ticket)
++
++
++@require_context
++@_retry
++@_writer
++def _grow(context, ticket_id, expected_version, total_bytes):
++    c._integer(total_bytes, minimum=1)
++    c._integer(expected_version, minimum=1)
++    usage, ticket = _locked_ticket(context, ticket_id)
++    if (
++        ticket.state != 'confirmed' or
++        ticket.version != expected_version or
++        total_bytes < ticket.reserved_bytes
++    ):
++        _conflict()
++    if total_bytes > ticket.reserved_bytes:
++        _charge(
++            usage,
++            usage.checkpoint_count,
++            usage.artifact_bytes + total_bytes - ticket.reserved_bytes,
++        )
++        ticket.reserved_bytes = total_bytes
++        ticket.version += 1
++    context.session.flush()
++    return _row(ticket)
++
++
++@require_context
++@_retry
++@_writer
++def _settle(context, ticket_id, proof):
++    usage, ticket = _locked_ticket(context, ticket_id)
++    c._integer(proof['revision'], minimum=1)
++    c._integer(proof['bytes'])
++    if (
++        proof['create_operation_id'] != ticket.operation_id or
++        proof['checkpoint_id'] != ticket.checkpoint_id or
++        proof['cell_uuid'] != ticket.cell_uuid
++    ):
++        _conflict()
++    if proof['revision'] <= ticket.settled_proof_revision:
++        return _row(ticket)
++    if (
++        ticket.state != 'confirmed' or
++        proof['ticket_version'] != ticket.version or
++        proof['bytes'] > ticket.reserved_bytes
++    ):
++        _conflict()
++    # Decreasing limits must not prevent release of an existing charge.
++    usage.artifact_bytes -= ticket.reserved_bytes - proof['bytes']
++    if usage.artifact_bytes < 0:
++        _conflict()
++    usage.version += 1
++    ticket.reserved_bytes = proof['bytes']
++    ticket.settled_proof_revision = proof['revision']
++    ticket.version += 1
++    context.session.flush()
++    return _row(ticket)
++
++
++@require_context
++@_retry
++@_writer
++def _release(context, ticket_id, proof):
++    usage, ticket = _locked_ticket(context, ticket_id)
++    if (
++        proof.create_operation_id != ticket.operation_id or
++        proof.checkpoint_id != ticket.checkpoint_id or
++        proof.cell_uuid != ticket.cell_uuid
++    ):
++        _conflict()
++    if ticket.state != 'released':
++        usage.checkpoint_count -= 1
++        usage.artifact_bytes -= ticket.reserved_bytes
++        if usage.checkpoint_count < 0 or usage.artifact_bytes < 0:
++            _conflict()
++        usage.version += 1
++        ticket.state = 'released'
++        ticket.version += 1
++    context.session.flush()
++    return _row(ticket)
++
++
++@require_context
++@_reader
++def list_tickets(context, marker=None, limit=100):
++    c._integer(limit, minimum=1, maximum=1000)
++    query = context.session.query(m.CheckpointQuotaTicket)
++    if not context.is_admin:
++        query = query.filter_by(project_id=context.project_id)
++    if marker:
++        query = query.filter(m.CheckpointQuotaTicket.id > marker)
++    return [
++        _row(row)
++        for row in query.order_by(m.CheckpointQuotaTicket.id).limit(limit)
++    ]
+diff --git a/nova/db/api/migrations/versions/71be90d2c402_add_checkpoint_quota_ledger.py b/nova/db/api/migrations/versions/71be90d2c402_add_checkpoint_quota_ledger.py
+new file mode 100644
+index 0000000..67f34f8
+--- /dev/null
++++ b/nova/db/api/migrations/versions/71be90d2c402_add_checkpoint_quota_ledger.py
+@@ -0,0 +1,71 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Add global checkpoint quota tickets.
++
++Revision ID: 71be90d2c402
++Revises: cdeec0c85668
++"""
++
++from alembic import op
++import sqlalchemy as sa
++
++revision = '71be90d2c402'
++down_revision = 'cdeec0c85668'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    op.create_table(
++        'checkpoint_project_usage',
++        sa.Column(
++            'project_id', sa.String(255), primary_key=True, nullable=False
++        ),
++        sa.Column('checkpoint_count', sa.BigInteger, nullable=False),
++        sa.Column('artifact_bytes', sa.BigInteger, nullable=False),
++        sa.Column('version', sa.Integer, nullable=False),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        mysql_engine='InnoDB',
++        mysql_charset='utf8',
++    )
++    op.create_table(
++        'checkpoint_quota_tickets',
++        sa.Column('id', sa.String(36), primary_key=True, nullable=False),
++        sa.Column('operation_id', sa.String(36), nullable=False),
++        sa.Column('checkpoint_id', sa.String(36), nullable=False),
++        sa.Column('project_id', sa.String(255), nullable=False),
++        sa.Column('instance_uuid', sa.String(36), nullable=False),
++        sa.Column('actor_user_id', sa.String(255), nullable=False),
++        sa.Column('request_id', sa.String(36), nullable=False),
++        sa.Column('payload_hash', sa.String(64), nullable=False),
++        sa.Column('cell_uuid', sa.String(36), nullable=False),
++        sa.Column('reserved_bytes', sa.BigInteger, nullable=False),
++        sa.Column('state', sa.String(32), nullable=False),
++        sa.Column('version', sa.Integer, nullable=False),
++        sa.Column('settled_proof_revision', sa.Integer, nullable=False),
++        sa.Column('admission', sa.Text, nullable=False),
++        sa.UniqueConstraint(
++            'operation_id', name='uniq_checkpoint_ticket_operation'
++        ),
++        sa.UniqueConstraint(
++            'project_id',
++            'instance_uuid',
++            'request_id',
++            name='uniq_checkpoint_ticket_request',
++        ),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        mysql_engine='InnoDB',
++        mysql_charset='utf8',
++    )
+diff --git a/nova/db/api/models.py b/nova/db/api/models.py
+index 5a236e9..24675a3 100644
+--- a/nova/db/api/models.py
++++ b/nova/db/api/models.py
+@@ -494,3 +494,36 @@ class Reservation(BASE):
+     expire = sa.Column(sa.DateTime)
+ 
+     usage = orm.relationship('QuotaUsage')
++
++
++
++class CheckpointProjectUsage(BASE):
++    __tablename__ = 'checkpoint_project_usage'
++    project_id = sa.Column(sa.String(255), primary_key=True, nullable=False)
++    checkpoint_count = sa.Column(sa.BigInteger, nullable=False)
++    artifact_bytes = sa.Column(sa.BigInteger, nullable=False)
++    version = sa.Column(sa.Integer, nullable=False)
++
++
++class CheckpointQuotaTicket(BASE):
++    __tablename__ = 'checkpoint_quota_tickets'
++    __table_args__ = (
++        sa.UniqueConstraint('operation_id',
++                            name='uniq_checkpoint_ticket_operation'),
++        sa.UniqueConstraint('project_id', 'instance_uuid', 'request_id',
++                            name='uniq_checkpoint_ticket_request'),
++    )
++    id = sa.Column(sa.String(36), primary_key=True, nullable=False)
++    operation_id = sa.Column(sa.String(36), nullable=False)
++    checkpoint_id = sa.Column(sa.String(36), nullable=False)
++    project_id = sa.Column(sa.String(255), nullable=False)
++    instance_uuid = sa.Column(sa.String(36), nullable=False)
++    actor_user_id = sa.Column(sa.String(255), nullable=False)
++    request_id = sa.Column(sa.String(36), nullable=False)
++    payload_hash = sa.Column(sa.String(64), nullable=False)
++    cell_uuid = sa.Column(sa.String(36), nullable=False)
++    reserved_bytes = sa.Column(sa.BigInteger, nullable=False)
++    state = sa.Column(sa.String(32), nullable=False)
++    version = sa.Column(sa.Integer, nullable=False)
++    settled_proof_revision = sa.Column(sa.Integer, nullable=False)
++    admission = sa.Column(sa.Text, nullable=False)
+diff --git a/nova/db/main/checkpoints.py b/nova/db/main/checkpoints.py
+index 1970f0b..a727556 100644
+--- a/nova/db/main/checkpoints.py
++++ b/nova/db/main/checkpoints.py
+@@ -38,7 +38,8 @@ from nova import exception
+ 
+ CONF = conf.CONF
+ _JSON_COLUMNS = frozenset(
+-    ('device_manifest', 'admission', 'payload', 'result')
++    ('device_manifest', 'admission', 'payload', 'result',
++     'artifact_usage_proof')
+ )
+ 
+ 
+@@ -364,6 +365,7 @@ def admit(context, admission, ticket_id):
+             create_operation_id=a.operation_id,
+             active_operation_id=a.operation_id,
+             artifact_upper_bound=a.artifact_upper_bound,
++            artifact_budget_version=1, artifact_usage_revision=0,
+         )
+         context.session.add(checkpoint)
+         for disk in a.device_manifest['disks']:
+@@ -944,3 +946,83 @@ def disks_get(context, checkpoint_id):
+ def artifacts_get(context, checkpoint_id):
+     _checkpoint(context, checkpoint_id)
+     return [_row(row) for row in _artifacts(context, checkpoint_id)]
++
++
++def _budget_checkpoint(context, operation_id):
++    operation = _operation(context, operation_id)
++    _instance(context, operation.instance_uuid, lock=True)
++    _guard(context, operation.instance_uuid)
++    checkpoint = _checkpoint(context, operation.checkpoint_id, lock=True)
++    if (operation.kind != 'create' or
++            checkpoint.create_operation_id != operation_id or
++            checkpoint.terminal_operation_id or
++            checkpoint.active_operation_id not in (None, operation_id)):
++        _conflict()
++    return checkpoint
++
++
++@require_context
++@db.pick_context_manager_writer
++def set_artifact_budget(context, operation_id, ticket_version, total_bytes):
++    c._integer(ticket_version, minimum=1)
++    c._integer(total_bytes, minimum=1)
++    checkpoint = _budget_checkpoint(context, operation_id)
++    if ticket_version < checkpoint.artifact_budget_version:
++        _conflict()
++    if ticket_version == checkpoint.artifact_budget_version:
++        if total_bytes != checkpoint.artifact_upper_bound:
++            _conflict()
++        return
++    if total_bytes < checkpoint.artifact_upper_bound:
++        _conflict()
++    save = context.session.query(m.InstanceCheckpointStep).filter_by(
++        operation_id=operation_id, phase='runtime_save').first()
++    if save and save.status not in ('succeeded', 'failed_no_effect'):
++        _conflict('recovery_required')
++    checkpoint.artifact_upper_bound = total_bytes
++    checkpoint.artifact_budget_version = ticket_version
++
++
++@require_context
++@db.pick_context_manager_writer
++def confirm_artifact_usage(context, operation_id, manifest):
++    checkpoint = _budget_checkpoint(context, operation_id)
++    publish = context.session.query(m.InstanceCheckpointStep).filter_by(
++        operation_id=operation_id, phase='artifact_publish').first()
++    if (not publish or publish.status != 'succeeded' or
++            manifest != jsonutils.loads(publish.result)['evidence']):
++        _conflict('resources_remaining')
++    artifacts = _artifacts(context, checkpoint.uuid)
++    if not artifacts or any(item.state != 'available' for item in artifacts):
++        _conflict('resources_remaining')
++    byte_count = sum(item.actual_bytes for item in artifacts)
++    if byte_count > checkpoint.artifact_upper_bound:
++        _conflict()
++    proof = dict(create_operation_id=operation_id,
++                 checkpoint_id=checkpoint.uuid, cell_uuid=checkpoint.cell_uuid,
++                 bytes=byte_count,
++                 ticket_version=checkpoint.artifact_budget_version,
++                 artifacts=[dict(id=item.uuid, checksum=item.checksum,
++                                 bytes=item.actual_bytes)
++                            for item in artifacts])
++    if checkpoint.artifact_usage_proof:
++        previous = jsonutils.loads(checkpoint.artifact_usage_proof)
++        previous.pop('revision')
++        if previous == proof:
++            return
++    checkpoint.artifact_usage_revision += 1
++    proof['revision'] = checkpoint.artifact_usage_revision
++    # Revoke the larger cell write budget BEFORE reducing the global charge.
++    checkpoint.artifact_upper_bound = byte_count
++    checkpoint.artifact_usage_proof = _encode(proof)
++
++
++@require_context
++@db.pick_context_manager_reader
++def artifact_usage_proof(context, create_operation_id):
++    operation = _operation(context, create_operation_id)
++    checkpoint = _checkpoint(context, operation.checkpoint_id)
++    if checkpoint.create_operation_id != create_operation_id:
++        _conflict()
++    return (jsonutils.loads(checkpoint.artifact_usage_proof)
++            if checkpoint.artifact_usage_proof else None)
+diff --git a/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py b/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py
+index 46f2713..bea577f 100644
+--- a/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py
++++ b/nova/db/main/migrations/versions/4a8c2d7e9101_add_instance_checkpoints.py
+@@ -45,6 +45,9 @@ def upgrade():
+         sa.Column('active_operation_id', sa.String(36), nullable=True),
+         sa.Column('terminal_operation_id', sa.String(36), nullable=True),
+         sa.Column('artifact_upper_bound', sa.BigInteger, nullable=False),
++        sa.Column('artifact_budget_version', sa.Integer, nullable=False),
++        sa.Column('artifact_usage_revision', sa.Integer, nullable=False),
++        sa.Column('artifact_usage_proof', sa.Text, nullable=True),
+         sa.Column('created_at', sa.DateTime),
+         sa.Column('updated_at', sa.DateTime),
+         mysql_engine='InnoDB',
+diff --git a/nova/db/main/models.py b/nova/db/main/models.py
+index d9f9298..a58c830 100644
+--- a/nova/db/main/models.py
++++ b/nova/db/main/models.py
+@@ -1264,6 +1264,9 @@ class InstanceCheckpoint(BASE, NovaBase):
+     active_operation_id = sa.Column(sa.String(36), nullable=True)
+     terminal_operation_id = sa.Column(sa.String(36), nullable=True)
+     artifact_upper_bound = sa.Column(sa.BigInteger, nullable=False)
++    artifact_budget_version = sa.Column(sa.Integer, nullable=False)
++    artifact_usage_revision = sa.Column(sa.Integer, nullable=False)
++    artifact_usage_proof = sa.Column(sa.Text, nullable=True)
+ 
+ 
+ class InstanceCheckpointDisk(BASE, NovaBase):
+diff --git a/nova/objects/checkpoint.py b/nova/objects/checkpoint.py
+index 2e7fe0b..781c738 100644
+--- a/nova/objects/checkpoint.py
++++ b/nova/objects/checkpoint.py
+@@ -19,6 +19,7 @@ Compute delegates SQL to conductor through standard object indirection.
+ from oslo_versionedobjects import exception as ovo_exc
+ 
+ from nova.checkpoints import contracts
++from nova.db.api import checkpoints as quota_db
+ from nova.db.main import checkpoints as db
+ from nova import objects
+ from nova.objects import base
+@@ -97,6 +98,9 @@ class InstanceCheckpoint(_Projection):
+         'active_operation_id': fields.UUIDField(nullable=True),
+         'terminal_operation_id': fields.UUIDField(nullable=True),
+         'artifact_upper_bound': fields.IntegerField(),
++        'artifact_budget_version': fields.IntegerField(),
++        'artifact_usage_revision': fields.IntegerField(),
++        'artifact_usage_proof': CheckpointJSONField(nullable=True),
+     }
+ 
+     @base.remotable_classmethod
+@@ -226,6 +230,22 @@ class InstanceCheckpointOperation(_Projection):
+     def device_manifest(cls, context, instance_uuid):
+         return db.device_manifest(context, instance_uuid)
+ 
++    @base.remotable_classmethod
++    def set_artifact_budget(
++        cls, context, operation_id, ticket_version, total_bytes
++    ):
++        db.set_artifact_budget(
++            context, operation_id, ticket_version, total_bytes
++        )
++
++    @base.remotable_classmethod
++    def confirm_artifact_usage(cls, context, operation_id, manifest):
++        db.confirm_artifact_usage(context, operation_id, manifest)
++
++    @base.remotable_classmethod
++    def artifact_usage_proof(cls, context, create_operation_id):
++        return db.artifact_usage_proof(context, create_operation_id)
++
+ 
+ @base.NovaObjectRegistry.register
+ class InstanceCheckpointStep(_Projection):
+@@ -339,3 +359,44 @@ class InstanceCheckpointStepList(
+         return base.obj_make_list(
+             context, cls(), objects.InstanceCheckpointStep, rows
+         )
++
++
++@base.NovaObjectRegistry.register
++class CheckpointQuotaTicket(_Projection):
++    VERSION = '1.0'
++    fields = {
++        'id': fields.UUIDField(),
++        'operation_id': fields.UUIDField(),
++        'checkpoint_id': fields.UUIDField(),
++        'project_id': fields.StringField(),
++        'instance_uuid': fields.UUIDField(),
++        'actor_user_id': fields.StringField(),
++        'request_id': fields.UUIDField(),
++        'payload_hash': fields.StringField(),
++        'cell_uuid': fields.UUIDField(),
++        'reserved_bytes': fields.IntegerField(),
++        'state': fields.StringField(),
++        'version': fields.IntegerField(),
++        'settled_proof_revision': fields.IntegerField(),
++        'admission': CheckpointJSONField(),
++    }
++
++    @base.remotable_classmethod
++    def get_by_uuid(cls, context, ticket_id):
++        return cls._from_row(context, quota_db.get(context, ticket_id))
++
++
++@base.NovaObjectRegistry.register
++class CheckpointQuotaTicketList(
++    _VersionOne, base.ObjectListBase, base.NovaObject
++):
++    VERSION = '1.0'
++    fields = {'objects': fields.ListOfObjectsField('CheckpointQuotaTicket')}
++    obj_relationships = {'objects': [('1.0', '1.0')]}
++
++    @base.remotable_classmethod
++    def get_page(cls, context, marker=None, limit=100):
++        rows = quota_db.list_tickets(context, marker=marker, limit=limit)
++        return base.obj_make_list(
++            context, cls(), objects.CheckpointQuotaTicket, rows
++        )
+diff --git a/nova/tests/functional/db/test_checkpoint_quota.py b/nova/tests/functional/db/test_checkpoint_quota.py
+new file mode 100644
+index 0000000..c6af34b
+--- /dev/null
++++ b/nova/tests/functional/db/test_checkpoint_quota.py
+@@ -0,0 +1,115 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from dataclasses import replace
++import threading
++from unittest import mock
++
++from oslo_db.sqlalchemy import enginefacade
++from oslo_db.sqlalchemy import test_fixtures
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import quota
++from nova import context
++from nova.db.api import api as api_db
++from nova.db.api import checkpoints as quota_db
++from nova.db import migration
++from nova import exception
++from nova import test
++from nova.tests.unit.checkpoints import test_cell_db
++
++
++class QuotaRaceMixin:
++    USES_DB_SELF = True
++    NUMBER_OF_CELLS = 2
++
++    def setUp(self):
++        super().setUp()
++        self.flags(
++            max_checkpoints_per_project=1,
++            max_artifact_bytes_per_project=8192,
++            group='checkpoint',
++        )
++        engine = enginefacade.writer.get_engine()
++        self.manager = enginefacade.transaction_context()
++        self.manager.configure(
++            connection=engine.url.render_as_string(hide_password=False)
++        )
++        self.useFixture(
++            test_fixtures.ReplaceEngineFacadeFixture(
++                api_db.context_manager, self.manager
++            )
++        )
++        with mock.patch.object(migration, '_get_engine', return_value=engine):
++            migration.db_sync(database='api')
++        self.addCleanup(self.manager.dispose_pool)
++        self._setup_cells()
++        self.ctx = context.RequestContext('actor', 'project')
++        self.candidates = []
++        for index, name in enumerate(('cell1', 'cell2')):
++            cell = self.cell_mappings[name]
++            with context.target_cell(self.ctx, cell) as ctx:
++                instance_uuid = getattr(uuids, 'instance%d' % index)
++                test_cell_db.make_instance(
++                    ctx,
++                    instance_uuid,
++                    getattr(uuids, 'bdm%d' % index),
++                    getattr(uuids, 'volume%d' % index),
++                )
++                candidate = test_cell_db.admission(
++                    ctx,
++                    instance_uuid=instance_uuid,
++                    request_id=getattr(uuids, 'request%d' % index),
++                    operation_id=getattr(uuids, 'operation%d' % index),
++                    checkpoint_id=getattr(uuids, 'checkpoint%d' % index),
++                )
++                self.candidates.append(replace(candidate, cell_uuid=cell.uuid))
++
++    def test_two_cells_share_one_project_limit(self):
++        barrier = threading.Barrier(2)
++        outcomes = []
++
++        def reserve(candidate):
++            ctx = context.RequestContext('actor', 'project')
++            barrier.wait(timeout=10)
++            try:
++                quota.QuotaLedger().reserve(ctx, candidate)
++                outcomes.append(True)
++            except exception.CheckpointQuotaExceeded:
++                outcomes.append(False)
++
++        threads = [
++            threading.Thread(target=reserve, args=(a,))
++            for a in self.candidates
++        ]
++        for worker in threads:
++            worker.start()
++        for worker in threads:
++            worker.join(timeout=20)
++            self.assertFalse(worker.is_alive())
++        self.assertEqual(2, len(outcomes))
++        self.assertEqual(1, sum(outcomes))
++        usage = quota_db.get_usage(self.ctx, 'project')
++        self.assertEqual(1, usage['checkpoint_count'])
++        self.assertEqual(4096, usage['artifact_bytes'])
++
++
++class QuotaMySQLRace(
++    QuotaRaceMixin, test_fixtures.OpportunisticDBTestMixin, test.NoDBTestCase
++):
++    FIXTURE = test_fixtures.MySQLOpportunisticFixture
++
++
++class QuotaPostgreSQLRace(
++    QuotaRaceMixin, test_fixtures.OpportunisticDBTestMixin, test.NoDBTestCase
++):
++    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
+diff --git a/nova/tests/unit/checkpoints/test_cell_db.py b/nova/tests/unit/checkpoints/test_cell_db.py
+index d66a901..45c64fe 100644
+--- a/nova/tests/unit/checkpoints/test_cell_db.py
++++ b/nova/tests/unit/checkpoints/test_cell_db.py
+@@ -31,7 +31,8 @@ from nova import exception
+ from nova import test
+ 
+ 
+-def make_instance(ctx, instance_uuid=uuids.instance):
++def make_instance(ctx, instance_uuid=uuids.instance, bdm_uuid=uuids.bdm,
++                  volume_uuid=uuids.volume):
+     flavor = {
+         'nova_object.data': dict(
+             memory_mb=1024,
+@@ -61,15 +62,15 @@ def make_instance(ctx, instance_uuid=uuids.instance):
+     db.block_device_mapping_create(
+         ctx,
+         dict(
+-            uuid=uuids.bdm,
++            uuid=bdm_uuid,
+             instance_uuid=instance_uuid,
+-            volume_id=uuids.volume,
++            volume_id=volume_uuid,
+             source_type='volume',
+             destination_type='volume',
+             device_type='disk',
+             device_name='/dev/vda',
+             boot_index=0,
+-            connection_info=jsonutils.dumps({'serial': uuids.volume}),
++            connection_info=jsonutils.dumps({'serial': volume_uuid}),
+         ),
+         legacy=False,
+     )
+@@ -81,12 +82,13 @@ def admission(
+     kind='create',
+     checkpoint_id=uuids.checkpoint,
+     operation_id=uuids.operation,
++    instance_uuid=uuids.instance,
+ ):
+-    manifest = checkpoints.device_manifest(ctx, uuids.instance)
++    manifest = checkpoints.device_manifest(ctx, instance_uuid)
+     return c.Admission(
+         c.RequestKey(
+             'project',
+-            uuids.instance,
++            instance_uuid,
+             request_id,
+             'actor',
+             kind,
+diff --git a/nova/tests/unit/checkpoints/test_quota.py b/nova/tests/unit/checkpoints/test_quota.py
+new file mode 100644
+index 0000000..0f8c854
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/test_quota.py
+@@ -0,0 +1,472 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from dataclasses import replace
++from unittest import mock
++
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import quota
++from nova.checkpoints import workflow
++from nova import context
++from nova.db.api import checkpoints as quota_db
++from nova.db.main import checkpoints as cell_db
++from nova import exception
++from nova import objects
++from nova import test
++from nova.tests.unit.checkpoints import test_cell_db
++
++
++class QuotaTest(test.TestCase):
++    NUMBER_OF_CELLS = 2
++
++    def setUp(self):
++        super().setUp()
++        self.flags(
++            max_checkpoints_per_project=2,
++            max_artifact_bytes_per_project=16384,
++            group='checkpoint',
++        )
++        self.ctx = context.RequestContext('actor', 'project')
++        self.ledger = quota.QuotaLedger()
++        self.cell = self.cell_mappings['cell1']
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            test_cell_db.make_instance(ctx)
++            self.admission = replace(
++                test_cell_db.admission(ctx), cell_uuid=self.cell.uuid
++            )
++
++    def usage(self):
++        return quota_db.get_usage(self.ctx, 'project')
++
++    def reserve_admit(self, confirm=True):
++        ticket = self.ledger.reserve(self.ctx, self.admission)
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            objects.InstanceCheckpointOperation.admit(
++                ctx, self.admission.to_primitive(), ticket.id
++            )
++        if confirm:
++            ticket = self.ledger.confirm(self.ctx, ticket.id)
++            with context.target_cell(self.ctx, self.cell) as ctx:
++                objects.InstanceCheckpointOperation.mark_quota_ready(
++                    ctx, self.admission.operation_id, ticket.id
++                )
++        return ticket
++
++    def complete(self, admission, ticket):
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            if admission.key.kind != 'create':
++                cell_db.admit(ctx, admission, ticket.id)
++                cell_db.mark_quota_ready(
++                    ctx, admission.operation_id, ticket.id
++                )
++            for phase in workflow.steps_for(admission.key.kind):
++                step = cell_db.claim_step(
++                    ctx, admission.operation_id, 1, phase, 'test-executor'
++                )
++                cell_db.finish_step(
++                    ctx,
++                    step.id,
++                    1,
++                    test_cell_db.phase_result(phase, admission.fingerprint),
++                )
++            cell_db.finalize(ctx, admission.operation_id, 1, 'succeeded')
++
++    def test_two_cells_share_one_project_limit(self):
++        self.flags(max_checkpoints_per_project=1, group='checkpoint')
++        first = self.ledger.reserve(self.ctx, self.admission)
++        second_cell = self.cell_mappings['cell2']
++        with context.target_cell(self.ctx, second_cell) as ctx:
++            test_cell_db.make_instance(
++                ctx, uuids.instance2, uuids.bdm2, uuids.volume2
++            )
++            second = test_cell_db.admission(
++                ctx,
++                request_id=uuids.request2,
++                operation_id=uuids.op2,
++                checkpoint_id=uuids.checkpoint2,
++                instance_uuid=uuids.instance2,
++            )
++            second = replace(second, cell_uuid=second_cell.uuid)
++        self.assertRaises(
++            exception.CheckpointQuotaExceeded,
++            self.ledger.reserve,
++            self.ctx,
++            second,
++        )
++        self.assertEqual('held', first.state)
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++        self.assertEqual(4096, self.usage()['artifact_bytes'])
++
++    def test_lost_confirm_retains_charge(self):
++        ticket = self.reserve_admit(confirm=False)
++        self.assertEqual('held', self.ledger.get(self.ctx, ticket.id).state)
++        confirmed = self.ledger.confirm(self.ctx, ticket.id)
++        self.assertEqual('confirmed', confirmed.state)
++        self.assertEqual(
++            confirmed.version, self.ledger.confirm(self.ctx, ticket.id).version
++        )
++        self.assertEqual(4096, self.usage()['artifact_bytes'])
++
++    def test_absent_operation_not_refund_proof(self):
++        ticket = self.ledger.reserve(self.ctx, self.admission)
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.ledger.release,
++            self.ctx,
++            ticket.id,
++        )
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++
++    def test_cancel_then_queued_admit_never_executes(self):
++        ticket = self.ledger.reserve(self.ctx, self.admission)
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            objects.InstanceCheckpointOperation.cancel_admission(
++                ctx, self.admission.to_primitive()
++            )
++        self.assertEqual(
++            'released', self.ledger.release(self.ctx, ticket.id).state
++        )
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            self.assertRaises(
++                exception.CheckpointConflict,
++                objects.InstanceCheckpointOperation.admit,
++                ctx,
++                self.admission.to_primitive(),
++                ticket.id,
++            )
++            self.assertEqual([], cell_db.steps_get(ctx, uuids.operation))
++        self.assertEqual(0, self.usage()['artifact_bytes'])
++
++    def test_duplicate_create_uses_winning_ids(self):
++        ticket = self.ledger.reserve(self.ctx, self.admission)
++        other = replace(
++            self.admission,
++            operation_id=uuids.candidate_op,
++            checkpoint_id=uuids.candidate_checkpoint,
++        )
++        replay = self.ledger.reserve(self.ctx, other)
++        self.assertEqual(ticket.id, replay.id)
++        self.assertEqual(ticket.operation_id, replay.operation_id)
++        self.assertEqual(ticket.checkpoint_id, replay.checkpoint_id)
++        self.assertEqual(self.admission.to_primitive(), replay.admission)
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++
++    def test_other_actor_or_payload_cannot_reuse_ticket(self):
++        self.ledger.reserve(self.ctx, self.admission)
++        other = replace(
++            self.admission,
++            key=replace(self.admission.key, actor_user_id='other'),
++        )
++        self.assertRaises(
++            exception.NotFound,
++            self.ledger.reserve,
++            context.RequestContext('other', 'project'),
++            other,
++        )
++        other = replace(
++            self.admission,
++            key=replace(self.admission.key, payload_hash='a' * 64),
++        )
++        self.assertRaises(
++            exception.CheckpointConflict, self.ledger.reserve, self.ctx, other
++        )
++
++    def test_refund_once_after_delete(self):
++        ticket = self.reserve_admit()
++        self.complete(self.admission, ticket)
++        deleting = replace(
++            self.admission,
++            operation_id=uuids.delete_op,
++            key=replace(
++                self.admission.key,
++                kind='delete',
++                request_id=uuids.delete_request,
++            ),
++        )
++        self.complete(deleting, ticket)
++        released = self.ledger.release(self.ctx, ticket.id)
++        self.assertEqual('released', released.state)
++        self.assertEqual(
++            released.version, self.ledger.release(self.ctx, ticket.id).version
++        )
++        self.assertEqual(0, self.usage()['checkpoint_count'])
++        self.assertEqual(0, self.usage()['artifact_bytes'])
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            # Ledger release itself does not tear down the cell guard.
++            self.assertEqual(
++                uuids.delete_op,
++                cell_db.guard_get(ctx, uuids.instance)['operation_id'],
++            )
++            cell_db.mark_quota_released(ctx, uuids.delete_op, ticket.id)
++            cell_db.finalize(ctx, uuids.delete_op, 1, 'succeeded')
++
++    def test_staging_counts_before_write(self):
++        ticket = self.reserve_admit()
++        self.assertEqual(4096, ticket.reserved_bytes)
++        self.assertEqual(4096, self.usage()['artifact_bytes'])
++        grown = self.ledger.grow(self.ctx, ticket.id, ticket.version, 8192)
++        self.assertEqual(8192, self.usage()['artifact_bytes'])
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            cp = cell_db.checkpoint_get(ctx, uuids.checkpoint)
++            self.assertEqual(8192, cp['artifact_upper_bound'])
++            self.assertEqual(grown.version, cp['artifact_budget_version'])
++
++    def test_budget_growth_conflict(self):
++        ticket = self.reserve_admit()
++        self.ledger.grow(self.ctx, ticket.id, ticket.version, 8192)
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.ledger.grow,
++            self.ctx,
++            ticket.id,
++            ticket.version,
++            12288,
++        )
++        self.assertEqual(8192, self.usage()['artifact_bytes'])
++
++    def test_lost_cell_growth_ack_retains_larger_charge(self):
++        ticket = self.reserve_admit()
++        with mock.patch.object(
++            objects.InstanceCheckpointOperation,
++            'set_artifact_budget',
++            side_effect=RuntimeError,
++        ):
++            self.assertRaises(
++                RuntimeError,
++                self.ledger.grow,
++                self.ctx,
++                ticket.id,
++                ticket.version,
++                8192,
++            )
++        self.assertEqual(8192, self.usage()['artifact_bytes'])
++
++    def test_lost_cell_growth_ack_is_repaired_before_write(self):
++        ticket = self.reserve_admit()
++        with mock.patch.object(
++            objects.InstanceCheckpointOperation,
++            'set_artifact_budget',
++            side_effect=RuntimeError,
++        ):
++            self.assertRaises(
++                RuntimeError,
++                self.ledger.grow,
++                self.ctx,
++                ticket.id,
++                ticket.version,
++                8192,
++            )
++        self.ledger.reconcile(self.ctx)
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            checkpoint = cell_db.checkpoint_get(ctx, uuids.checkpoint)
++            self.assertEqual(8192, checkpoint['artifact_upper_bound'])
++        self.assertEqual(8192, self.usage()['artifact_bytes'])
++
++    def test_cancel_admitted_create_refunds_before_releasing_guard(self):
++        ticket = self.reserve_admit(confirm=False)
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            cell_db.cancel_admission(ctx, self.admission)
++            self.assertEqual(
++                uuids.operation,
++                cell_db.guard_get(ctx, uuids.instance)['operation_id'],
++            )
++        self.ledger.release(self.ctx, ticket.id)
++        self.ledger.reconcile(self.ctx)
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            self.assertEqual(
++                0, cell_db.guard_get(ctx, uuids.instance)['checkpoint_count']
++            )
++            self.assertRaises(
++                exception.CheckpointConflict,
++                cell_db.claim_step,
++                ctx,
++                uuids.operation,
++                1,
++                'preflight',
++                'test-executor',
++            )
++
++    def test_shrink_needs_durable_full_artifact_proof(self):
++        ticket = self.reserve_admit()
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.ledger.settle,
++            self.ctx,
++            ticket.id,
++        )
++        self.complete(self.admission, ticket)
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            publish = test_cell_db.phase_result(
++                'artifact_publish', self.admission.fingerprint
++            )
++            objects.InstanceCheckpointOperation.confirm_artifact_usage(
++                ctx, uuids.operation, publish.to_primitive()['evidence']
++            )
++        settled = self.ledger.settle(self.ctx, ticket.id)
++        self.assertEqual(1024, settled.reserved_bytes)
++        self.assertEqual(1024, self.usage()['artifact_bytes'])
++        self.assertEqual(
++            settled.version, self.ledger.settle(self.ctx, ticket.id).version
++        )
++
++    def test_cell_down_does_not_release(self):
++        ticket = self.reserve_admit()
++        with mock.patch.object(
++            objects.InstanceCheckpointOperation,
++            'close_proof',
++            side_effect=RuntimeError,
++        ):
++            self.assertRaises(
++                RuntimeError, self.ledger.release, self.ctx, ticket.id
++            )
++        self.assertEqual(4096, self.usage()['artifact_bytes'])
++
++    def test_revert_delete_do_not_charge_second_checkpoint(self):
++        self.reserve_admit()
++        for kind in ('revert', 'delete'):
++            other = replace(
++                self.admission,
++                key=replace(
++                    self.admission.key,
++                    kind=kind,
++                    request_id=uuids.other_request,
++                ),
++            )
++            self.assertRaises(
++                exception.CheckpointConflict,
++                self.ledger.reserve,
++                self.ctx,
++                other,
++            )
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++
++    def test_reconcile_missing_operation_first_persists_cancellation(self):
++        ticket = self.ledger.reserve(self.ctx, self.admission)
++        self.ledger.reconcile(self.ctx)
++        self.assertEqual(
++            'released', self.ledger.get(self.ctx, ticket.id).state
++        )
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            proof = cell_db.close_proof(ctx, uuids.operation)
++            self.assertEqual('admission_cancelled', proof.kind)
++            self.assertRaises(
++                exception.CheckpointConflict,
++                cell_db.admit,
++                ctx,
++                self.admission,
++                ticket.id,
++            )
++
++    def test_zero_and_overflow_budgets_cannot_reserve(self):
++        self.flags(max_artifact_bytes_per_project=0, group='checkpoint')
++        self.assertRaises(
++            exception.CheckpointQuotaExceeded,
++            self.ledger.reserve,
++            self.ctx,
++            self.admission,
++        )
++        self.assertRaises(
++            ValueError,
++            replace,
++            self.admission,
++            artifact_upper_bound=c.MAX_BYTES + 1,
++        )
++
++    def test_lost_confirm_cell_ack_is_repaired(self):
++        ticket = self.reserve_admit(confirm=False)
++        with mock.patch.object(
++            objects.InstanceCheckpointOperation,
++            'set_artifact_budget',
++            side_effect=RuntimeError,
++        ):
++            self.assertRaises(
++                RuntimeError, self.ledger.confirm, self.ctx, ticket.id
++            )
++        self.assertEqual(
++            'confirmed', self.ledger.get(self.ctx, ticket.id).state
++        )
++        self.ledger.reconcile(self.ctx)
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            self.assertTrue(
++                cell_db.get_by_uuid(ctx, uuids.operation)['quota_ready']
++            )
++            self.assertEqual(
++                2,
++                cell_db.checkpoint_get(ctx, uuids.checkpoint)[
++                    'artifact_budget_version'
++                ],
++            )
++
++    def test_stale_usage_proof_cannot_refund_a_newer_budget(self):
++        ticket = self.reserve_admit()
++        self.complete(self.admission, ticket)
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            evidence = test_cell_db.phase_result(
++                'artifact_publish', self.admission.fingerprint
++            ).to_primitive()
++            cell_db.confirm_artifact_usage(
++                ctx, uuids.operation, evidence['evidence']
++            )
++        self.ledger.grow(self.ctx, ticket.id, ticket.version, 8192)
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.ledger.settle,
++            self.ctx,
++            ticket.id,
++        )
++        self.assertEqual(8192, self.usage()['artifact_bytes'])
++
++    def test_foreign_close_proof_cannot_refund(self):
++        ticket = self.reserve_admit()
++        proof = c.CloseProof(
++            ticket.operation_id,
++            ticket.operation_id,
++            uuids.foreign_checkpoint,
++            ticket.cell_uuid,
++            'admission_cancelled',
++        )
++        with mock.patch.object(
++            objects.InstanceCheckpointOperation,
++            'close_proof',
++            return_value=proof.to_primitive(),
++        ):
++            self.assertRaises(
++                exception.CheckpointConflict,
++                self.ledger.release,
++                self.ctx,
++                ticket.id,
++            )
++        self.assertEqual(4096, self.usage()['artifact_bytes'])
++
++    def test_lost_refund_ack_releases_cell_guard_once(self):
++        ticket = self.reserve_admit()
++        self.complete(self.admission, ticket)
++        deleting = replace(
++            self.admission,
++            operation_id=uuids.delete_op,
++            key=replace(
++                self.admission.key,
++                kind='delete',
++                request_id=uuids.delete_request,
++            ),
++        )
++        self.complete(deleting, ticket)
++        self.ledger.release(self.ctx, ticket.id)
++        self.ledger.reconcile(self.ctx)
++        self.ledger.reconcile(self.ctx)
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            guard = cell_db.guard_get(ctx, uuids.instance)
++            self.assertEqual(0, guard['checkpoint_count'])
++            self.assertIsNone(guard['operation_id'])
++        self.assertEqual(0, self.usage()['artifact_bytes'])
+diff --git a/nova/tests/unit/db/api/test_migrations.py b/nova/tests/unit/db/api/test_migrations.py
+index 3756520..39feb2c 100644
+--- a/nova/tests/unit/db/api/test_migrations.py
++++ b/nova/tests/unit/db/api/test_migrations.py
+@@ -196,6 +196,15 @@ class NovaMigrationsWalk(
+         # removal without creating it first, which is dumb
+         pass
+ 
++    def _check_71be90d2c402(self, connection):
++        inspector = sqlalchemy.inspect(connection)
++        for name in ('checkpoint_project_usage', 'checkpoint_quota_tickets'):
++            self.assertIn(name, inspector.get_table_names())
++        unique = inspector.get_unique_constraints('checkpoint_quota_tickets')
++        self.assertIn(['operation_id'], [c['column_names'] for c in unique])
++        self.assertIn(['project_id', 'instance_uuid', 'request_id'],
++                      [c['column_names'] for c in unique])
++
+     def test_single_base_revision(self):
+         """Ensure we only have a single base revision.
+ 
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 3ac1d74..d6e210e 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1077,14 +1077,16 @@ class TestRegistry(test.NoDBTestCase):
+ # they come with a corresponding version bump in the affected
+ # objects
+ object_data = {
+-    'InstanceCheckpoint': '1.0-34525cf00914f9211abf6738ff70b4da',
++    'CheckpointQuotaTicketList': '1.0-9eef9c15e15020a0109f01c50e13d512',
++    'CheckpointQuotaTicket': '1.0-123c9a95dc1d0bcfc8aa604d0b84f236',
++    'InstanceCheckpoint': '1.0-cb5ed39f906933b5c5fffb66160eb464',
+     'InstanceCheckpointArtifact': '1.0-230a6b36d1ee8416232da223889e465e',
+     'InstanceCheckpointArtifactList': '1.0-980a2e851b91058a2b688bee649202ef',
+     'InstanceCheckpointDisk': '1.0-32b4b8527364c69b5b047d3534dc2f26',
+     'InstanceCheckpointDiskList': '1.0-980a2e851b91058a2b688bee649202ef',
+     'InstanceCheckpointGuard': '1.0-e82f95884bbb1b0d0d33d3da46211154',
+     'InstanceCheckpointList': '1.0-df8bec672e55a3a45b40eaded98ec218',
+-    'InstanceCheckpointOperation': '1.0-3b55229ba7e9019fa9370d6a93c3dcf5',
++    'InstanceCheckpointOperation': '1.0-6c6013918c1bbadc5b1a96574e975d11',
+     'InstanceCheckpointStep': '1.0-c93b4ee2e9176e4e97356aab8ea3dd0a',
+     'InstanceCheckpointStepList': '1.0-380130b03f40b317487ed802199130bb',
+     'Aggregate': '1.3-f315cb68906307ca2d1cca84d4753585',

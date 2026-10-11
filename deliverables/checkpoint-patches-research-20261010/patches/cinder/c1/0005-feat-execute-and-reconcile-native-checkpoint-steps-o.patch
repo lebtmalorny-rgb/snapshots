@@ -1,0 +1,582 @@
+From 026c718a0a25e668e74fe2ad10b7791a3e64ae04 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Tue, 6 Oct 2026 23:20:27 +0300
+Subject: [PATCH 05/10] feat: execute and reconcile native checkpoint steps
+ over RPC
+
+---
+ cinder/checkpoints/manager.py                 | 119 +++++++++
+ cinder/db/sqlalchemy/checkpoints.py           |  21 ++
+ cinder/exception.py                           |   5 +
+ cinder/tests/unit/checkpoints/test_db.py      |  12 +
+ cinder/tests/unit/checkpoints/test_manager.py | 240 ++++++++++++++++++
+ cinder/volume/manager.py                      |  13 +
+ cinder/volume/rpcapi.py                       |  59 ++++-
+ 7 files changed, 468 insertions(+), 1 deletion(-)
+ create mode 100644 cinder/checkpoints/manager.py
+ create mode 100644 cinder/tests/unit/checkpoints/test_manager.py
+
+diff --git a/cinder/checkpoints/manager.py b/cinder/checkpoints/manager.py
+new file mode 100644
+index 0000000..41bffc8
+--- /dev/null
++++ b/cinder/checkpoints/manager.py
+@@ -0,0 +1,119 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Native checkpoint dispatch. Claims precede I/O and never expire."""
++
++import json
++
++from cinder.checkpoints import contracts
++from cinder.checkpoints import guards
++from cinder import db
++from cinder import exception
++from cinder import objects
++from cinder.policies import checkpoints as policy
++from cinder.volume import volume_utils
++
++
++class CheckpointManager:
++    def __init__(self, volume_manager):
++        self.owner = volume_manager
++
++    def _volume(self, context, volume_id):
++        volume = objects.Volume.get_by_id(context, volume_id)
++        if volume.project_id != context.project_id:
++            raise exception.VolumeNotFound(volume_id=volume_id)
++        if (volume_utils.extract_host(volume.host or '') !=
++                volume_utils.extract_host(self.owner.host)):
++            raise exception.CheckpointConflict(reason='wrong_backend_worker')
++        if not self.owner.driver.initialized:
++            raise exception.CheckpointBackendUnavailable()
++        return volume
++
++    def capabilities(self, context, volume_id):
++        guards.require_service(context)
++        context.authorize(policy.READ_POLICY)
++        volume = self._volume(context, volume_id)
++        try:
++            return contracts.validate_capabilities(
++                self.owner.driver.get_checkpoint_capabilities(context, volume))
++        except Exception:
++            return contracts.unsupported_capabilities(
++                'unverified_capabilities')
++
++    def _load(self, context, step_id, generation):
++        guards.require_service(context)
++        context.authorize(policy.OPERATE_POLICY)
++        step = objects.CheckpointStep.get_by_id(context, step_id)
++        operation = objects.CheckpointOperation.get_by_id(
++            context, step.operation_id)
++        if (type(generation) is not int or generation != operation.generation
++                or generation != step.generation):
++            raise exception.CheckpointConflict(reason='stale_generation')
++        return step, operation
++
++    def _preflight(self, context, step, operation):
++        resource = next(r for r in operation.resources
++                        if r.id == step.resource_id)
++        volume = self._volume(context, resource.volume_id)
++        current = contracts.validate_capabilities(
++            self.capabilities(context, volume.id))
++        saved = json.loads(resource.capabilities_json)
++        if current['driver_identity'] != saved['driver_identity']:
++            raise exception.CheckpointConflict(reason='driver_profile_changed')
++        try:
++            snapshot = objects.Snapshot.get_by_id(
++                context, resource.snapshot_id)
++        except exception.SnapshotNotFound:
++            raise exception.CheckpointConflict(
++                reason='snapshot_record_missing')
++        if (snapshot.volume_id != volume.id or
++                snapshot.project_id != operation.project_id or
++                snapshot.volume_size != resource.volume_size or
++                volume.size != resource.volume_size):
++            raise exception.CheckpointConflict(reason='snapshot_mismatch')
++        if step.phase == 'revert' and snapshot.status != 'available':
++            raise exception.CheckpointConflict(reason='snapshot_not_available')
++        return volume, snapshot
++
++    def execute(self, context, step_id, generation):
++        step, operation = self._load(context, step_id, generation)
++        if operation.status == 'released' or step.status != 'prepared':
++            return
++        volume, snapshot = self._preflight(context, step, operation)
++        if not db.checkpoint_step_claim(context, step_id, generation,
++                                        self.owner.host):
++            return
++        methods = {
++            'snapshot': self.owner.driver.checkpoint_create_snapshot,
++            'revert': self.owner.driver.checkpoint_revert_to_snapshot,
++            'delete_snapshot': self.owner.driver.checkpoint_delete_snapshot,
++        }
++        try:
++            result = methods[step.phase](context, volume, snapshot, step_id)
++        except Exception:
++            # A transport or driver exception does not prove no effect.
++            # Do not copy backend messages, which may contain credentials.
++            result = {'status': 'unknown', 'error_code': 'driver_exception'}
++        db.checkpoint_step_finish(context, step_id, generation, result)
++
++    def reconcile(self, context, step_id, generation):
++        step, operation = self._load(context, step_id, generation)
++        if (operation.status == 'released' or step.status not in
++                ('dispatching', 'pending', 'unknown')):
++            return
++        volume, snapshot = self._preflight(context, step, operation)
++        try:
++            result = self.owner.driver.checkpoint_query_operation(
++                context, volume, snapshot, step_id, step.phase)
++        except Exception:
++            result = {'status': 'unknown', 'error_code': 'query_exception'}
++        db.checkpoint_step_finish(context, step_id, generation, result)
+diff --git a/cinder/db/sqlalchemy/checkpoints.py b/cinder/db/sqlalchemy/checkpoints.py
+index 6bfc77d..523d633 100644
+--- a/cinder/db/sqlalchemy/checkpoints.py
++++ b/cinder/db/sqlalchemy/checkpoints.py
+@@ -362,12 +362,33 @@ def step_claim(context, step_id, generation, executor_id):
+         return False
+     if not isinstance(executor_id, str) or not 0 < len(executor_id) <= 255:
+         raise exception.InvalidInput(reason='invalid_executor_id')
++    _dispatch_state(context, operation, step)
+     step.status = 'dispatching'
+     step.executor_id = executor_id
+     operation.status = 'running'
+     return True
+ 
+ 
++def _dispatch_state(context, operation, step):
++    # Recheck the entire volume set while holding the admission row locks.
++    # Never start a partial revert while another disk is still attached.
++    for resource in _resources(context, operation.checkpoint_id):
++        volume = _query(context, models.Volume).filter_by(
++            id=resource.volume_id).one()
++        attachments = _attachments(context, volume.id)
++        if operation.kind == 'revert':
++            if volume.status != 'available' or attachments:
++                _conflict('revert_requires_disconnected_volumes')
++        elif (volume.status not in ('available', 'in-use') or
++              len(attachments) > 1 or any(
++                  a.instance_uuid != operation.instance_uuid or
++                  a.attach_status != 'attached' for a in attachments)):
++            _conflict('attachment_conflict')
++        elif operation.kind == 'create' and step.phase == 'snapshot':
++            if len(attachments) != 1 or volume.status != 'in-use':
++                _conflict('attachment_conflict')
++
++
+ def _update_operation(context, operation):
+     statuses = {s.status for s in _steps(context, operation.id)}
+     if statuses & {'unknown', 'dispatching', 'pending'}:
+diff --git a/cinder/exception.py b/cinder/exception.py
+index d5dcfcb..ecad098 100644
+--- a/cinder/exception.py
++++ b/cinder/exception.py
+@@ -268,6 +268,11 @@ class ServiceUnavailable(Invalid):
+     message = _("Service is unavailable at this time.")
+ 
+ 
++class CheckpointBackendUnavailable(ServiceUnavailable):
++    code = 503
++    safe = True
++
++
+ class UnavailableDuringUpgrade(Invalid):
+     message = _('Cannot perform %(action)s during system upgrade.')
+ 
+diff --git a/cinder/tests/unit/checkpoints/test_db.py b/cinder/tests/unit/checkpoints/test_db.py
+index 4e2e6ae..44a9e3d 100644
+--- a/cinder/tests/unit/checkpoints/test_db.py
++++ b/cinder/tests/unit/checkpoints/test_db.py
+@@ -235,6 +235,18 @@ class CheckpointDBTests(CheckpointDBHelpers):
+         reverted = self.reserve(
+             self.values('revert', created['checkpoint_id']))
+         first = reverted['steps'][0]
++        self.assertRaises(exception.CheckpointConflict,
++                          db.checkpoint_step_claim, self.ctxt, first['id'],
++                          1, 'worker-one')
++        # Simulate successful authorized disconnect, implemented in Task 6.
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            self.ctxt.session.query(models.VolumeAttachment).filter(
++                models.VolumeAttachment.volume_id.in_(self.volumes)).update(
++                    {'deleted': True}, synchronize_session=False)
++            self.ctxt.session.query(models.Volume).filter(
++                models.Volume.id.in_(self.volumes)).update(
++                    {'status': 'available', 'attach_status': 'detached'},
++                    synchronize_session=False)
+         db.checkpoint_step_claim(self.ctxt, first['id'], 1, 'worker-one')
+         db.checkpoint_step_finish(self.ctxt, first['id'], 1,
+                                   {'status': 'succeeded'})
+diff --git a/cinder/tests/unit/checkpoints/test_manager.py b/cinder/tests/unit/checkpoints/test_manager.py
+new file mode 100644
+index 0000000..80b018d
+--- /dev/null
++++ b/cinder/tests/unit/checkpoints/test_manager.py
+@@ -0,0 +1,240 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from types import SimpleNamespace
++from unittest import mock
++
++import oslo_messaging
++from oslo_utils import timeutils
++
++from cinder.checkpoints import manager
++from cinder import db
++from cinder.db.sqlalchemy import api as sqla_api
++from cinder.db.sqlalchemy import models
++from cinder import exception
++from cinder import objects
++from cinder.tests.unit.checkpoints import fake_driver
++from cinder.tests.unit.checkpoints import test_api
++from cinder.tests.unit import test
++from cinder.volume import rpcapi
++
++
++class ManagerHelpers(test_api.APIHelpers):
++    def prepare_manager(self):
++        self.prepare_api()
++        self.driver = fake_driver.FakeCheckpointDriver()
++        self.driver.set_initialized()
++        self.owner = SimpleNamespace(
++            driver=self.driver, host='worker@backend', cluster=None,
++            _revert_to_snapshot_generic=mock.Mock())
++        for vid in self.volumes:
++            db.volume_update(self.ctxt, vid, {'host': self.owner.host})
++        self.manager = manager.CheckpointManager(self.owner)
++        self.rpc.get_checkpoint_capabilities.side_effect = (
++            lambda ctxt, vid, host: self.manager.capabilities(ctxt, vid))
++
++    def read(self, operation):
++        return self.api.get(self.ctxt, operation.id)
++
++    def execute(self, operation):
++        for step in operation.steps:
++            self.manager.execute(self.ctxt, step.id, operation.generation)
++
++    def available_checkpoint(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.execute(operation)
++        self.api.action(self.ctxt, operation.id, 'release', 1, 'commit')
++        return operation
++
++    def detach_for_worker_test(self):
++        # Simulate the authorized Nova attachment workflow; its implementation
++        # and API authorization are tested in test_attachment_scope.
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            self.ctxt.session.query(models.VolumeAttachment).filter(
++                models.VolumeAttachment.volume_id.in_(self.volumes)).update(
++                    {'deleted': True}, synchronize_session=False)
++            self.ctxt.session.query(models.Volume).filter(
++                models.Volume.id.in_(self.volumes)).update(
++                    {'status': 'available', 'attach_status': 'detached'},
++                    synchronize_session=False)
++
++
++class TestCheckpointManager(ManagerHelpers, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_manager()
++
++    def test_lost_reply_never_reexecutes(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        step = operation.steps[0]
++        self.driver.outcomes['snapshot'].append(RuntimeError('secret-token'))
++        self.manager.execute(self.ctxt, step.id, 1)
++        self.assertEqual('recovery_required', self.read(operation).status)
++        self.manager.execute(self.ctxt, step.id, 1)
++        self.assertEqual(1, self.driver.native_call_count)
++        self.manager.reconcile(self.ctxt, step.id, 1)
++        self.assertEqual(1, self.driver.native_call_count)
++        actual = next(s for s in self.read(operation).steps if s.id == step.id)
++        self.assertEqual('succeeded', actual.status)
++        self.assertNotIn('secret-token', str(actual))
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++    def test_two_rpc_deliveries_have_one_claim(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.execute(operation)
++        self.execute(operation)
++        self.assertEqual(2, self.driver.native_call_count)
++        self.assertEqual('succeeded', self.read(operation).status)
++
++    def test_pending_and_partial_outcomes_hold_all_locks(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.driver.outcomes['snapshot'].append({'status': 'pending'})
++        self.execute(operation)
++        self.assertEqual('recovery_required', self.read(operation).status)
++        self.assertRaises(exception.CheckpointConflict, self.api.action,
++                          self.ctxt, operation.id, 'release', 1, 'commit')
++        for step in operation.steps:
++            self.manager.reconcile(self.ctxt, step.id, 1)
++        self.assertEqual(2, self.driver.native_call_count)
++        self.assertEqual('succeeded', self.read(operation).status)
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++    def test_malformed_reply_is_unknown_and_safe(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.driver.outcomes['snapshot'].append({'secret': 'token'})
++        self.execute(operation)
++        self.assertEqual('recovery_required', self.read(operation).status)
++        step = next(s for s in self.read(operation).steps
++                    if s.status == 'unknown')
++        self.assertEqual('invalid_driver_result', step.error_code)
++
++    def test_partial_failure_retains_every_volume_lock(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.driver.outcomes['snapshot'].append({'status': 'failed_no_effect'})
++        self.execute(operation)
++        self.assertEqual('failed', self.read(operation).status)
++        self.assertRaises(exception.CheckpointConflict, self.api.action,
++                          self.ctxt, operation.id, 'release', 1, 'abort')
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++        self.assertEqual(1, len(self.driver.snapshots))
++
++    def test_stale_generation_and_wrong_worker_have_no_effect(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.assertRaises(exception.CheckpointConflict, self.manager.execute,
++                          self.ctxt, operation.steps[0].id, 2)
++        self.owner.host = 'different@backend'
++        self.assertRaises(exception.CheckpointConflict, self.execute,
++                          operation)
++        self.assertEqual(0, self.driver.native_call_count)
++
++    def test_changed_driver_profile_has_no_effect(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        caps = self.driver.get_checkpoint_capabilities(self.ctxt, None)
++        caps['driver_identity']['profile'] = 'other-profile'
++        self.mock_object(self.driver, 'get_checkpoint_capabilities',
++                         return_value=caps)
++        self.assertRaises(exception.CheckpointConflict, self.execute,
++                          operation)
++        self.assertEqual(0, self.driver.native_call_count)
++
++    def test_native_failure_never_calls_copy_fallback(self):
++        created = self.available_checkpoint()
++        self.payload.update(kind='revert', request_id=created.checkpoint_id)
++        operation = self.api.reserve(self.ctxt, self.payload)
++        self.assertRaises(exception.CheckpointConflict, self.execute,
++                          operation)
++        self.assertEqual(2, self.driver.native_call_count)
++        self.detach_for_worker_test()
++        self.driver.outcomes['revert'].append(RuntimeError('lost reply'))
++        self.execute(operation)
++        self.assertEqual('recovery_required', self.read(operation).status)
++        self.owner._revert_to_snapshot_generic.assert_not_called()
++        self.assertRaises(exception.CheckpointConflict, self.api.action,
++                          self.ctxt, operation.id, 'release', 1, 'abort')
++
++    def test_missing_snapshot_is_not_proof_of_backend_absence(self):
++        operation = self.api.reserve(self.ctxt, self.payload)
++        step = operation.steps[0]
++        self.driver.outcomes['snapshot'].append(RuntimeError('lost'))
++        self.manager.execute(self.ctxt, step.id, 1)
++        resource = next(r for r in operation.resources
++                        if r.id == step.resource_id)
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            self.ctxt.session.query(models.Snapshot).filter_by(
++                id=resource.snapshot_id).update({'deleted': True})
++        self.assertRaises(exception.CheckpointConflict, self.manager.reconcile,
++                          self.ctxt, step.id, 1)
++        self.assertEqual('recovery_required', self.read(operation).status)
++        self.assertEqual(1, self.driver.native_call_count)
++
++
++class TestCheckpointRPCGate(ManagerHelpers, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_manager()
++        self.real_rpc = rpcapi.VolumeAPI()
++        self.volume = objects.Volume.get_by_id(self.ctxt, self.volumes[0])
++        self.service = db.service_create(self.ctxt.elevated(), {
++            'host': self.owner.host, 'binary': 'cinder-volume',
++            'topic': 'cinder-volume', 'disabled': False,
++            'rpc_current_version': '3.21', 'object_current_version': '1.40',
++            'updated_at': timeutils.utcnow()})
++        self.mock_object(self.real_rpc.client, 'can_send_version',
++                         return_value=True)
++
++    def test_rpc_320_rejected_before_reserve(self):
++        db.service_update(self.ctxt.elevated(), self.service.id,
++                          {'rpc_current_version': '3.20'})
++        self.api.rpc = self.real_rpc
++        self.assertRaises(exception.CheckpointNotSupported, self.api.reserve,
++                          self.ctxt, self.payload)
++        self.assertEqual([], self.locks())
++        self.assertEqual(0, self.driver.native_call_count)
++
++    def test_old_object_cap_and_unconfirmed_target_rejected(self):
++        db.service_update(self.ctxt.elevated(), self.service.id,
++                          {'object_current_version': '1.39'})
++        self.assertRaises(exception.CheckpointNotSupported,
++                          self.real_rpc.assert_checkpoint_ready,
++                          self.ctxt, self.volume)
++        self.volume.host = 'absent@backend'
++        self.assertRaises(exception.ServiceUnavailable,
++                          self.real_rpc.assert_checkpoint_ready,
++                          self.ctxt, self.volume)
++
++    def test_current_target_and_versions_are_accepted(self):
++        self.real_rpc.assert_checkpoint_ready(self.ctxt, self.volume)
++
++    def test_capability_transport_failure_is_unavailable(self):
++        client = self.mock_object(self.real_rpc, '_get_cctxt')
++        client.return_value.call.side_effect = (
++            oslo_messaging.MessagingTimeout())
++        error = self.assertRaises(
++            exception.ServiceUnavailable,
++            self.real_rpc.get_checkpoint_capabilities,
++            self.ctxt, self.volume.id, self.owner.host)
++        self.assertEqual(503, error.code)
++
++    def test_new_rpcs_pin_321(self):
++        client = self.mock_object(self.real_rpc, '_get_cctxt')
++        for method, kind, kwargs in (
++                ('get_checkpoint_capabilities', 'call',
++                 {'volume_id': self.volume.id}),
++                ('execute_checkpoint_step', 'cast',
++                 {'step_id': self.volume.id, 'generation': 1}),
++                ('reconcile_checkpoint_step', 'cast',
++                 {'step_id': self.volume.id, 'generation': 1})):
++            getattr(self.real_rpc, method)(
++                self.ctxt, host=self.owner.host, **kwargs)
++            client.assert_called_with(self.owner.host, version='3.21')
++            getattr(client.return_value, kind).assert_called_with(
++                self.ctxt, method, **kwargs)
+diff --git a/cinder/volume/manager.py b/cinder/volume/manager.py
+index cbdc54a..525aeaa 100644
+--- a/cinder/volume/manager.py
++++ b/cinder/volume/manager.py
+@@ -59,6 +59,7 @@ from taskflow import exceptions as tfe
+ 
+ from cinder.backup import rpcapi as backup_rpcapi
+ from cinder.checkpoints import guards as checkpoint_guards
++from cinder.checkpoints import manager as checkpoint_manager
+ from cinder.common import constants
+ from cinder import compute
+ from cinder import context
+@@ -247,6 +248,18 @@ class VolumeManager(manager.CleanableManager,
+         'consistencygroup', 'volume_attachment', 'group', 'snapshots',
+         'use_quota'}
+ 
++    def get_checkpoint_capabilities(self, ctxt, volume_id):
++        return checkpoint_manager.CheckpointManager(self).capabilities(
++            ctxt, volume_id)
++
++    def execute_checkpoint_step(self, ctxt, step_id, generation):
++        checkpoint_manager.CheckpointManager(self).execute(
++            ctxt, step_id, generation)
++
++    def reconcile_checkpoint_step(self, ctxt, step_id, generation):
++        checkpoint_manager.CheckpointManager(self).reconcile(
++            ctxt, step_id, generation)
++
+     def _get_service(self,
+                      host: Optional[str] = None,
+                      binary: str = constants.VOLUME_BINARY) -> objects.Service:
+diff --git a/cinder/volume/rpcapi.py b/cinder/volume/rpcapi.py
+index dc1be6a..aafb115 100644
+--- a/cinder/volume/rpcapi.py
++++ b/cinder/volume/rpcapi.py
+@@ -14,8 +14,12 @@
+ 
+ from typing import Optional, Union
+ 
++import oslo_messaging
++from oslo_utils import versionutils
++
+ from cinder.common import constants
+ from cinder import context
++from cinder import exception
+ from cinder import objects
+ from cinder import quota
+ from cinder import rpc
+@@ -140,9 +144,10 @@ class VolumeAPI(rpc.RPCAPI):
+         3.18 - Add reimage method
+         3.19 - Add extend_volume_completion method
+         3.20 - Add image_snap parameter to reimage method
++        3.21 - Native checkpoint execution, query and scoped attachments
+     """
+ 
+-    RPC_API_VERSION = '3.20'
++    RPC_API_VERSION = '3.21'
+     RPC_DEFAULT_VERSION = '3.0'
+     TOPIC = constants.VOLUME_TOPIC
+     BINARY = constants.VOLUME_BINARY
+@@ -570,3 +575,55 @@ class VolumeAPI(rpc.RPCAPI):
+                        image_snap=image_snap)
+         else:
+             cctxt.cast(ctxt, 'reimage', volume=volume, image_meta=image_meta)
++
++    def assert_checkpoint_ready(self, ctxt, volume):
++        services = objects.ServiceList.get_all_by_binary(
++            ctxt.elevated(), self.BINARY)
++        target = volume_utils.extract_host(volume.service_topic_queue or '')
++        matching = [service for service in services if
++                    volume_utils.extract_host(service.cluster_name or
++                                              service.host or '') == target]
++        if not matching or not any(
++                s.is_up and not s.disabled for s in matching):
++            raise exception.CheckpointBackendUnavailable()
++        if not self.client.can_send_version('3.21'):
++            raise exception.CheckpointNotSupported(
++                reason='rpc_upgrade_required')
++        # Read actual service advertisements, not fallback-to-local or cached
++        # RPC defaults. Every participating volume service must be upgraded.
++        for service in services:
++            try:
++                ready = (versionutils.is_compatible(
++                    '3.21', service.rpc_current_version or '', same_major=True)
++                    and versionutils.is_compatible(
++                        '1.40', service.object_current_version or '',
++                        same_major=True))
++            except (ValueError, TypeError):
++                ready = False
++            if not ready:
++                raise exception.CheckpointNotSupported(
++                    reason='service_upgrade_required')
++        if not versionutils.is_compatible(
++                '1.40', self.determine_obj_version_cap(), same_major=True):
++            raise exception.CheckpointNotSupported(reason='object_cap_too_old')
++
++    @rpc.assert_min_rpc_version('3.21')
++    def get_checkpoint_capabilities(self, ctxt, volume_id, host):
++        cctxt = self._get_cctxt(host, version='3.21')
++        try:
++            return cctxt.call(ctxt, 'get_checkpoint_capabilities',
++                              volume_id=volume_id)
++        except oslo_messaging.MessagingException:
++            raise exception.CheckpointBackendUnavailable()
++
++    @rpc.assert_min_rpc_version('3.21')
++    def execute_checkpoint_step(self, ctxt, step_id, generation, host):
++        cctxt = self._get_cctxt(host, version='3.21')
++        cctxt.cast(ctxt, 'execute_checkpoint_step', step_id=step_id,
++                   generation=generation)
++
++    @rpc.assert_min_rpc_version('3.21')
++    def reconcile_checkpoint_step(self, ctxt, step_id, generation, host):
++        cctxt = self._get_cctxt(host, version='3.21')
++        cctxt.cast(ctxt, 'reconcile_checkpoint_step', step_id=step_id,
++                   generation=generation)

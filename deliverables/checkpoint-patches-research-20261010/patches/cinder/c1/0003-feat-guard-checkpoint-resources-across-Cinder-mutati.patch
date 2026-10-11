@@ -1,0 +1,1581 @@
+From 8ef06157d3da24ee53a69958d0dedc16cfbcdf48 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Tue, 6 Oct 2026 23:00:24 +0300
+Subject: [PATCH 03/10] feat: guard checkpoint resources across Cinder mutation
+ paths
+
+---
+ cinder/api/contrib/admin_actions.py           |   2 +
+ cinder/api/v3/attachments.py                  |   5 +-
+ cinder/backup/api.py                          |  30 +-
+ cinder/backup/manager.py                      |   6 +
+ cinder/checkpoints/guards.py                  |  64 ++++
+ cinder/db/api.py                              |  16 +
+ cinder/db/sqlalchemy/api.py                   |  61 ++++
+ cinder/db/sqlalchemy/checkpoints.py           | 172 +++++++++-
+ cinder/group/api.py                           |  10 +-
+ .../attachments/test_attachments_manager.py   |   2 +-
+ cinder/tests/unit/checkpoints/test_guards.py  | 322 ++++++++++++++++++
+ .../tests/unit/group/test_groups_manager.py   |   5 +-
+ cinder/transfer/api.py                        |   3 +
+ cinder/volume/api.py                          |  30 ++
+ cinder/volume/manager.py                      |  47 +++
+ 15 files changed, 751 insertions(+), 24 deletions(-)
+ create mode 100644 cinder/checkpoints/guards.py
+ create mode 100644 cinder/tests/unit/checkpoints/test_guards.py
+
+diff --git a/cinder/api/contrib/admin_actions.py b/cinder/api/contrib/admin_actions.py
+index bcfbbaa..19233eb 100644
+--- a/cinder/api/contrib/admin_actions.py
++++ b/cinder/api/contrib/admin_actions.py
+@@ -25,6 +25,7 @@ from cinder.api.openstack import wsgi
+ from cinder.api.schemas import admin_actions
+ from cinder.api import validation
+ from cinder import backup
++from cinder.checkpoints import guards as checkpoint_guards
+ from cinder import db
+ from cinder import exception
+ from cinder.i18n import _
+@@ -179,6 +180,7 @@ class VolumeAdminController(AdminController):
+         context = req.environ['cinder.context']
+         volume = objects.Volume.get_by_id(context, id)
+         self.authorize(context, 'reset_status', target_obj=volume)
++        checkpoint_guards.check_volume(context, volume, 'reset_status')
+ 
+         # at this point, we still don't know if we're going to
+         # reset the volume's state.  Need to check what the caller
+diff --git a/cinder/api/v3/attachments.py b/cinder/api/v3/attachments.py
+index a0cc86a..3e8caf8 100644
+--- a/cinder/api/v3/attachments.py
++++ b/cinder/api/v3/attachments.py
+@@ -196,7 +196,7 @@ class AttachmentsController(wsgi.Controller):
+                                                   instance_uuid,
+                                                   **args))
+         except (exception.NotAuthorized,
+-                exception.InvalidVolume):
++                exception.InvalidVolume, exception.CheckpointConflict):
+             raise
+         except exception.CinderException as ex:
+             err_msg = _(
+@@ -250,7 +250,8 @@ class AttachmentsController(wsgi.Controller):
+                 self.volume_api.attachment_update(context,
+                                                   attachment_ref,
+                                                   connector))
+-        except (exception.NotAuthorized, exception.Invalid):
++        except (exception.NotAuthorized, exception.Invalid,
++                exception.CheckpointConflict):
+             raise
+         except exception.CinderException as ex:
+             err_msg = (
+diff --git a/cinder/backup/api.py b/cinder/backup/api.py
+index e4d28a1..cb13ab3 100644
+--- a/cinder/backup/api.py
++++ b/cinder/backup/api.py
+@@ -29,6 +29,7 @@ from oslo_utils import excutils
+ from oslo_utils import strutils
+ 
+ from cinder.backup import rpcapi as backup_rpcapi
++from cinder.checkpoints import guards as checkpoint_guards
+ from cinder.common import constants
+ from cinder import context
+ from cinder.db import base
+@@ -227,6 +228,9 @@ class API(base.Base):
+                snapshot_id: Optional[str] = None,
+                metadata: Optional[dict] = None) -> 'objects.Backup':
+         """Make the RPC call to create a volume backup."""
++        checkpoint_guards.check_volume(context, volume_id, 'backup')
++        if snapshot_id:
++            checkpoint_guards.check_snapshot(context, snapshot_id, 'backup')
+         volume = self.volume_api.get(context, volume_id)
+         context.authorize(policy.CREATE_POLICY, target_obj=volume)
+         snapshot = None
+@@ -321,16 +325,20 @@ class API(base.Base):
+                 raise exception.InvalidBackup(reason=msg)
+ 
+         data_timestamp = None
+-        if snapshot_id:
+-            snapshot = objects.Snapshot.get_by_id(context, snapshot_id)
+-            data_timestamp = snapshot.created_at
+-            self.db.snapshot_update(
+-                context, snapshot_id,
+-                {'status': fields.SnapshotStatus.BACKING_UP})
+-        else:
+-            self.db.volume_update(context, volume_id,
+-                                  {'status': 'backing-up',
+-                                   'previous_status': previous_status})
++        try:
++            if snapshot_id:
++                snapshot = objects.Snapshot.get_by_id(context, snapshot_id)
++                data_timestamp = snapshot.created_at
++                self.db.snapshot_update(
++                    context, snapshot_id,
++                    {'status': fields.SnapshotStatus.BACKING_UP})
++            else:
++                self.db.volume_update(context, volume_id,
++                                      {'status': 'backing-up',
++                                       'previous_status': previous_status})
++        except exception.CheckpointConflict:
++            QUOTAS.rollback(context, reservations)
++            raise
+ 
+         kwargs = {
+             'user_id': context.user_id,
+@@ -379,6 +387,8 @@ class API(base.Base):
+                 volume_id: Optional[str] = None,
+                 name: Optional[str] = None) -> dict:
+         """Make the RPC call to restore a volume backup."""
++        if volume_id:
++            checkpoint_guards.check_volume(context, volume_id, 'restore')
+         backup = self.get(context, backup_id)
+         context.authorize(policy.RESTORE_POLICY, target_obj=backup)
+         if backup['status'] != fields.BackupStatus.AVAILABLE:
+diff --git a/cinder/backup/manager.py b/cinder/backup/manager.py
+index 897acd2..a49b463 100644
+--- a/cinder/backup/manager.py
++++ b/cinder/backup/manager.py
+@@ -47,6 +47,7 @@ from oslo_utils import importutils
+ from oslo_utils import timeutils
+ 
+ from cinder.backup import rpcapi as backup_rpcapi
++from cinder.checkpoints import guards as checkpoint_guards
+ from cinder import context
+ from cinder import exception
+ from cinder.i18n import _
+@@ -359,6 +360,10 @@ class BackupManager(manager.SchedulerDependentManager):
+     @utils.limit_operations
+     def create_backup(self, context, backup):
+         """Create volume backups using configured backup service."""
++        checkpoint_guards.check_volume(context, backup.volume_id, 'backup')
++        if backup.snapshot_id:
++            checkpoint_guards.check_snapshot(
++                context, backup.snapshot_id, 'backup')
+         volume_id = backup.volume_id
+         snapshot_id = backup.snapshot_id
+         volume = objects.Volume.get_by_id(context, volume_id)
+@@ -643,6 +648,7 @@ class BackupManager(manager.SchedulerDependentManager):
+         :param volume_is_new: The volume does not have stale data, so
+                               sparse backups can be restored as such.
+         """
++        checkpoint_guards.check_volume(context, volume_id, 'restore')
+         context.message_resource_id = backup.id
+         context.message_resource_type = message_field.Resource.VOLUME_BACKUP
+         context.message_action = message_field.Action.BACKUP_RESTORE
+diff --git a/cinder/checkpoints/guards.py b/cinder/checkpoints/guards.py
+new file mode 100644
+index 0000000..5f3d998
+--- /dev/null
++++ b/cinder/checkpoints/guards.py
+@@ -0,0 +1,64 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Checks at API/worker boundaries; atomic admission lives in the DB layer."""
++
++import contextlib
++import inspect
++
++import decorator
++
++from cinder import db
++from cinder import exception
++
++
++def _id(resource):
++    return resource if isinstance(resource, str) else resource['id']
++
++
++def check_volume(context, volume, action, operation_id=None, generation=None):
++    db.checkpoint_resource_guard(context, _id(volume), action)
++
++
++def check_snapshot(context, snapshot, action, operation_id=None,
++                   generation=None):
++    db.checkpoint_snapshot_guard(context, _id(snapshot), action)
++
++
++def validate_operation_scope(context, operation_id, generation, volume_id,
++                             action):
++    # A header or an admin role alone never grants an internal bypass.
++    raise exception.CheckpointServiceForbidden()
++
++
++@contextlib.contextmanager
++def connection(context, volume, action):
++    """Persist a barrier for legacy calls lacking their own pending status.
++
++    The SQL transaction ends before backend I/O. Failure leaves maintenance
++    visible to checkpoint admission; it is never an automatic checkpoint
++    unlock. Existing legacy recovery applies to these unprotected volumes.
++    """
++    volume_id = _id(volume)
++    previous = db.checkpoint_connection_begin(context, volume_id, action)
++    yield
++    db.checkpoint_connection_end(context, volume_id, previous)
++
++
++def connection_worker(action, volume_arg, context_arg='context'):
++    """Cover backend I/O and preserve the signature used by coordination."""
++    @decorator.decorator
++    def guarded(function, *args, **kwargs):
++        bound = inspect.getcallargs(function, *args, **kwargs)
++        with connection(bound[context_arg], bound[volume_arg], action):
++            return function(*args, **kwargs)
++    return guarded
+diff --git a/cinder/db/api.py b/cinder/db/api.py
+index e6b82f0..3d1272a 100644
+--- a/cinder/db/api.py
++++ b/cinder/db/api.py
+@@ -2024,3 +2024,19 @@ def checkpoint_resource_guard(context, volume_id, action):
+ 
+ def checkpoint_records(context, name, record_id=None):
+     return IMPL.checkpoint_records(context, name, record_id)
++
++
++def checkpoint_snapshot_guard(context, snapshot_id, action):
++    return IMPL.checkpoint_snapshot_guard(context, snapshot_id, action)
++
++
++def checkpoint_connection_begin(context, volume_id, action):
++    return IMPL.checkpoint_connection_begin(context, volume_id, action)
++
++
++def checkpoint_connection_end(context, volume_id, previous):
++    return IMPL.checkpoint_connection_end(context, volume_id, previous)
++
++
++def checkpoint_group_admission(context, group_id, add_volumes):
++    return IMPL.checkpoint_group_admission(context, group_id, add_volumes)
+diff --git a/cinder/db/sqlalchemy/api.py b/cinder/db/sqlalchemy/api.py
+index efa6358..8acb752 100644
+--- a/cinder/db/sqlalchemy/api.py
++++ b/cinder/db/sqlalchemy/api.py
+@@ -489,6 +489,7 @@ def _conditional_update(
+     query = model_query(
+         context, model, read_deleted=include_deleted, project_only=project_only
+     ).filter(*where_conds)
++    query = _checkpoint_guards().guard_update(context, model, query, values)
+ 
+     # NOTE(geguileo): Some DBs' update method are order dependent, and they
+     # behave differently depending on the order of the values, example on a
+@@ -940,6 +941,8 @@ def service_create(context, values):
+ def service_update(context, service_id, values, retry=True):
+     def _service_update(context, service_id, values):
+         query = _service_query(context, id=service_id)
++        query = _checkpoint_guards().guard_update(
++            context, models.Service, query, values)
+ 
+         if 'disabled' in values:
+             entity = query.column_descriptions[0]['entity']
+@@ -1143,6 +1146,8 @@ def cluster_update(context, cluster_id, values):
+     Raises ClusterNotFound if cluster does not exist.
+     """
+     query = _cluster_query(context, id=cluster_id)
++    query = _checkpoint_guards().guard_update(
++        context, models.Cluster, query, values)
+     result = query.update(values)
+     if not result:
+         raise exception.ClusterNotFound(id=cluster_id)
+@@ -1933,6 +1938,8 @@ def reservation_expire(context):
+ @require_admin_context
+ @main_context_manager.writer
+ def volume_attach(context, values):
++    _checkpoint_guards().resource_guard(
++        context, values['volume_id'], 'attachment')
+     volume_attachment_ref = models.VolumeAttachment()
+     if not values.get('id'):
+         values['id'] = str(uuid.uuid4())
+@@ -1965,6 +1972,7 @@ def volume_attached(
+     status settings.
+ 
+     """
++    _checkpoint_guards().guard_attachment(context, attachment_id)
+     attach_status = fields.VolumeAttachStatus.ATTACHED
+     volume_status = 'in-use'
+     if not mark_attached:
+@@ -2002,6 +2010,12 @@ def volume_attached(
+ @oslo_db_api.wrap_db_retry(max_retries=5, retry_on_deadlock=True)
+ @main_context_manager.writer
+ def volume_create(context, values):
++    if values.get('snapshot_id'):
++        _checkpoint_guards().snapshot_guard(
++            context, values['snapshot_id'], 'clone')
++    if values.get('source_volid'):
++        _checkpoint_guards().resource_guard(
++            context, values['source_volid'], 'clone')
+     values['volume_metadata'] = _metadata_refs(
+         values.get('metadata'),
+         models.VolumeMetadata,
+@@ -2122,6 +2136,7 @@ VOLUME_DEPENDENT_MODELS = frozenset(
+ @oslo_db_api.wrap_db_retry(max_retries=5, retry_on_deadlock=True)
+ @main_context_manager.writer
+ def volume_destroy(context, volume_id):
++    _checkpoint_guards().resource_guard(context, volume_id, 'delete')
+     now = timeutils.utcnow()
+     updated_values = {
+         'status': 'deleted',
+@@ -2185,6 +2200,8 @@ def _include_in_cluster(context, cluster, model, partial_rename, filters):
+             cluster = func.replace(getattr(model, field), value, cluster)
+ 
+     query = query.filter_by(**filters)
++    query = _checkpoint_guards().guard_update(
++        context, model, query, {'cluster_name': cluster})
+     result = query.update({'cluster_name': cluster}, synchronize_session=False)
+     return result
+ 
+@@ -2245,6 +2262,7 @@ def volume_detached(context, volume_id, attachment_id):
+     Volume attach_status will be changed to one of: attached, attaching,
+     detaching, reserved, or detached.
+     """
++    _checkpoint_guards().resource_guard(context, volume_id, 'attachment')
+ 
+     # NOTE(jdg): This is a funky band-aid for the earlier attempts at
+     # multiattach, it's a bummer because these things aren't really being used
+@@ -2593,6 +2611,7 @@ def volume_attachment_get_all_by_project(
+ @main_context_manager.writer
+ def attachment_destroy(context, attachment_id):
+     """Destroy the specified attachment record."""
++    _checkpoint_guards().guard_attachment(context, attachment_id)
+     utcnow = timeutils.utcnow()
+     query = model_query(context, models.VolumeAttachment).filter_by(
+         id=attachment_id
+@@ -3233,6 +3252,7 @@ def process_sort_params(
+ @require_context
+ @main_context_manager.writer
+ def volume_update(context, volume_id, values):
++    _checkpoint_guards().guard_volume_update(context, volume_id, values)
+     metadata = values.get('metadata')
+     if metadata is not None:
+         _volume_user_metadata_update(
+@@ -3261,6 +3281,8 @@ def volume_update(context, volume_id, values):
+ @require_context
+ @main_context_manager.writer
+ def volumes_update(context, values_list):
++    for item in sorted(values_list, key=lambda item: item['id']):
++        _checkpoint_guards().guard_volume_update(context, item['id'], item)
+     volume_refs = []
+     for values in values_list:
+         volume_id = values['id']
+@@ -3293,6 +3315,7 @@ def volumes_update(context, values_list):
+ @require_context
+ @main_context_manager.writer
+ def volume_attachment_update(context, attachment_id, values):
++    _checkpoint_guards().guard_attachment(context, attachment_id)
+     query = model_query(context, models.VolumeAttachment)
+     result = query.filter_by(id=attachment_id).update(values)
+     if not result:
+@@ -3313,6 +3336,7 @@ def volume_update_status_based_on_attachment(context, volume_id):
+     :param volume_id: id of volume to be updated
+     :returns: updated volume
+     """
++    _checkpoint_guards().resource_guard(context, volume_id, 'attachment')
+     volume_ref = _volume_get(context, volume_id)
+     # We need to get and update volume using same session because
+     # there is possibility that instance is deleted between the 'get'
+@@ -3736,6 +3760,8 @@ def volume_admin_metadata_update(
+ @handle_db_data_error
+ @main_context_manager.writer
+ def snapshot_create(context, values):
++    _checkpoint_guards().resource_guard(
++        context, values['volume_id'], 'snapshot')
+     values['snapshot_metadata'] = _metadata_refs(
+         values.get('metadata'), models.SnapshotMetadata
+     )
+@@ -3753,6 +3779,7 @@ def snapshot_create(context, values):
+ @oslo_db_api.wrap_db_retry(max_retries=5, retry_on_deadlock=True)
+ @main_context_manager.writer
+ def snapshot_destroy(context, snapshot_id):
++    _checkpoint_guards().snapshot_guard(context, snapshot_id, 'delete')
+     utcnow = timeutils.utcnow()
+     query = model_query(context, models.Snapshot).filter_by(id=snapshot_id)
+     entity = query.column_descriptions[0]['entity']
+@@ -4154,6 +4181,8 @@ def snapshot_get_all_active_by_window(
+ @require_context
+ @main_context_manager.writer
+ def snapshot_update(context, snapshot_id, values):
++    if set(values) - {'display_name', 'display_description', 'metadata'}:
++        _checkpoint_guards().snapshot_guard(context, snapshot_id, 'mutate')
+     query = model_query(context, models.Snapshot, project_only=True)
+     result = query.filter_by(id=snapshot_id).update(values)
+     if not result:
+@@ -6540,6 +6569,12 @@ def backup_get_all_active_by_window(context, begin, end=None, project_id=None):
+ @require_context
+ @main_context_manager.writer
+ def backup_create(context, values):
++    if values.get('snapshot_id'):
++        _checkpoint_guards().snapshot_guard(
++            context, values['snapshot_id'], 'backup')
++    if values.get('volume_id'):
++        _checkpoint_guards().resource_guard(
++            context, values['volume_id'], 'backup')
+     values['backup_metadata'] = _metadata_refs(
+         values.get('metadata'), models.BackupMetadata
+     )
+@@ -8741,3 +8776,29 @@ def checkpoint_resource_guard(context, volume_id, action):
+ def checkpoint_records(context, name, record_id=None):
+     from cinder.db.sqlalchemy import checkpoints
+     return checkpoints.records(context, name, record_id)
++
++
++def checkpoint_snapshot_guard(context, snapshot_id, action):
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints.snapshot_guard(context, snapshot_id, action)
++
++
++def checkpoint_connection_begin(context, volume_id, action):
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints.connection_begin(context, volume_id, action)
++
++
++def checkpoint_connection_end(context, volume_id, previous):
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints.connection_end(context, volume_id, previous)
++
++
++def _checkpoint_guards():
++    # Imported lazily: journal transitions use this backend's enginefacade.
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints
++
++
++def checkpoint_group_admission(context, group_id, add_volumes):
++    from cinder.db.sqlalchemy import checkpoints
++    return checkpoints.group_admission(context, group_id, add_volumes)
+diff --git a/cinder/db/sqlalchemy/checkpoints.py b/cinder/db/sqlalchemy/checkpoints.py
+index ebe88bc..7557445 100644
+--- a/cinder/db/sqlalchemy/checkpoints.py
++++ b/cinder/db/sqlalchemy/checkpoints.py
+@@ -18,6 +18,7 @@ call belongs in any of these short transactions. Journal rows are tombstones;
+ only temporary volume-lock rows are physically removed.
+ """
+ 
++import contextlib
+ import json
+ import uuid
+ 
+@@ -135,7 +136,22 @@ def _check_volume(context, volume, instance_uuid, kind):
+             volume.migration_status or volume.replication_status not in
+             (None, 'disabled', 'not-capable')):
+         _conflict('unsupported_volume_state')
++    if volume.host:
++        service = _current(_query(context, models.Service).filter_by(
++            host=volume.host.split('#')[0], topic='cinder-volume')).first()
++        if service and service.replication_status not in (
++                None, 'enabled', 'disabled'):
++            _conflict('backend_failover_in_progress')
++    if volume.cluster_name:
++        cluster = _current(_query(context, models.Cluster).filter_by(
++            name=volume.cluster_name.split('#')[0])).first()
++        if cluster and cluster.replication_status not in (
++                None, 'enabled', 'disabled'):
++            _conflict('backend_failover_in_progress')
+     attachments = _attachments(context, volume.id)
++    if ((attachments and volume.status != 'in-use') or
++            (not attachments and volume.status != 'available')):
++        _conflict('attachment_status_mismatch')
+     if (len(attachments) > 1 or (kind == 'create' and len(attachments) != 1)
+             or any(a.attach_status != 'attached' or
+                    a.instance_uuid != instance_uuid for a in attachments)):
+@@ -145,6 +161,12 @@ def _check_volume(context, volume, instance_uuid, kind):
+         models.Snapshot.status != 'available')).first()
+     if pending:
+         _conflict('snapshot_in_progress')
++    clones = _current(_query(context, models.Volume).filter(
++        models.Volume.source_volid == volume.id,
++        models.Volume.status.notin_(
++            ('available', 'in-use', 'deleted')))).first()
++    if clones:
++        _conflict('clone_in_progress')
+     return [a.id for a in attachments]
+ 
+ 
+@@ -418,18 +440,19 @@ def release(context, operation_id, generation, outcome):
+     return _as_dict(context, operation)
+ 
+ 
+-@api.require_context
+-@api.main_context_manager.writer
+-def resource_guard(context, volume_id, action):
++def _guard_volume(context, volume_id, action):
+     if action == 'read':
+         return
+-    _lock_volumes(context, [volume_id])
++    # Lock the same volume row used by checkpoint reserve before observing
++    # ownership, including when there are no journal records yet.
++    volume = _current(_query(context, models.Volume).filter_by(
++        id=volume_id)).first()
++    if volume is None:
++        return  # Preserve the caller's existing not-found behavior.
+     active = _current(_query(context, models.CheckpointVolumeLock).filter_by(
+         volume_id=volume_id)).first()
+     if active:
+         _conflict('volume_operation_active')
+-    # These source-only operations are allowed between reservations. Their
+-    # pending status is checked again by checkpoint admission.
+     if action in ('snapshot', 'backup', 'clone', 'upload'):
+         return
+     reference = _current(_query(context, models.CheckpointResource).filter_by(
+@@ -439,6 +462,123 @@ def resource_guard(context, volume_id, action):
+         _conflict('volume_has_checkpoints')
+ 
+ 
++@api.require_context
++@api.main_context_manager.writer
++def resource_guard(context, volume_id, action):
++    _guard_volume(context, volume_id, action)
++
++
++def _guard_snapshot(context, snapshot_id, action):
++    if action == 'read':
++        return
++    snapshot = _query(context, models.Snapshot).filter_by(
++        id=snapshot_id).first()
++    if snapshot:
++        # Ordinary snapshots of a protected volume can still be deleted
++        # between operations. Only checkpoint snapshots are long-lived refs.
++        _guard_volume(context, snapshot.volume_id, 'snapshot')
++    reference = _current(_query(context, models.CheckpointResource).filter_by(
++        snapshot_id=snapshot_id).filter(
++            models.CheckpointResource.status != 'deleted')).first()
++    if reference:
++        _conflict('protected_checkpoint_snapshot')
++
++
++@api.require_context
++@api.main_context_manager.writer
++def snapshot_guard(context, snapshot_id, action):
++    _guard_snapshot(context, snapshot_id, action)
++
++
++def guard_volume_update(context, volume_id, values):
++    # Cosmetic fields cannot release ownership or change volume identity.
++    if not set(values) - {'display_name', 'display_description', 'metadata',
++                          'updated_at', 'admin_metadata'}:
++        return
++    action = 'mutate'
++    status = values.get('status')
++    status_fields = {'status', 'previous_status', 'updated_at'}
++    if not set(values) - status_fields and isinstance(status, str):
++        if status == 'backing-up':
++            action = 'backup'
++        elif status == 'uploading':
++            action = 'upload'
++        elif status in ('available', 'in-use', 'error'):
++            volume = _current(_query(context, models.Volume).filter_by(
++                id=volume_id)).first()
++            if volume and volume.status in ('backing-up', 'uploading'):
++                action = 'backup'
++    _guard_volume(context, volume_id, action)
++
++
++def guard_attachment(context, attachment_id):
++    attachment = _query(context, models.VolumeAttachment).filter_by(
++        id=attachment_id).first()
++    if attachment:
++        _guard_volume(context, attachment.volume_id, 'attachment')
++
++
++def guard_update(context, model, query, values):
++    """Guard and constrain a bulk/CAS write to its locked admission set."""
++    if model in (models.Service, models.Cluster):
++        if 'replication_status' in values or 'active_backend_id' in values:
++            services = query.all()
++            for service in sorted(services, key=lambda item: item.id):
++                field = (models.Volume.host if model == models.Service
++                         else models.Volume.cluster_name)
++                name = (service.host if model == models.Service
++                        else service.name)
++                volumes = _query(context, models.Volume).filter(
++                    api._filter_host(field, name)).order_by(models.Volume.id)
++                for volume in volumes.all():
++                    _guard_volume(context, volume.id, 'failover')
++        return query
++    if model not in (models.Volume, models.Snapshot, models.VolumeAttachment):
++        return query
++    rows = query.with_entities(model.id).all()
++    ids = sorted(row[0] for row in rows)
++    if model == models.Volume:
++        for volume_id in ids:
++            guard_volume_update(context, volume_id, values)
++    else:
++        # Do not take a snapshot/attachment lock before its parent volume.
++        records = _query(context, model).filter(model.id.in_(ids)).all()
++        for row in sorted(records, key=lambda row: (row.volume_id, row.id)):
++            if model == models.Snapshot:
++                _guard_snapshot(context, row.id, 'mutate')
++            else:
++                _guard_volume(context, row.volume_id, 'attachment')
++    return query.filter(model.id.in_(ids))
++
++
++@api.require_context
++@api.main_context_manager.writer
++def connection_begin(context, volume_id, action):
++    _guard_volume(context, volume_id, action)
++    volume = _current(_query(context, models.Volume).filter_by(
++        id=volume_id)).first()
++    if not volume:
++        return None
++    if volume.status == 'maintenance':
++        _conflict('connection_operation_active')
++    if volume.status in ('available', 'in-use'):
++        previous = volume.status
++        volume.status = 'maintenance'
++        return previous
++    # An API-admitted operation already exposes a pending status.
++    return None
++
++
++@api.require_context
++@api.main_context_manager.writer
++def connection_end(context, volume_id, previous):
++    if previous is not None:
++        _current(_query(context, models.Volume).filter_by(
++            id=volume_id)).first()
++        _query(context, models.Volume).filter_by(
++            id=volume_id, status='maintenance').update({'status': previous})
++
++
+ RECORD_TYPES = {name: getattr(models, name) for name in (
+     'CheckpointInstance', 'CheckpointOperation', 'CheckpointResource',
+     'CheckpointStep', 'CheckpointVolumeLock')}
+@@ -472,3 +612,23 @@ def records(context, name, record_id=None):
+         raise exception.CheckpointOperationNotFound()
+     return [(_as_dict(context, row) if name == 'CheckpointOperation'
+              else dict(row)) for row in rows]
++
++
++@contextlib.contextmanager
++def group_admission(context, group_id, add_volumes):
++    """Persist group membership with the API's group-state CAS, before RPC.
++
++    The worker already retains failed additions in error state. Provisional
++    membership also prevents checkpoint admission before that worker runs.
++    """
++    with api.main_context_manager.writer.using(context):
++        volumes = []
++        for volume_id in sorted(set(add_volumes)):
++            _guard_volume(context, volume_id, 'group')
++            volume = _query(context, models.Volume).filter_by(
++                id=volume_id).first()
++            if volume:
++                volumes.append(volume)
++        yield
++        for volume in volumes:
++            volume.group_id = group_id
+diff --git a/cinder/group/api.py b/cinder/group/api.py
+index f23b52f..c896e15 100644
+--- a/cinder/group/api.py
++++ b/cinder/group/api.py
+@@ -24,6 +24,7 @@ from oslo_utils import excutils
+ from oslo_utils import timeutils
+ from oslo_utils import uuidutils
+ 
++from cinder.checkpoints import guards as checkpoint_guards
+ from cinder import db
+ from cinder.db import base
+ from cinder import exception
+@@ -669,9 +670,11 @@ class API(base.Base):
+             expected['status'] = c_fields.GroupStatus.AVAILABLE
+             fields['status'] = c_fields.GroupStatus.UPDATING
+ 
+-        if not group.conditional_update(fields, expected):
+-            msg = _("Group status must be available.")
+-            raise exception.InvalidGroup(reason=msg)
++        additions = add_volumes_new.split(',') if add_volumes_new else []
++        with db.checkpoint_group_admission(context, group.id, additions):
++            if not group.conditional_update(fields, expected):
++                msg = _("Group status must be available.")
++                raise exception.InvalidGroup(reason=msg)
+ 
+         # Do an RPC call only if the update request includes
+         # adding/removing volumes. add_volumes_new and remove_volumes_new
+@@ -722,6 +725,7 @@ class API(base.Base):
+                 add_volumes_list.remove(volume['id'])
+ 
+         for add_vol in add_volumes_list:
++            checkpoint_guards.check_volume(context, add_vol, 'group')
+             try:
+                 add_vol_ref = objects.Volume.get_by_id(context, add_vol)
+             except exception.VolumeNotFound:
+diff --git a/cinder/tests/unit/attachments/test_attachments_manager.py b/cinder/tests/unit/attachments/test_attachments_manager.py
+index 7b4a4bd..2b0373e 100644
+--- a/cinder/tests/unit/attachments/test_attachments_manager.py
++++ b/cinder/tests/unit/attachments/test_attachments_manager.py
+@@ -278,7 +278,7 @@ class AttachmentManagerTestCase(test.TestCase):
+         # Tests that attachment_delete does not call remove_export
+         # if _connection_terminate returns None indicating there is nothing
+         # to consider for the export.
+-        volume = mock.MagicMock()
++        volume = tests_utils.create_volume(self.context)
+         with mock.patch.object(self.manager.driver, '_initialized',
+                                create=True, new=True):
+             with mock.patch.object(self.manager.driver,
+diff --git a/cinder/tests/unit/checkpoints/test_guards.py b/cinder/tests/unit/checkpoints/test_guards.py
+new file mode 100644
+index 0000000..29dce59
+--- /dev/null
++++ b/cinder/tests/unit/checkpoints/test_guards.py
+@@ -0,0 +1,322 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import inspect
++from unittest import mock
++
++import eventlet
++from oslo_config import fixture as config_fixture
++from oslo_db.sqlalchemy import enginefacade
++from oslo_db.sqlalchemy import test_fixtures
++from oslotest import base as test_base
++
++from cinder.api.contrib import admin_actions
++from cinder.backup import api as backup_api
++from cinder.backup import manager as backup_manager
++from cinder.checkpoints import config
++from cinder.checkpoints import guards
++from cinder import db
++from cinder.db import migration
++from cinder.db.sqlalchemy import api as sqla_api
++from cinder import exception
++from cinder.group import api as group_api
++from cinder import objects
++from cinder.tests.unit.api import fakes
++from cinder.tests.unit.checkpoints import test_db
++from cinder.tests.unit import test
++from cinder.tests.unit import utils
++from cinder.transfer import api as transfer_api
++from cinder.volume import api as volume_api
++from cinder.volume import manager as volume_manager
++
++
++class TestGuards(test_db.CheckpointDBHelpers, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_volumes(count=1)
++        self.operation = self.reserve()
++        self.volume = objects.Volume.get_by_id(self.ctxt, self.volumes[0])
++        self.snapshot_id = self.operation['resources'][0]['snapshot_id']
++        self.snapshot = objects.Snapshot.get_by_id(self.ctxt, self.snapshot_id)
++        self.attachment = self.volume.volume_attachment[0]
++
++    def test_guard_applies_when_feature_disabled_and_admin(self):
++        config.CONF.set_override('enabled', False, group='checkpoint')
++        for action in ('delete', 'extend', 'retype', 'migrate', 'transfer',
++                       'restore', 'attach', 'detach', 'initialize',
++                       'terminate',
++                       'reset_status', 'group', 'failover', 'snapshot',
++                       'clone', 'backup', 'upload'):
++            with self.subTest(action=action):
++                self.assertRaises(exception.CheckpointConflict,
++                                  guards.check_volume, self.ctxt.elevated(),
++                                  self.volume, action)
++        guards.check_volume(self.ctxt, self.volume, 'read')
++        self.assertEqual(self.volume.id,
++                         objects.Volume.get_by_id(
++                             self.ctxt, self.volume.id).id)
++
++    def test_protected_resource_rejects_db_mutation(self):
++        # DB admission is the race boundary, even for direct admin updates.
++        for updates in ({'status': 'available'}, {'size': 2},
++                        {'volume_type_id': self.volume.volume_type_id},
++                        {'migration_status': 'starting'}, {'group_id': None},
++                        {'project_id': self.ctxt.project_id},
++                        {'replication_status': 'failing-over'}):
++            with self.subTest(updates=updates):
++                self.assertRaises(exception.CheckpointConflict,
++                                  db.volume_update, self.ctxt.elevated(),
++                                  self.volume.id, dict(updates))
++                self.assertRaises(exception.CheckpointConflict,
++                                  self.volume.conditional_update, updates)
++        self.assertRaises(exception.CheckpointConflict, db.volume_destroy,
++                          self.ctxt.elevated(), self.volume.id)
++        self.assertRaises(exception.CheckpointConflict, db.snapshot_update,
++                          self.ctxt, self.snapshot_id, {'status': 'available'})
++        self.assertRaises(exception.CheckpointConflict, db.snapshot_destroy,
++                          self.ctxt.elevated(), self.snapshot_id)
++        self.assertRaises(exception.CheckpointConflict, utils.create_snapshot,
++                          self.ctxt, self.volume.id)
++        self.assertRaises(exception.CheckpointConflict, utils.create_volume,
++                          self.ctxt, snapshot_id=self.snapshot_id)
++        self.assertRaises(exception.CheckpointConflict, utils.create_volume,
++                          self.ctxt, source_volid=self.volume.id)
++
++    def test_protected_attachments_reject_direct_db_changes(self):
++        attempts = (
++            (db.volume_attach, ({'volume_id': self.volume.id,
++                                 'instance_uuid': self.instance,
++                                 'attach_status': 'reserved'},)),
++            (db.volume_attachment_update, (self.attachment.id,
++                                           {'attach_status': 'attaching'})),
++            (db.attachment_destroy, (self.attachment.id,)),
++            (db.volume_detached, (self.volume.id, self.attachment.id)),
++            (db.volume_attached, (self.attachment.id, self.instance,
++                                  'compute-one', '/dev/vda')),
++        )
++        for function, args in attempts:
++            with self.subTest(function=function.__name__):
++                self.assertRaises(exception.CheckpointConflict, function,
++                                  self.ctxt.elevated(), *args)
++        self.assertEqual('attached', db.volume_attachment_get(
++            self.ctxt, self.attachment.id).attach_status)
++
++    def test_admin_cannot_disguise_reset_as_backup(self):
++        self.succeed(self.operation)
++        db.checkpoint_release(self.ctxt, self.operation['id'], 1, 'commit')
++        request = fakes.HTTPRequest.blank('/v3/volumes/id/action')
++        request.environ['cinder.context'] = self.ctxt.elevated()
++        controller = admin_actions.VolumeAdminController()
++        self.assertRaises(exception.CheckpointConflict,
++                          controller._reset_status, request, self.volume.id,
++                          {'os-reset_status': {'status': 'backing-up'}})
++
++    def test_read_only_source_backup_allowed_between_operations(self):
++        self.succeed(self.operation)
++        db.checkpoint_release(self.ctxt, self.operation['id'], 1, 'commit')
++        guards.check_volume(self.ctxt, self.volume, 'backup')
++        db.volume_update(self.ctxt, self.volume.id,
++                         {'status': 'backing-up', 'previous_status': 'in-use'})
++        self.assertRaises(exception.CheckpointConflict, self.reserve)
++        db.volume_update(self.ctxt, self.volume.id, {'status': 'in-use'})
++        self.assertRaises(exception.CheckpointConflict, guards.check_snapshot,
++                          self.ctxt, self.snapshot, 'backup')
++
++    def _assert_entry_guard(self, cls, names):
++        service = mock.MagicMock()
++        service.driver = mock.Mock()
++        values = dict(context=self.ctxt, ctxt=self.ctxt, volume=self.volume,
++                      volume_ref=self.volume, vref=self.volume,
++                      volume_id=self.volume.id, snapshot=self.snapshot,
++                      snapshot_id=self.snapshot_id,
++                      attachment_ref=self.attachment,
++                      attachment_id=self.attachment.id,
++                      attachment=self.attachment,
++                      instance_uuid=self.instance, connector={},
++                      volumes=[], add_volumes_list=[self.volume.id])
++        for name in names:
++            with self.subTest(entrypoint=name):
++                function = inspect.unwrap(getattr(cls, name))
++                signature = inspect.signature(function)
++                kwargs = {key: values.get(key) for key, param in
++                          signature.parameters.items() if key != 'self' and
++                          (param.default is inspect.Parameter.empty or
++                           key in values)}
++                self.assertRaises(exception.CheckpointConflict,
++                                  function, service, **kwargs)
++                self.assertEqual([], service.driver.mock_calls)
++
++    def test_api_rejects_mutation_before_rpc(self):
++        self._assert_entry_guard(volume_api.API, (
++            'delete', 'revert_to_snapshot', 'reserve_volume',
++            'unreserve_volume',
++            'begin_detaching', 'roll_detaching', 'attach', 'detach',
++            'initialize_connection', 'terminate_connection', 'accept_transfer',
++            'delete_snapshot', 'copy_volume_to_image', '_extend',
++            'migrate_volume', 'migrate_volume_completion', 'retype', 'reimage',
++            'attachment_create', 'attachment_update', 'attachment_delete'))
++
++    def test_stale_worker_messages_reject_before_driver(self):
++        self._assert_entry_guard(volume_manager.VolumeManager, (
++            'delete_volume', 'revert_to_snapshot', 'create_snapshot',
++            'delete_snapshot', 'attach_volume', 'detach_volume',
++            'initialize_connection', 'terminate_connection',
++            'initialize_connection_snapshot', 'terminate_connection_snapshot',
++            'remove_export_snapshot', 'accept_transfer', 'migrate_volume',
++            'migrate_volume_completion', 'update_migrated_volume',
++            'extend_volume', 'extend_volume_completion', 'retype', 'reimage',
++            'copy_volume_to_image', 'attachment_update', 'attachment_delete'))
++
++    def test_other_services_reject_before_quota_or_driver(self):
++        self._assert_entry_guard(transfer_api.API, ('create',))
++        self._assert_entry_guard(backup_api.API, ('create', 'restore'))
++        self._assert_entry_guard(backup_manager.BackupManager,
++                                 ('restore_backup',))
++        self._assert_entry_guard(group_api.API, ('_validate_add_volumes',))
++
++    def test_backup_losing_admission_rolls_back_quota(self):
++        service = mock.MagicMock()
++        service.volume_api.get.return_value = self.volume
++        service.db = db
++        with mock.patch.object(guards, 'check_volume'), mock.patch.object(
++                backup_api.QUOTAS, 'reserve', return_value=['reservation']), \
++                mock.patch.object(backup_api.QUOTAS, 'rollback') as rollback:
++            self.assertRaises(exception.CheckpointConflict,
++                              backup_api.API.create, service, self.ctxt,
++                              None, None, self.volume.id, None, force=True)
++            rollback.assert_called_once_with(self.ctxt, ['reservation'])
++
++    def test_group_admission_and_cas_rollback_together(self):
++        db.checkpoint_release(self.ctxt, self.operation['id'], 1, 'abort')
++        group_type = db.group_type_create(self.ctxt.elevated(),
++                                          {'name': 'checkpoint-test'})
++        group = utils.create_group(self.ctxt, group_type_id=group_type['id'])
++
++        def failing_update():
++            with db.checkpoint_group_admission(
++                    self.ctxt, group.id, [self.volume.id]):
++                group.conditional_update({'status': 'updating'},
++                                         {'status': 'available'})
++                raise ValueError('simulate losing group CAS')
++        self.assertRaises(ValueError, failing_update)
++        group.refresh()
++        self.assertEqual('available', group.status)
++        self.volume.refresh()
++        self.assertIsNone(self.volume.group_id)
++        with db.checkpoint_group_admission(
++                self.ctxt, group.id, [self.volume.id]):
++            group.conditional_update({'status': 'updating'},
++                                     {'status': 'available'})
++        self.assertRaises(exception.CheckpointConflict, self.reserve)
++
++    def test_backend_failover_admission_rejects_checkpoint_references(self):
++        service = utils.create_service(self.ctxt.elevated(), {
++            'host': self.volume.host.split('#')[0],
++            'topic': 'cinder-volume', 'replication_status': 'enabled'})
++        self.assertRaises(exception.CheckpointConflict,
++                          service.conditional_update,
++                          {'replication_status': 'failing-over'})
++        db.checkpoint_release(self.ctxt, self.operation['id'], 1, 'abort')
++        self.assertTrue(service.conditional_update(
++            {'replication_status': 'failing-over'}))
++        self.assertRaises(exception.CheckpointConflict, self.reserve)
++
++    def test_legacy_worker_barrier_survives_backend_exception(self):
++        db.checkpoint_release(self.ctxt, self.operation['id'], 1, 'abort')
++
++        @guards.connection_worker('initialize', 'volume')
++        def native(context, volume):
++            self.assertRaises(exception.CheckpointConflict, self.reserve,
++                              ctxt=test_db.service_context())
++            raise RuntimeError('simulate lost backend reply')
++
++        self.assertRaises(RuntimeError, native, self.ctxt, self.volume)
++        self.assertEqual('maintenance', db.volume_get(
++            self.ctxt, self.volume.id).status)
++        self.assertRaises(exception.CheckpointConflict, self.reserve)
++
++    def test_inconsistent_attachment_status_rejected(self):
++        db.checkpoint_release(self.ctxt, self.operation['id'], 1, 'abort')
++        db.volume_update(self.ctxt, self.volume.id, {'status': 'available'})
++        self.assertRaises(exception.CheckpointConflict, self.reserve)
++
++    def test_connection_admission_keeps_reservation_out(self):
++        db.checkpoint_release(self.ctxt, self.operation['id'], 1, 'abort')
++        previous = db.checkpoint_connection_begin(self.ctxt, self.volume.id,
++                                                  'initialize')
++        self.assertRaises(exception.CheckpointConflict, self.reserve)
++        db.checkpoint_connection_end(self.ctxt, self.volume.id, previous)
++        self.reserve()
++        self.assertRaises(exception.CheckpointConflict,
++                          db.checkpoint_connection_begin, self.ctxt,
++                          self.volume.id, 'initialize')
++
++    def test_unprotected_resources_keep_normal_mutations(self):
++        db.checkpoint_release(self.ctxt, self.operation['id'], 1, 'abort')
++        db.volume_update(self.ctxt, self.volume.id, {'size': 7})
++        db.volume_detached(self.ctxt.elevated(), self.volume.id,
++                           self.attachment.id)
++        self.assertEqual(7, db.volume_get(self.ctxt, self.volume.id).size)
++        self.assertEqual('available', db.volume_get(
++            self.ctxt, self.volume.id).status)
++
++
++class GuardConcurrency(test_db.CheckpointDBHelpers):
++    def setUp(self):
++        super().setUp()
++        self.useFixture(config_fixture.Config()).config(
++            connection='sqlite://', group='database')
++        engine = enginefacade.writer.get_engine()
++        migration.db_sync(engine=engine)
++        self.addCleanup(sqla_api.main_context_manager.patch_engine(engine))
++        self.prepare_volumes(count=1)
++
++    def test_reserve_races_attachment(self):
++        gate = eventlet.event.Event()
++        outcomes = []
++
++        def mutate(kind):
++            ctxt = test_db.service_context()
++            gate.wait()
++            try:
++                if kind == 'checkpoint':
++                    self.reserve(ctxt=ctxt)
++                else:
++                    db.volume_attach(ctxt.elevated(), {
++                        'volume_id': self.volumes[0],
++                        'instance_uuid': self.instance,
++                        'attach_status': 'reserved'})
++                outcomes.append(kind)
++            except exception.CheckpointConflict:
++                outcomes.append(None)
++
++        pool = eventlet.GreenPool(size=2)
++        for kind in ('checkpoint', 'attachment'):
++            pool.spawn_n(mutate, kind)
++        gate.send()
++        pool.waitall()
++        self.assertEqual(2, len(outcomes))
++        self.assertEqual(1, sum(result is not None for result in outcomes))
++
++
++class TestGuardMySQL(GuardConcurrency,
++                     test_fixtures.OpportunisticDBTestMixin,
++                     test_base.BaseTestCase):
++    FIXTURE = test_fixtures.MySQLOpportunisticFixture
++    SKIP_ON_UNAVAILABLE_DB = False
++
++
++class TestGuardPostgreSQL(GuardConcurrency,
++                          test_fixtures.OpportunisticDBTestMixin,
++                          test_base.BaseTestCase):
++    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
++    SKIP_ON_UNAVAILABLE_DB = False
+diff --git a/cinder/tests/unit/group/test_groups_manager.py b/cinder/tests/unit/group/test_groups_manager.py
+index d4d6f07..5fed533 100644
+--- a/cinder/tests/unit/group/test_groups_manager.py
++++ b/cinder/tests/unit/group/test_groups_manager.py
+@@ -346,12 +346,13 @@ class GroupManagerTestCase(test.TestCase):
+             'group_type': type_id
+         }
+         self.assertEqual(fields.GroupStatus.AVAILABLE, grp.status)
+-        self.assertEqual(10, len(self.notifier.notifications),
++        # Provisional admission includes the added volume in update.start.
++        self.assertEqual(11, len(self.notifier.notifications),
+                          self.notifier.notifications)
+         msg = self.notifier.notifications[6]
+         self.assertEqual('group.update.start', msg['event_type'])
+         self.assertDictEqual(expected, msg['payload'])
+-        msg = self.notifier.notifications[8]
++        msg = self.notifier.notifications[9]
+         self.assertEqual('group.update.end', msg['event_type'])
+         self.assertDictEqual(expected, msg['payload'])
+         grpvolumes = db.volume_get_all_by_generic_group(self.context, group.id)
+diff --git a/cinder/transfer/api.py b/cinder/transfer/api.py
+index 4871802..656b3c2 100644
+--- a/cinder/transfer/api.py
++++ b/cinder/transfer/api.py
+@@ -27,6 +27,7 @@ from oslo_log import log as logging
+ from oslo_utils import excutils
+ from oslo_utils import strutils
+ 
++from cinder.checkpoints import guards as checkpoint_guards
+ from cinder.db import base
+ from cinder import exception
+ from cinder.i18n import _
+@@ -131,6 +132,7 @@ class API(base.Base):
+     def create(self, context, volume_id, display_name, no_snapshots=False,
+                allow_encrypted=False):
+         """Creates an entry in the transfers table."""
++        checkpoint_guards.check_volume(context, volume_id, 'transfer')
+         LOG.info("Generating transfer record for volume %s", volume_id)
+         volume_ref = objects.Volume.get_by_id(context, volume_id)
+         context.authorize(policy.CREATE_POLICY, target_obj=volume_ref)
+@@ -247,6 +249,7 @@ class API(base.Base):
+             raise exception.InvalidAuthKey(reason=msg)
+ 
+         volume_id = transfer['volume_id']
++        checkpoint_guards.check_volume(context, volume_id, 'transfer')
+         vol_ref = objects.Volume.get_by_id(context.elevated(), volume_id)
+         if vol_ref['consistencygroup_id']:
+             msg = _("Volume %s must not be part of a consistency "
+diff --git a/cinder/volume/api.py b/cinder/volume/api.py
+index e981bff..42c2632 100644
+--- a/cinder/volume/api.py
++++ b/cinder/volume/api.py
+@@ -32,6 +32,7 @@ from oslo_utils import versionutils
+ import webob
+ 
+ from cinder.api import common
++from cinder.checkpoints import guards as checkpoint_guards
+ from cinder.common import constants
+ from cinder import compute
+ from cinder import context
+@@ -236,6 +237,10 @@ class API(base.Base):
+                source_group=None,
+                backup: Optional[objects.Backup] = None):
+ 
++        if snapshot:
++            checkpoint_guards.check_snapshot(context, snapshot, 'clone')
++        if source_volume:
++            checkpoint_guards.check_volume(context, source_volume, 'clone')
+         if image_id:
+             context.authorize(vol_policy.CREATE_FROM_IMAGE_POLICY)
+         else:
+@@ -388,6 +393,7 @@ class API(base.Base):
+                            volume: objects.Volume,
+                            snapshot: objects.Snapshot) -> None:
+         """revert a volume to a snapshot"""
++        checkpoint_guards.check_volume(context, volume, 'revert')
+         context.authorize(vol_action_policy.REVERT_POLICY,
+                           target_obj=volume)
+         v_res = volume.update_single_status_where(
+@@ -417,6 +423,7 @@ class API(base.Base):
+                unmanage_only: bool = False,
+                cascade: bool = False,
+                shred: bool = False) -> None:
++        checkpoint_guards.check_volume(context, volume, 'delete')
+         context.authorize(vol_policy.DELETE_POLICY, target_obj=volume)
+         if context.is_admin and context.project_id != volume.project_id:
+             project_id = volume.project_id
+@@ -752,6 +759,7 @@ class API(base.Base):
+     def reserve_volume(self,
+                        context: context.RequestContext,
+                        volume: objects.Volume) -> None:
++        checkpoint_guards.check_volume(context, volume, 'attach')
+         context.authorize(vol_action_policy.RESERVE_POLICY, target_obj=volume)
+         expected = {'multiattach': volume.multiattach,
+                     'status': (('available', 'in-use') if volume.multiattach
+@@ -773,6 +781,7 @@ class API(base.Base):
+     def unreserve_volume(self,
+                          context: context.RequestContext,
+                          volume: objects.Volume) -> None:
++        checkpoint_guards.check_volume(context, volume, 'attach')
+         context.authorize(vol_action_policy.UNRESERVE_POLICY,
+                           target_obj=volume)
+         expected = {'status': 'attaching'}
+@@ -794,6 +803,7 @@ class API(base.Base):
+     def begin_detaching(self,
+                         context: context.RequestContext,
+                         volume: objects.Volume) -> None:
++        checkpoint_guards.check_volume(context, volume, 'detach')
+         context.authorize(vol_action_policy.BEGIN_DETACHING_POLICY,
+                           target_obj=volume)
+         # If we are in the middle of a volume migration, we don't want the
+@@ -817,6 +827,7 @@ class API(base.Base):
+     def roll_detaching(self,
+                        context: context.RequestContext,
+                        volume: objects.Volume) -> None:
++        checkpoint_guards.check_volume(context, volume, 'detach')
+         context.authorize(vol_action_policy.ROLL_DETACHING_POLICY,
+                           target_obj=volume)
+         volume.conditional_update({'status': 'in-use'},
+@@ -831,6 +842,7 @@ class API(base.Base):
+                host_name: str,
+                mountpoint: str,
+                mode: str) -> objects.VolumeAttachment:
++        checkpoint_guards.check_volume(context, volume, 'attach')
+         context.authorize(vol_action_policy.ATTACH_POLICY,
+                           target_obj=volume)
+         if volume.status == 'maintenance':
+@@ -862,6 +874,7 @@ class API(base.Base):
+                context: context.RequestContext,
+                volume: objects.Volume,
+                attachment_id: str) -> None:
++        checkpoint_guards.check_volume(context, volume, 'detach')
+         context.authorize(vol_action_policy.DETACH_POLICY,
+                           target_obj=volume)
+         self.attachment_deletion_allowed(context, attachment_id, volume)
+@@ -882,6 +895,7 @@ class API(base.Base):
+                               context: context.RequestContext,
+                               volume: objects.Volume,
+                               connector: dict) -> dict:
++        checkpoint_guards.check_volume(context, volume, 'initialize')
+         context.authorize(vol_action_policy.INITIALIZE_POLICY,
+                           target_obj=volume)
+         if volume.status == 'maintenance':
+@@ -916,6 +930,7 @@ class API(base.Base):
+                              volume: objects.Volume,
+                              connector: dict,
+                              force: bool = False) -> None:
++        checkpoint_guards.check_volume(context, volume, 'terminate')
+         context.authorize(vol_action_policy.TERMINATE_POLICY,
+                           target_obj=volume)
+         self.attachment_deletion_allowed(context, None, volume)
+@@ -934,6 +949,7 @@ class API(base.Base):
+                         new_user: str,
+                         new_project: str,
+                         no_snapshots: bool = False) -> dict:
++        checkpoint_guards.check_volume(context, volume, 'transfer')
+         if volume['status'] == 'maintenance':
+             LOG.info('Unable to accept transfer for volume, '
+                      'because it is in maintenance.', resource=volume)
+@@ -987,6 +1003,7 @@ class API(base.Base):
+             commit_quota: bool = True,
+             group_snapshot_id: Optional[str] = None,
+             allow_in_use: bool = False) -> objects.Snapshot:
++        checkpoint_guards.check_volume(context, volume, 'snapshot')
+         self._create_snapshot_in_db_validate(context, volume)
+ 
+         utils.check_metadata_properties(metadata)
+@@ -1225,6 +1242,7 @@ class API(base.Base):
+                         snapshot: objects.Snapshot,
+                         force: bool = False,
+                         unmanage_only: bool = False) -> None:
++        checkpoint_guards.check_snapshot(context, snapshot, 'delete_snapshot')
+         context.authorize(snapshot_policy.DELETE_POLICY,
+                           target_obj=snapshot)
+         if not unmanage_only:
+@@ -1491,6 +1509,7 @@ class API(base.Base):
+                              metadata: dict[str, str],
+                              force: bool) -> dict[str, Optional[str]]:
+         """Create a new image from the specified volume."""
++        checkpoint_guards.check_volume(context, volume, 'upload')
+         if not CONF.enable_force_upload and force:
+             LOG.info("Force upload to image is disabled, "
+                      "Force option will be ignored.",
+@@ -1561,6 +1580,7 @@ class API(base.Base):
+                 volume: objects.Volume,
+                 new_size: int,
+                 attached: bool = False) -> None:
++        checkpoint_guards.check_volume(context, volume, 'extend')
+         value = {'status': 'extending',
+                  'previous_status': volume.status}
+         expected: dict
+@@ -1690,6 +1710,7 @@ class API(base.Base):
+                                  context: context.RequestContext,
+                                  volume: objects.Volume,
+                                  error: bool):
++        checkpoint_guards.check_volume(context, volume, 'extend')
+         context.authorize(vol_action_policy.EXTEND_COMPLETE_POLICY,
+                           target_obj=volume)
+ 
+@@ -1736,6 +1757,7 @@ class API(base.Base):
+                        force_copy: bool,
+                        lock_volume: bool) -> None:
+         """Migrate the volume to the specified host or cluster."""
++        checkpoint_guards.check_volume(context, volume, 'migrate')
+         elevated = context.elevated()
+         context.authorize(vol_action_policy.MIGRATE_POLICY,
+                           target_obj=volume)
+@@ -1828,6 +1850,7 @@ class API(base.Base):
+                                   volume: objects.Volume,
+                                   new_volume: objects.Volume,
+                                   error: bool) -> str:
++        checkpoint_guards.check_volume(context, volume, 'migrate')
+         context.authorize(vol_action_policy.MIGRATE_COMPLETE_POLICY,
+                           target_obj=volume)
+         if not (volume.migration_status or new_volume.migration_status):
+@@ -1891,6 +1914,7 @@ class API(base.Base):
+                new_type: Union[str, objects.VolumeType],
+                migration_policy: Optional[str] = None) -> None:
+         """Attempt to modify the type associated with an existing volume."""
++        checkpoint_guards.check_volume(context, volume, 'retype')
+         context.authorize(vol_action_policy.RETYPE_POLICY, target_obj=volume)
+ 
+         # Support specifying volume type by ID or name
+@@ -2489,6 +2513,7 @@ class API(base.Base):
+             connector: Optional[dict] = None,
+             attach_mode: Optional[str] = 'null') -> objects.VolumeAttachment:
+         """Create an attachment record for the specified volume."""
++        checkpoint_guards.check_volume(ctxt, volume_ref, 'attachment')
+         ctxt.authorize(attachment_policy.CREATE_POLICY, target_obj=volume_ref)
+         connection_info = {}
+         if "error" in volume_ref.status:
+@@ -2537,6 +2562,8 @@ class API(base.Base):
+                           attachment_ref: objects.VolumeAttachment,
+                           connector) -> objects.VolumeAttachment:
+         """Update an existing attachment record."""
++        checkpoint_guards.check_volume(
++            ctxt, attachment_ref.volume_id, 'attachment')
+         # Valid items to update (connector includes mode and mountpoint):
+         #   1. connector (required)
+         #     a. mode (if None use value from attachment_ref)
+@@ -2672,6 +2699,8 @@ class API(base.Base):
+                           ctxt: context.RequestContext,
+                           attachment) -> objects.VolumeAttachmentList:
+         # Check if policy allows user to delete attachment
++        checkpoint_guards.check_volume(
++            ctxt, attachment.volume_id, 'attachment')
+         ctxt.authorize(attachment_policy.DELETE_POLICY,
+                        target_obj=attachment)
+ 
+@@ -2703,6 +2732,7 @@ class API(base.Base):
+ 
+     def reimage(self, context, volume, image_id, reimage_reserved=False,
+                 image_snap=None):
++        checkpoint_guards.check_volume(context, volume, 'reimage')
+         if volume.status in ['reserved']:
+             context.authorize(vol_action_policy.REIMAGE_RESERVED_POLICY,
+                               target_obj=volume)
+diff --git a/cinder/volume/manager.py b/cinder/volume/manager.py
+index 3d83578..cbdc54a 100644
+--- a/cinder/volume/manager.py
++++ b/cinder/volume/manager.py
+@@ -58,6 +58,7 @@ import requests
+ from taskflow import exceptions as tfe
+ 
+ from cinder.backup import rpcapi as backup_rpcapi
++from cinder.checkpoints import guards as checkpoint_guards
+ from cinder.common import constants
+ from cinder import compute
+ from cinder import context
+@@ -747,6 +748,13 @@ class VolumeManager(manager.CleanableManager,
+                       filter_properties=None,
+                       allow_reschedule=True) -> ovo_fields.UUIDField:
+         """Creates the volume."""
++        checkpoint_guards.check_volume(context, volume, 'create')
++        if volume.snapshot_id:
++            checkpoint_guards.check_snapshot(
++                context, volume.snapshot_id, 'clone')
++        if volume.source_volid:
++            checkpoint_guards.check_volume(
++                context, volume.source_volid, 'clone')
+         # Log about unsupported drivers
+         volume_utils.log_unsupported_driver_warning(self.driver)
+ 
+@@ -991,6 +999,7 @@ class VolumeManager(manager.CleanableManager,
+            If deleting the temp volume for backup, we want to skip
+            quotas but we need database updates for the volume.
+       """
++        checkpoint_guards.check_volume(context, volume, 'delete')
+ 
+         context = context.elevated()
+ 
+@@ -1200,6 +1209,7 @@ class VolumeManager(manager.CleanableManager,
+         2.2. try the generic way to revert volume if driver's method is missing
+         3.   delete the backup snapshot
+         """
++        checkpoint_guards.check_volume(context, volume, 'revert')
+         backup_snapshot = None
+         try:
+             LOG.info("Start to perform revert to snapshot process.")
+@@ -1280,6 +1290,7 @@ class VolumeManager(manager.CleanableManager,
+     @objects.Snapshot.set_workers
+     def create_snapshot(self, context, snapshot) -> ovo_fields.UUIDField:
+         """Creates and exports the snapshot."""
++        checkpoint_guards.check_volume(context, snapshot.volume_id, 'snapshot')
+         context = context.elevated()
+ 
+         self._notify_about_snapshot_usage(
+@@ -1357,6 +1368,7 @@ class VolumeManager(manager.CleanableManager,
+                         snapshot: objects.Snapshot,
+                         unmanage_only: bool = False) -> Optional[bool]:
+         """Deletes and unexports snapshot."""
++        checkpoint_guards.check_snapshot(context, snapshot, 'delete_snapshot')
+         context = context.elevated()
+         snapshot._context = context
+         project_id = snapshot.project_id
+@@ -1437,10 +1449,12 @@ class VolumeManager(manager.CleanableManager,
+         return None
+ 
+     @coordination.synchronized('{volume_id}')
++    @checkpoint_guards.connection_worker('attach_volume', 'volume_id')
+     def attach_volume(self, context, volume_id, instance_uuid, host_name,
+                       mountpoint, mode,
+                       volume=None) -> objects.VolumeAttachment:
+         """Updates db to show volume is attached."""
++        checkpoint_guards.check_volume(context, volume_id, 'attach')
+         # FIXME(lixiaoy1): Remove this in v4.0 of RPC API.
+         if volume is None:
+             # For older clients, mimic the old behavior and look
+@@ -1526,9 +1540,11 @@ class VolumeManager(manager.CleanableManager,
+         return attachment
+ 
+     @coordination.synchronized('{volume_id}-{f_name}')
++    @checkpoint_guards.connection_worker('detach_volume', 'volume_id')
+     def detach_volume(self, context, volume_id, attachment_id=None,
+                       volume=None) -> None:
+         """Updates db to show volume is detached."""
++        checkpoint_guards.check_volume(context, volume_id, 'detach')
+         # TODO(vish): refactor this into a more general "unreserve"
+         # FIXME(lixiaoy1): Remove this in v4.0 of RPC API.
+         if volume is None:
+@@ -1803,6 +1819,7 @@ class VolumeManager(manager.CleanableManager,
+         'id', 'container_format', 'disk_format'
+ 
+         """
++        checkpoint_guards.check_volume(context, volume_id, 'upload')
+         payload: dict = {'volume_id': volume_id, 'image_id': image_meta['id']}
+         image_service = None
+         try:
+@@ -1935,6 +1952,7 @@ class VolumeManager(manager.CleanableManager,
+ 
+         return conn_info
+ 
++    @checkpoint_guards.connection_worker('initialize_connection', 'volume')
+     def initialize_connection(self,
+                               context,
+                               volume: objects.Volume,
+@@ -1981,6 +1999,7 @@ class VolumeManager(manager.CleanableManager,
+             various places, so it should not contain any non-json data types.
+ 
+         """
++        checkpoint_guards.check_volume(context, volume, 'initialize')
+         # TODO(jdg): Add deprecation warning
+         volume_utils.require_driver_initialized(self.driver)
+         try:
+@@ -2035,6 +2054,7 @@ class VolumeManager(manager.CleanableManager,
+                                        ctxt,
+                                        snapshot_id: ovo_fields.UUIDField,
+                                        connector: dict) -> dict:
++        checkpoint_guards.check_snapshot(ctxt, snapshot_id, 'export_snapshot')
+         volume_utils.require_driver_initialized(self.driver)
+         snapshot = objects.Snapshot.get_by_id(ctxt, snapshot_id)
+         try:
+@@ -2094,6 +2114,7 @@ class VolumeManager(manager.CleanableManager,
+                  resource=snapshot)
+         return conn
+ 
++    @checkpoint_guards.connection_worker('terminate_connection', 'volume_id')
+     def terminate_connection(self,
+                              context,
+                              volume_id: ovo_fields.UUIDField,
+@@ -2103,6 +2124,7 @@ class VolumeManager(manager.CleanableManager,
+ 
+         The format of connector is the same as for initialize_connection.
+         """
++        checkpoint_guards.check_volume(context, volume_id, 'terminate')
+         volume_utils.require_driver_initialized(self.driver)
+ 
+         volume_ref = objects.Volume.get_by_id(context, volume_id)
+@@ -2122,6 +2144,7 @@ class VolumeManager(manager.CleanableManager,
+                                       snapshot_id: ovo_fields.UUIDField,
+                                       connector: dict,
+                                       force=False) -> None:
++        checkpoint_guards.check_snapshot(ctxt, snapshot_id, 'export_snapshot')
+         volume_utils.require_driver_initialized(self.driver)
+ 
+         snapshot = objects.Snapshot.get_by_id(ctxt, snapshot_id)
+@@ -2154,6 +2177,7 @@ class VolumeManager(manager.CleanableManager,
+                                ctxt,
+                                snapshot_id: ovo_fields.UUIDField) -> None:
+         """Removes an export for a snapshot."""
++        checkpoint_guards.check_snapshot(ctxt, snapshot_id, 'export_snapshot')
+         volume_utils.require_driver_initialized(self.driver)
+         snapshot = objects.Snapshot.get_by_id(ctxt, snapshot_id)
+         try:
+@@ -2168,6 +2192,7 @@ class VolumeManager(manager.CleanableManager,
+ 
+     def accept_transfer(self, context, volume_id, new_user, new_project,
+                         no_snapshots=False) -> dict:
++        checkpoint_guards.check_volume(context, volume_id, 'transfer')
+         volume_utils.require_driver_initialized(self.driver)
+ 
+         # NOTE(jdg): need elevated context as we haven't "given" the vol
+@@ -2517,6 +2542,7 @@ class VolumeManager(manager.CleanableManager,
+                                   volume,
+                                   new_volume,
+                                   error=False) -> ovo_fields.UUIDField:
++        checkpoint_guards.check_volume(ctxt, volume, 'migrate')
+         try:
+             volume_utils.require_driver_initialized(self.driver)
+         except exception.DriverNotInitialized:
+@@ -2688,6 +2714,7 @@ class VolumeManager(manager.CleanableManager,
+                        new_type_id=None,
+                        diff=None) -> None:
+         """Migrate the volume to the specified host (called on source host)."""
++        checkpoint_guards.check_volume(ctxt, volume, 'migrate')
+         try:
+             volume_utils.require_driver_initialized(self.driver)
+         except exception.DriverNotInitialized:
+@@ -2981,6 +3008,7 @@ class VolumeManager(manager.CleanableManager,
+                       volume: objects.Volume,
+                       new_size: int,
+                       reservations) -> None:
++        checkpoint_guards.check_volume(context, volume, 'extend')
+         try:
+             volume_utils.require_driver_initialized(self.driver)
+         except exception.DriverNotInitialized:
+@@ -3024,6 +3052,7 @@ class VolumeManager(manager.CleanableManager,
+                                  reservations: list[str],
+                                  error: bool) -> None:
+ 
++        checkpoint_guards.check_volume(context, volume, 'extend')
+         project_id = volume.project_id
+         size_increase = new_size - volume.size
+ 
+@@ -3089,6 +3118,7 @@ class VolumeManager(manager.CleanableManager,
+                reservations=None,
+                old_reservations=None) -> None:
+ 
++        checkpoint_guards.check_volume(context, volume, 'retype')
+         def _retype_error(context, volume, old_reservations,
+                           new_reservations, status_update) -> None:
+             try:
+@@ -4079,6 +4109,11 @@ class VolumeManager(manager.CleanableManager,
+                                                              group,
+                                                              remove_volumes,
+                                                              add=False)
++        additions = [volume.id for volume in add_volumes_ref]
++        with self.db.checkpoint_group_admission(context, group.id, additions):
++            pass
++        for volume in remove_volumes_ref:
++            checkpoint_guards.check_volume(context, volume, 'group')
+         self._notify_about_group_usage(
+             context, group, "update.start")
+ 
+@@ -4468,6 +4503,7 @@ class VolumeManager(manager.CleanableManager,
+                                new_volume: objects.Volume,
+                                volume_status) -> None:
+         """Finalize migration process on backend device."""
++        checkpoint_guards.check_volume(ctxt, volume, 'migrate')
+         model_update = None
+         model_update_default = {'_name_id': new_volume.name_id,
+                                 'provider_location':
+@@ -4539,6 +4575,8 @@ class VolumeManager(manager.CleanableManager,
+         # Change non replicated volumes and their snapshots to error if we are
+         # failing over, leave them as they are for failback
+         volumes = self._get_my_volumes(context)
++        for volume in volumes:
++            checkpoint_guards.check_volume(context, volume, 'failover')
+ 
+         replicated_vols = []
+         for volume in volumes:
+@@ -4847,6 +4885,10 @@ class VolumeManager(manager.CleanableManager,
+                           backup: objects.Backup,
+                           want_objects: bool = False,
+                           async_call: bool = False):
++        checkpoint_guards.check_volume(ctxt, backup.volume_id, 'backup')
++        if backup.snapshot_id:
++            checkpoint_guards.check_snapshot(
++                ctxt, backup.snapshot_id, 'backup')
+         (backup_device, is_snapshot) = (
+             self.driver.get_backup_device(ctxt, backup))
+         secure_enabled = self.driver.secure_file_operations_enabled()
+@@ -4938,6 +4980,7 @@ class VolumeManager(manager.CleanableManager,
+                    strutils.mask_dict_password(connection_info)})
+         return connection_info
+ 
++    @checkpoint_guards.connection_worker('attachment', 'vref')
+     def attachment_update(self,
+                           context: context.RequestContext,
+                           vref: objects.Volume,
+@@ -4954,6 +4997,7 @@ class VolumeManager(manager.CleanableManager,
+         param: connector: Connector object to use for attachment creation
+         param: attachment_ref: ID of the attachment record to update
+         """
++        checkpoint_guards.check_volume(context, vref, 'attachment')
+ 
+         mode = connector.get('mode', 'rw')
+         self._notify_about_volume_usage(context, vref, 'attach.start')
+@@ -5044,6 +5088,7 @@ class VolumeManager(manager.CleanableManager,
+         # going on here.
+         return shared_connections
+ 
++    @checkpoint_guards.connection_worker('attachment', 'vref')
+     def attachment_delete(self,
+                           context: context.RequestContext,
+                           attachment_id: str,
+@@ -5056,6 +5101,7 @@ class VolumeManager(manager.CleanableManager,
+         param: attachment_id: Attachment id to remove
+         param: vref: Volume object associated with the attachment
+         """
++        checkpoint_guards.check_volume(context, vref, 'attachment')
+         volume_utils.require_driver_initialized(self.driver)
+         attachment = objects.VolumeAttachment.get_by_id(context, attachment_id)
+ 
+@@ -5427,6 +5473,7 @@ class VolumeManager(manager.CleanableManager,
+ 
+     def reimage(self, context, volume, image_meta, image_snap=None):
+         """Reimage a volume with specific image."""
++        checkpoint_guards.check_volume(context, volume, 'reimage')
+         image_id = None
+         try:
+             if image_snap:

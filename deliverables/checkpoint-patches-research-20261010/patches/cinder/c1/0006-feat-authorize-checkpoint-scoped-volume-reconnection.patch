@@ -1,0 +1,804 @@
+From 1593eb0975570a4aa897d7e3e052423b4ddf1cf1 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Tue, 6 Oct 2026 23:27:59 +0300
+Subject: [PATCH 06/10] feat: authorize checkpoint-scoped volume reconnections
+
+---
+ cinder/api/v3/attachments.py                  |  15 +-
+ cinder/checkpoints/guards.py                  |  45 +++-
+ cinder/context.py                             |  11 +-
+ cinder/db/api.py                              |   8 +
+ cinder/db/sqlalchemy/api.py                   |  22 +-
+ cinder/db/sqlalchemy/checkpoints.py           | 121 ++++++++-
+ .../unit/checkpoints/test_attachment_scope.py | 244 ++++++++++++++++++
+ cinder/volume/api.py                          |  15 +-
+ cinder/volume/manager.py                      |  12 +-
+ cinder/volume/rpcapi.py                       |  12 +-
+ 10 files changed, 478 insertions(+), 27 deletions(-)
+ create mode 100644 cinder/tests/unit/checkpoints/test_attachment_scope.py
+
+diff --git a/cinder/api/v3/attachments.py b/cinder/api/v3/attachments.py
+index 3e8caf8..1b24f45 100644
+--- a/cinder/api/v3/attachments.py
++++ b/cinder/api/v3/attachments.py
+@@ -23,6 +23,7 @@ from cinder.api.openstack import wsgi
+ from cinder.api.schemas import attachments as attachment
+ from cinder.api.v3.views import attachments as attachment_views
+ from cinder.api import validation
++from cinder.checkpoints import guards as checkpoint_guards
+ from cinder import context as cinder_context
+ from cinder import exception
+ from cinder.i18n import _
+@@ -172,7 +173,7 @@ class AttachmentsController(wsgi.Controller):
+ 
+         returns: A summary view of the attachment object
+         """
+-        context = req.environ['cinder.context']
++        context = checkpoint_guards.attachment_request(req)
+         instance_uuid = body['attachment'].get('instance_uuid')
+         volume_uuid = body['attachment']['volume_uuid']
+         volume_ref = objects.Volume.get_by_id(
+@@ -196,7 +197,7 @@ class AttachmentsController(wsgi.Controller):
+                                                   instance_uuid,
+                                                   **args))
+         except (exception.NotAuthorized,
+-                exception.InvalidVolume, exception.CheckpointConflict):
++                exception.Invalid, exception.NotFound):
+             raise
+         except exception.CinderException as ex:
+             err_msg = _(
+@@ -240,7 +241,7 @@ class AttachmentsController(wsgi.Controller):
+             }
+ 
+         """
+-        context = req.environ['cinder.context']
++        context = checkpoint_guards.attachment_request(req)
+         attachment_ref = (
+             objects.VolumeAttachment.get_by_id(context, id))
+         connector = body['attachment']['connector']
+@@ -251,7 +252,7 @@ class AttachmentsController(wsgi.Controller):
+                                                   attachment_ref,
+                                                   connector))
+         except (exception.NotAuthorized, exception.Invalid,
+-                exception.CheckpointConflict):
++                exception.NotFound):
+             raise
+         except exception.CinderException as ex:
+             err_msg = (
+@@ -278,7 +279,7 @@ class AttachmentsController(wsgi.Controller):
+         returns: A summary list of any attachments sharing this connection
+ 
+         """
+-        context = req.environ['cinder.context']
++        context = checkpoint_guards.attachment_request(req)
+         attachment = objects.VolumeAttachment.get_by_id(context, id)
+         attachments = self.volume_api.attachment_delete(context, attachment)
+         return attachment_views.ViewBuilder.list(attachments)
+@@ -288,12 +289,14 @@ class AttachmentsController(wsgi.Controller):
+     @wsgi.action('os-complete')
+     def complete(self, req, id, body):
+         """Mark a volume attachment process as completed (in-use)."""
+-        context = req.environ['cinder.context']
++        context = checkpoint_guards.attachment_request(req)
+         attachment_ref = (
+             objects.VolumeAttachment.get_by_id(context, id))
+         volume_ref = objects.Volume.get_by_id(
+             context,
+             attachment_ref.volume_id)
++        checkpoint_guards.attachment(
++            context, volume_ref.id, 'reconnect', attachment_id=id)
+         context.authorize(attachment_policy.COMPLETE_POLICY,
+                           target_obj=attachment_ref)
+         attachment_ref.update(
+diff --git a/cinder/checkpoints/guards.py b/cinder/checkpoints/guards.py
+index 8846342..28696f0 100644
+--- a/cinder/checkpoints/guards.py
++++ b/cinder/checkpoints/guards.py
+@@ -14,6 +14,7 @@
+ 
+ import contextlib
+ import inspect
++import uuid
+ 
+ import decorator
+ 
+@@ -37,8 +38,9 @@ def check_snapshot(context, snapshot, action, operation_id=None,
+ 
+ def validate_operation_scope(context, operation_id, generation, volume_id,
+                              action):
+-    # A header or an admin role alone never grants an internal bypass.
+-    raise exception.CheckpointServiceForbidden()
++    require_service(context)
++    db.checkpoint_attachment_scope(context, operation_id, generation,
++                                   volume_id, action)
+ 
+ 
+ @contextlib.contextmanager
+@@ -72,3 +74,42 @@ def require_service(context):
+             not context.service_user_id or context.service_user_id not in
+             config.CONF.checkpoint.nova_service_user_ids):
+         raise exception.CheckpointServiceForbidden()
++
++
++def attachment(context, volume_id, action, attachment_id=None,
++               instance_uuid=None):
++    if context.checkpoint_operation_id:
++        require_service(context)
++        if action == 'reconnect' and attachment_id is None:
++            action = 'reserve_attachment'
++        db.checkpoint_attachment_scope(
++            context, context.checkpoint_operation_id,
++            context.checkpoint_generation, volume_id, action,
++            attachment_id, instance_uuid)
++    else:
++        check_volume(context, volume_id, 'attachment')
++
++
++def attachment_request(req):
++    """Accept operation scope only at the modern attachment API boundary."""
++    context = req.environ['cinder.context']
++    operation_id = req.headers.get('OpenStack-Checkpoint-Operation-ID')
++    generation = req.headers.get('OpenStack-Checkpoint-Generation')
++    context.checkpoint_operation_id = None
++    context.checkpoint_generation = None
++    if operation_id is None and generation is None:
++        return context
++    from cinder.api import microversions
++    if not req.api_version_request.matches(microversions.CHECKPOINT_CONTRACT):
++        raise exception.InvalidInput(reason='checkpoint_scope_requires_372')
++    require_service(context)
++    try:
++        operation_id = str(uuid.UUID(operation_id))
++        if not generation or not generation.isdecimal() or int(generation) < 1:
++            raise ValueError()
++        generation = int(generation)
++    except (ValueError, TypeError, AttributeError):
++        raise exception.InvalidInput(reason='invalid_checkpoint_scope')
++    context.checkpoint_operation_id = operation_id
++    context.checkpoint_generation = generation
++    return context
+diff --git a/cinder/context.py b/cinder/context.py
+index 1c42fc0..53e634c 100644
+--- a/cinder/context.py
++++ b/cinder/context.py
+@@ -94,6 +94,8 @@ class RequestContext(context.RequestContext):
+                  message_resource_id = None,
+                  message_resource_type = None,
+                  message_action = None,
++                 checkpoint_operation_id=None,
++                 checkpoint_generation=None,
+                  **kwargs):
+         """Initialize RequestContext.
+ 
+@@ -123,6 +125,8 @@ class RequestContext(context.RequestContext):
+         self.message_resource_id = message_resource_id
+         self.message_resource_type = message_resource_type
+         self.message_action = message_action
++        self.checkpoint_operation_id = checkpoint_operation_id
++        self.checkpoint_generation = checkpoint_generation
+ 
+         if service_catalog:
+             # Only include required parts of service_catalog
+@@ -182,6 +186,8 @@ class RequestContext(context.RequestContext):
+         result['message_action'] = self.message_action
+         result['service_user_id'] = self.service_user_id
+         result['service_roles'] = self.service_roles
++        result['checkpoint_operation_id'] = self.checkpoint_operation_id
++        result['checkpoint_generation'] = self.checkpoint_generation
+         return result
+ 
+     @classmethod
+@@ -206,7 +212,10 @@ class RequestContext(context.RequestContext):
+                    project_domain_id=values.get('project_domain_id'),
+                    message_resource_id = values.get('message_resource_id'),
+                    message_resource_type = values.get('message_resource_type'),
+-                   message_action = values.get('message_action')
++                   message_action = values.get('message_action'),
++                   checkpoint_operation_id=values.get(
++                       'checkpoint_operation_id'),
++                   checkpoint_generation=values.get('checkpoint_generation')
+                    )
+ 
+     def authorize(self,
+diff --git a/cinder/db/api.py b/cinder/db/api.py
+index 3d1272a..ad318bf 100644
+--- a/cinder/db/api.py
++++ b/cinder/db/api.py
+@@ -2040,3 +2040,11 @@ def checkpoint_connection_end(context, volume_id, previous):
+ 
+ def checkpoint_group_admission(context, group_id, add_volumes):
+     return IMPL.checkpoint_group_admission(context, group_id, add_volumes)
++
++
++def checkpoint_attachment_scope(context, operation_id, generation, volume_id,
++                                action, attachment_id=None,
++                                instance_uuid=None):
++    return IMPL.checkpoint_attachment_scope(
++        context, operation_id, generation, volume_id, action,
++        attachment_id, instance_uuid)
+diff --git a/cinder/db/sqlalchemy/api.py b/cinder/db/sqlalchemy/api.py
+index 8acb752..f589155 100644
+--- a/cinder/db/sqlalchemy/api.py
++++ b/cinder/db/sqlalchemy/api.py
+@@ -1938,8 +1938,7 @@ def reservation_expire(context):
+ @require_admin_context
+ @main_context_manager.writer
+ def volume_attach(context, values):
+-    _checkpoint_guards().resource_guard(
+-        context, values['volume_id'], 'attachment')
++    _checkpoint_guards().guard_attachment_create(context, values)
+     volume_attachment_ref = models.VolumeAttachment()
+     if not values.get('id'):
+         values['id'] = str(uuid.uuid4())
+@@ -1972,7 +1971,8 @@ def volume_attached(
+     status settings.
+ 
+     """
+-    _checkpoint_guards().guard_attachment(context, attachment_id)
++    _checkpoint_guards().guard_attachment(
++        context, attachment_id, 'reconnect', {'instance_uuid': instance_uuid})
+     attach_status = fields.VolumeAttachStatus.ATTACHED
+     volume_status = 'in-use'
+     if not mark_attached:
+@@ -2262,6 +2262,8 @@ def volume_detached(context, volume_id, attachment_id):
+     Volume attach_status will be changed to one of: attached, attaching,
+     detaching, reserved, or detached.
+     """
++    _checkpoint_guards().guard_attachment(
++        context, attachment_id, 'disconnect')
+     _checkpoint_guards().resource_guard(context, volume_id, 'attachment')
+ 
+     # NOTE(jdg): This is a funky band-aid for the earlier attempts at
+@@ -2611,7 +2613,8 @@ def volume_attachment_get_all_by_project(
+ @main_context_manager.writer
+ def attachment_destroy(context, attachment_id):
+     """Destroy the specified attachment record."""
+-    _checkpoint_guards().guard_attachment(context, attachment_id)
++    _checkpoint_guards().guard_attachment(
++        context, attachment_id, 'disconnect')
+     utcnow = timeutils.utcnow()
+     query = model_query(context, models.VolumeAttachment).filter_by(
+         id=attachment_id
+@@ -3315,7 +3318,8 @@ def volumes_update(context, values_list):
+ @require_context
+ @main_context_manager.writer
+ def volume_attachment_update(context, attachment_id, values):
+-    _checkpoint_guards().guard_attachment(context, attachment_id)
++    _checkpoint_guards().guard_attachment(
++        context, attachment_id, 'reconnect', values)
+     query = model_query(context, models.VolumeAttachment)
+     result = query.filter_by(id=attachment_id).update(values)
+     if not result:
+@@ -8802,3 +8806,11 @@ def _checkpoint_guards():
+ def checkpoint_group_admission(context, group_id, add_volumes):
+     from cinder.db.sqlalchemy import checkpoints
+     return checkpoints.group_admission(context, group_id, add_volumes)
++
++
++def checkpoint_attachment_scope(context, operation_id, generation, volume_id,
++                                action, attachment_id=None,
++                                instance_uuid=None):
++    return _checkpoint_guards().attachment_scope(
++        context, operation_id, generation, volume_id, action,
++        attachment_id, instance_uuid)
+diff --git a/cinder/db/sqlalchemy/checkpoints.py b/cinder/db/sqlalchemy/checkpoints.py
+index 523d633..cda333c 100644
+--- a/cinder/db/sqlalchemy/checkpoints.py
++++ b/cinder/db/sqlalchemy/checkpoints.py
+@@ -457,7 +457,9 @@ def release(context, operation_id, generation, outcome):
+         if operation.kind == 'revert':
+             for volume in volumes:
+                 attachments = _attachments(context, volume.id)
+-                if (len(attachments) != 1 or any(
++                if (volume.status != 'in-use' or
++                        volume.attach_status != 'attached' or
++                        len(attachments) != 1 or any(
+                         a.instance_uuid != instance.instance_uuid or
+                         a.attach_status != 'attached' for a in attachments)):
+                     _conflict('reattachment_required')
+@@ -484,7 +486,92 @@ def release(context, operation_id, generation, outcome):
+     return _as_dict(context, operation)
+ 
+ 
++def _scope(context, operation_id, generation, volume_id, action,
++           attachment_id=None, instance_uuid=None):
++    from cinder.checkpoints import guards
++    from cinder.policies import checkpoints as policy
++    guards.require_service(context)
++    context.authorize(policy.OPERATE_POLICY)
++    # Attachment writers already lock only their parent volume. Do not take
++    # the instance lock in reverse order here; release needs all volume locks.
++    volume = _lock_volumes(context, [volume_id])[0]
++    operation = _owned(context, _current(_query(
++        context, models.CheckpointOperation).filter_by(
++            id=operation_id)).first())
++    lock = _current(_query(context, models.CheckpointVolumeLock).filter_by(
++        volume_id=volume_id)).first()
++    if (type(generation) is not int or generation != operation.generation or
++            operation.status == 'released' or operation.kind != 'revert' or
++            not lock or lock.operation_id != operation_id or
++            lock.generation != generation):
++        _conflict('invalid_attachment_scope')
++    steps = _steps(context, operation_id)
++    if all(s.status == 'prepared' for s in steps):
++        stage = 'disconnect'
++    elif all(s.status == 'succeeded' for s in steps):
++        stage = 'reconnect'
++    else:
++        _conflict('attachment_phase_not_ready')
++    expected_stage = ('reconnect' if action == 'reserve_attachment'
++                      else action)
++    if expected_stage not in ('attachment', stage):
++        _conflict('attachment_phase_not_ready')
++    resource = next(r for r in _resources(context, operation.checkpoint_id)
++                    if r.volume_id == volume_id)
++    step = next(s for s in steps if s.resource_id == resource.id)
++    original = json.loads(step.original_attachment_ids_json)
++    if expected_stage == 'reconnect' and attachment_id is None:
++        if instance_uuid != operation.instance_uuid:
++            _conflict('attachment_instance_changed')
++    if action == 'reserve_attachment' and (
++            volume.status != 'available' or _attachments(context, volume_id)):
++        _conflict('attachment_conflict')
++    if instance_uuid is not None and instance_uuid != operation.instance_uuid:
++        _conflict('attachment_instance_changed')
++    if attachment_id is not None:
++        attachment = _current(_query(context, models.VolumeAttachment).
++                              filter_by(id=attachment_id)).first()
++        if (not attachment or attachment.volume_id != volume_id or
++                attachment.instance_uuid != operation.instance_uuid or
++                (stage == 'disconnect' and attachment_id not in original) or
++                (stage == 'reconnect' and attachment_id in original)):
++            _conflict('attachment_not_owned')
++    return stage, operation, volume
++
++
++@api.require_context
++@api.main_context_manager.writer
++def attachment_scope(context, operation_id, generation, volume_id, action,
++                     attachment_id=None, instance_uuid=None):
++    _scope(context, operation_id, generation, volume_id, action,
++           attachment_id, instance_uuid)
++
++
++def _context_scope(context, volume_id, action='attachment',
++                   attachment_id=None, instance_uuid=None):
++    return _scope(context, context.checkpoint_operation_id,
++                  context.checkpoint_generation, volume_id, action,
++                  attachment_id, instance_uuid)
++
++
++def guard_attachment_create(context, values):
++    volume_id = values['volume_id']
++    if context.checkpoint_operation_id:
++        stage, operation, volume = _context_scope(
++            context, volume_id, 'reconnect',
++            instance_uuid=values.get('instance_uuid'))
++        if (values.get('instance_uuid') != operation.instance_uuid or
++                _attachments(context, volume_id) or
++                volume.status != 'reserved'):
++            _conflict('attachment_conflict')
++    else:
++        _guard_volume(context, volume_id, 'attachment')
++
++
+ def _guard_volume(context, volume_id, action):
++    if action == 'attachment' and context.checkpoint_operation_id:
++        _context_scope(context, volume_id)
++        return
+     if action == 'read':
+         return
+     # Lock the same volume row used by checkpoint reserve before observing
+@@ -535,6 +622,22 @@ def snapshot_guard(context, snapshot_id, action):
+ 
+ 
+ def guard_volume_update(context, volume_id, values):
++    if context.checkpoint_operation_id:
++        stage, operation, volume = _context_scope(context, volume_id)
++        allowed = {'status', 'attach_status', 'updated_at'}
++        if stage == 'reconnect':
++            allowed |= {'provider_location', 'provider_auth'}
++        if set(values) - allowed:
++            _conflict('attachment_scope_forbids_volume_mutation')
++        if values.get('status') == 'reserved' and (
++                stage != 'reconnect' or volume.status != 'available' or
++                _attachments(context, volume_id)):
++            _conflict('attachment_conflict')
++        if 'status' in values and values['status'] not in (
++                'available', 'reserved', 'attaching', 'in-use', 'detaching',
++                'error', 'error_attaching', 'error_detaching'):
++            _conflict('invalid_attachment_volume_status')
++        return
+     # Cosmetic fields cannot release ownership or change volume identity.
+     if not set(values) - {'display_name', 'display_description', 'metadata',
+                           'updated_at', 'admin_metadata'}:
+@@ -555,11 +658,19 @@ def guard_volume_update(context, volume_id, values):
+     _guard_volume(context, volume_id, action)
+ 
+ 
+-def guard_attachment(context, attachment_id):
++def guard_attachment(context, attachment_id, action='attachment', values=None):
+     attachment = _query(context, models.VolumeAttachment).filter_by(
+         id=attachment_id).first()
+     if attachment:
+-        _guard_volume(context, attachment.volume_id, 'attachment')
++        if context.checkpoint_operation_id:
++            _context_scope(context, attachment.volume_id, action,
++                           attachment_id=attachment_id)
++            values = values or {}
++            for key in ('id', 'volume_id', 'instance_uuid'):
++                if key in values and values[key] != getattr(attachment, key):
++                    _conflict('attachment_identity_changed')
++        else:
++            _guard_volume(context, attachment.volume_id, 'attachment')
+ 
+ 
+ def guard_update(context, model, query, values):
+@@ -591,7 +702,7 @@ def guard_update(context, model, query, values):
+             if model == models.Snapshot:
+                 _guard_snapshot(context, row.id, 'mutate')
+             else:
+-                _guard_volume(context, row.volume_id, 'attachment')
++                guard_attachment(context, row.id, 'reconnect', values)
+     return query.filter(model.id.in_(ids))
+ 
+ 
+@@ -599,6 +710,8 @@ def guard_update(context, model, query, values):
+ @api.main_context_manager.writer
+ def connection_begin(context, volume_id, action):
+     _guard_volume(context, volume_id, action)
++    if action == 'attachment' and context.checkpoint_operation_id:
++        return None  # The checkpoint operation already owns the barrier.
+     volume = _current(_query(context, models.Volume).filter_by(
+         id=volume_id)).first()
+     if not volume:
+diff --git a/cinder/tests/unit/checkpoints/test_attachment_scope.py b/cinder/tests/unit/checkpoints/test_attachment_scope.py
+new file mode 100644
+index 0000000..8c8f245
+--- /dev/null
++++ b/cinder/tests/unit/checkpoints/test_attachment_scope.py
+@@ -0,0 +1,244 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from unittest import mock
++
++from oslo_serialization import jsonutils
++from oslo_utils import uuidutils
++import webob
++
++from cinder.api.middleware import fault
++from cinder.api.v3 import router
++from cinder.checkpoints import guards
++from cinder import context
++from cinder import exception
++from cinder import objects
++from cinder.tests.unit.api import fakes
++from cinder.tests.unit.checkpoints import test_manager
++from cinder.tests.unit import test
++from cinder.tests.unit import utils
++from cinder.volume import api as volume_api
++from cinder.volume import manager as volume_manager
++from cinder.volume import rpcapi
++
++
++class TestAttachmentScope(test_manager.ManagerHelpers, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_manager()
++        self.available_checkpoint()
++        self.payload.update(kind='revert',
++                            request_id=uuidutils.generate_uuid())
++        self.operation = self.api.reserve(self.ctxt, self.payload)
++        self.scope = self.ctxt.deepcopy()
++        self.scope.checkpoint_operation_id = self.operation.id
++        self.scope.checkpoint_generation = 1
++        self.vm = volume_manager.VolumeManager(host=self.owner.host)
++        self.vm.driver = self.driver
++        for name, result in (
++                ('validate_connector', None), ('create_export', None),
++                ('initialize_connection',
++                 {'driver_volume_type': 'fake', 'data': {}}),
++                ('terminate_connection', False), ('remove_export', None)):
++            self.mock_object(self.driver, name, return_value=result)
++        self.driver.initialize_connection.side_effect = (
++            lambda *args: {'driver_volume_type': 'fake', 'data': {}})
++        self.va = volume_api.API()
++        self.attachment_rpc = mock.Mock(spec=[
++            'assert_checkpoint_ready', 'attachment_update',
++            'attachment_delete'])
++        self.attachment_rpc.attachment_update.side_effect = (
++            self.vm.attachment_update)
++        self.attachment_rpc.attachment_delete.side_effect = (
++            self.vm.attachment_delete)
++        self.va.volume_rpcapi = self.attachment_rpc
++        self.original = [objects.Volume.get_by_id(
++            self.ctxt, vid).volume_attachment[0].id for vid in self.volumes]
++        self.app = fakes.urlmap.URLMap()
++        self.mock_object(volume_api, 'API', return_value=self.va)
++        # require_service uses the class static method, retained on the mock.
++        volume_api.API.is_service_request = self.va.is_service_request
++        self.app['/v3'] = router.APIRouter()
++        self.app = fault.FaultWrapper(self.app)
++
++    def request(self, method, path, body=None, version='3.72', ctxt=None,
++                operation_id=None, generation='1'):
++        req = webob.Request.blank('/v3/%s/%s' % (self.ctxt.project_id, path))
++        req.method = method
++        req.headers['Content-Type'] = 'application/json'
++        req.headers['OpenStack-API-Version'] = 'volume ' + version
++        req.headers['OpenStack-Checkpoint-Operation-ID'] = (
++            operation_id or self.operation.id)
++        req.headers['OpenStack-Checkpoint-Generation'] = generation
++        req.environ['cinder.context'] = (ctxt or self.ctxt).deepcopy()
++        if body is not None:
++            req.body = jsonutils.dump_as_bytes(body)
++        return req.get_response(self.app)
++
++    def disconnect(self):
++        for attachment_id in self.original:
++            response = self.request('DELETE', 'attachments/' + attachment_id)
++            self.assertEqual(200, response.status_int, response.text)
++
++    def reconnect(self, vid, instance=None):
++        return self.request('POST', 'attachments', {'attachment': {
++            'volume_uuid': vid, 'instance_uuid': instance or self.instance,
++            'connector': {'host': 'compute-one', 'ip': '192.0.2.10'}}})
++
++    def test_tenant_cannot_forge_attachment_scope(self):
++        tenant = self.ctxt.deepcopy()
++        tenant.service_user_id = None
++        tenant.service_roles = []
++        tenant.roles = ['admin', 'service']
++        response = self.request('DELETE', 'attachments/' + self.original[0],
++                                ctxt=tenant)
++        self.assertEqual(403, response.status_int, response.text)
++        self.assertEqual(self.original[0], objects.Volume.get_by_id(
++            self.ctxt, self.volumes[0]).volume_attachment[0].id)
++        self.driver.terminate_connection.assert_not_called()
++
++    def test_valid_revert_reconnect_preserves_volume_uuid(self):
++        self.disconnect()
++        self.execute(self.operation)
++        for vid in self.volumes:
++            response = self.reconnect(vid)
++            self.assertEqual(200, response.status_int, response.text)
++            attachment_id = response.json['attachment']['id']
++            self.assertNotIn(attachment_id, self.original)
++            response = self.request('POST',
++                                    'attachments/%s/action' % attachment_id,
++                                    {'os-complete': {}})
++            self.assertEqual(204, response.status_int, response.text)
++            volume = objects.Volume.get_by_id(self.ctxt, vid)
++            self.assertEqual(vid, volume.id)
++            self.assertEqual(self.instance,
++                             volume.volume_attachment[0].instance_uuid)
++        self.api.action(self.ctxt, self.operation.id, 'release', 1, 'commit')
++        self.assertEqual([], self.locks())
++
++    def test_reconnect_before_all_results_and_wrong_instance_rejected(self):
++        self.disconnect()
++        response = self.reconnect(self.volumes[0])
++        self.assertEqual(409, response.status_int, response.text)
++        self.execute(self.operation)
++        response = self.reconnect(self.volumes[0], uuidutils.generate_uuid())
++        self.assertEqual(409, response.status_int, response.text)
++        self.driver.initialize_connection.assert_not_called()
++
++    def test_missing_instance_rejected_before_reserving_attachment(self):
++        self.disconnect()
++        self.execute(self.operation)
++        response = self.request('POST', 'attachments', {'attachment': {
++            'volume_uuid': self.volumes[0]}})
++        self.assertEqual(409, response.status_int, response.text)
++        self.assertEqual('available', objects.Volume.get_by_id(
++            self.ctxt, self.volumes[0]).status)
++
++    def test_partial_revert_forbids_reconnect(self):
++        self.disconnect()
++        self.manager.execute(self.ctxt, self.operation.steps[0].id, 1)
++        response = self.reconnect(self.volumes[0])
++        self.assertEqual(409, response.status_int, response.text)
++        self.driver.initialize_connection.assert_not_called()
++
++    def test_release_waits_for_complete_volume_status(self):
++        self.disconnect()
++        self.execute(self.operation)
++        for vid in self.volumes:
++            response = self.reconnect(vid)
++            self.assertEqual(200, response.status_int, response.text)
++            attachment = objects.VolumeAttachment.get_by_id(
++                self.scope, response.json['attachment']['id'])
++            attachment.attach_status = 'attached'
++            attachment.save()
++        self.assertRaises(exception.CheckpointConflict, self.api.action,
++                          self.ctxt, self.operation.id, 'release', 1, 'commit')
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++
++    def test_duplicate_reconnect_cannot_create_second_attachment(self):
++        self.disconnect()
++        self.execute(self.operation)
++        self.assertEqual(200, self.reconnect(self.volumes[0]).status_int)
++        response = self.reconnect(self.volumes[0])
++        self.assertEqual(409, response.status_int, response.text)
++        self.assertEqual(1, len(objects.Volume.get_by_id(
++            self.ctxt, self.volumes[0]).volume_attachment))
++
++    def test_other_volume_rejected(self):
++        volume = utils.create_volume(self.ctxt, volume_type_id=None)
++        response = self.reconnect(volume.id)
++        self.assertEqual(409, response.status_int, response.text)
++        self.assertEqual('available', objects.Volume.get_by_id(
++            self.ctxt, volume.id).status)
++
++    def test_stale_unknown_foreign_and_old_version_scope_rejected(self):
++        for kwargs, status in (({'generation': '2'}, 409),
++                               ({'generation': '0'}, 400),
++                               ({'operation_id': uuidutils.generate_uuid()},
++                                404), ({'version': '3.71'}, 400)):
++            response = self.request(
++                'DELETE', 'attachments/' + self.original[0], **kwargs)
++            self.assertEqual(status, response.status_int, response.text)
++        foreign = self.ctxt.deepcopy()
++        foreign.service_user_id = uuidutils.generate_uuid()
++        self.flags(nova_service_user_ids=[self.ctxt.service_user_id,
++                                          foreign.service_user_id],
++                   group='checkpoint')
++        response = self.request('DELETE', 'attachments/' + self.original[0],
++                                ctxt=foreign)
++        self.assertEqual(404, response.status_int, response.text)
++        self.driver.terminate_connection.assert_not_called()
++
++    def test_released_scope_and_legacy_connections_never_bypass(self):
++        self.assertRaises(exception.CheckpointConflict,
++                          self.va.initialize_connection, self.scope,
++                          objects.Volume.get_by_id(self.scope,
++                                                   self.volumes[0]), {})
++        self.api.action(self.ctxt, self.operation.id, 'release', 1, 'abort')
++        response = self.request('DELETE', 'attachments/' + self.original[0])
++        self.assertEqual(409, response.status_int, response.text)
++        self.driver.terminate_connection.assert_not_called()
++
++    def test_context_scope_roundtrip(self):
++        restored = context.RequestContext.from_dict(self.scope.to_dict())
++        self.assertEqual(self.operation.id, restored.checkpoint_operation_id)
++        self.assertEqual(1, restored.checkpoint_generation)
++        guards.validate_operation_scope(restored, self.operation.id, 1,
++                                        self.volumes[0], 'attachment')
++
++    def test_worker_rejects_scope_for_different_attachment(self):
++        self.assertRaises(exception.CheckpointConflict,
++                          self.vm.attachment_delete, self.scope,
++                          self.original[1], objects.Volume.get_by_id(
++                              self.scope, self.volumes[0]))
++        self.driver.terminate_connection.assert_not_called()
++
++    def test_create_scope_never_allows_attachment_change(self):
++        self.api.action(self.ctxt, self.operation.id, 'release', 1, 'abort')
++        self.payload.update(kind='create',
++                            request_id=uuidutils.generate_uuid(),
++                            checkpoint_id=uuidutils.generate_uuid())
++        operation = self.api.reserve(self.ctxt, self.payload)
++        response = self.request('DELETE', 'attachments/' + self.original[0],
++                                operation_id=operation.id)
++        self.assertEqual(409, response.status_int, response.text)
++
++    def test_scoped_rpc_requires_321_legacy_stays_39(self):
++        rpc = rpcapi.VolumeAPI()
++        cctxt = self.mock_object(rpc, '_get_cctxt')
++        self.mock_object(rpc.client, 'can_send_version', return_value=True)
++        self.mock_object(rpc, 'assert_checkpoint_ready')
++        vref = objects.Volume.get_by_id(self.ctxt, self.volumes[0])
++        rpc.attachment_delete(self.scope, self.original[0], vref)
++        cctxt.assert_called_with(vref.service_topic_queue, version='3.21')
++        rpc.attachment_delete(self.ctxt, self.original[0], vref)
++        cctxt.assert_called_with(vref.service_topic_queue, version='3.9')
+diff --git a/cinder/volume/api.py b/cinder/volume/api.py
+index 42c2632..2b0049d 100644
+--- a/cinder/volume/api.py
++++ b/cinder/volume/api.py
+@@ -2513,7 +2513,10 @@ class API(base.Base):
+             connector: Optional[dict] = None,
+             attach_mode: Optional[str] = 'null') -> objects.VolumeAttachment:
+         """Create an attachment record for the specified volume."""
+-        checkpoint_guards.check_volume(ctxt, volume_ref, 'attachment')
++        checkpoint_guards.attachment(
++            ctxt, volume_ref.id, 'reconnect', instance_uuid=instance_uuid)
++        if ctxt.checkpoint_operation_id:
++            self.volume_rpcapi.assert_checkpoint_ready(ctxt, volume_ref)
+         ctxt.authorize(attachment_policy.CREATE_POLICY, target_obj=volume_ref)
+         connection_info = {}
+         if "error" in volume_ref.status:
+@@ -2562,8 +2565,9 @@ class API(base.Base):
+                           attachment_ref: objects.VolumeAttachment,
+                           connector) -> objects.VolumeAttachment:
+         """Update an existing attachment record."""
+-        checkpoint_guards.check_volume(
+-            ctxt, attachment_ref.volume_id, 'attachment')
++        checkpoint_guards.attachment(
++            ctxt, attachment_ref.volume_id, 'reconnect',
++            attachment_id=attachment_ref.id)
+         # Valid items to update (connector includes mode and mountpoint):
+         #   1. connector (required)
+         #     a. mode (if None use value from attachment_ref)
+@@ -2699,8 +2703,9 @@ class API(base.Base):
+                           ctxt: context.RequestContext,
+                           attachment) -> objects.VolumeAttachmentList:
+         # Check if policy allows user to delete attachment
+-        checkpoint_guards.check_volume(
+-            ctxt, attachment.volume_id, 'attachment')
++        checkpoint_guards.attachment(
++            ctxt, attachment.volume_id, 'disconnect',
++            attachment_id=attachment.id)
+         ctxt.authorize(attachment_policy.DELETE_POLICY,
+                        target_obj=attachment)
+ 
+diff --git a/cinder/volume/manager.py b/cinder/volume/manager.py
+index 525aeaa..4997666 100644
+--- a/cinder/volume/manager.py
++++ b/cinder/volume/manager.py
+@@ -5010,7 +5010,11 @@ class VolumeManager(manager.CleanableManager,
+         param: connector: Connector object to use for attachment creation
+         param: attachment_ref: ID of the attachment record to update
+         """
+-        checkpoint_guards.check_volume(context, vref, 'attachment')
++        checkpoint_guards.attachment(
++            context, vref.id, 'reconnect', attachment_id=attachment_id)
++        if context.checkpoint_operation_id:
++            checkpoint_manager.CheckpointManager(self)._volume(
++                context, vref.id)
+ 
+         mode = connector.get('mode', 'rw')
+         self._notify_about_volume_usage(context, vref, 'attach.start')
+@@ -5114,7 +5118,11 @@ class VolumeManager(manager.CleanableManager,
+         param: attachment_id: Attachment id to remove
+         param: vref: Volume object associated with the attachment
+         """
+-        checkpoint_guards.check_volume(context, vref, 'attachment')
++        checkpoint_guards.attachment(
++            context, vref.id, 'disconnect', attachment_id=attachment_id)
++        if context.checkpoint_operation_id:
++            checkpoint_manager.CheckpointManager(self)._volume(
++                context, vref.id)
+         volume_utils.require_driver_initialized(self.driver)
+         attachment = objects.VolumeAttachment.get_by_id(context, attachment_id)
+ 
+diff --git a/cinder/volume/rpcapi.py b/cinder/volume/rpcapi.py
+index aafb115..bd9b392 100644
+--- a/cinder/volume/rpcapi.py
++++ b/cinder/volume/rpcapi.py
+@@ -503,7 +503,11 @@ class VolumeAPI(rpc.RPCAPI):
+ 
+     @rpc.assert_min_rpc_version('3.9')
+     def attachment_update(self, ctxt, vref, connector, attachment_id):
+-        version = self._compat_ver('3.9')
++        if ctxt.checkpoint_operation_id:
++            self.assert_checkpoint_ready(ctxt, vref)
++            version = '3.21'
++        else:
++            version = self._compat_ver('3.9')
+         cctxt = self._get_cctxt(vref.service_topic_queue, version=version)
+         return cctxt.call(ctxt,
+                           'attachment_update',
+@@ -513,7 +517,11 @@ class VolumeAPI(rpc.RPCAPI):
+ 
+     @rpc.assert_min_rpc_version('3.9')
+     def attachment_delete(self, ctxt, attachment_id, vref):
+-        version = self._compat_ver('3.9')
++        if ctxt.checkpoint_operation_id:
++            self.assert_checkpoint_ready(ctxt, vref)
++            version = '3.21'
++        else:
++            version = self._compat_ver('3.9')
+         cctxt = self._get_cctxt(vref.service_topic_queue, version=version)
+         return cctxt.call(ctxt,
+                           'attachment_delete',

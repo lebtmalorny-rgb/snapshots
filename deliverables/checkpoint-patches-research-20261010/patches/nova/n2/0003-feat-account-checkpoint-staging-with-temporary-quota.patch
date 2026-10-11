@@ -1,0 +1,1283 @@
+From cf04e02fcd7f17a5f8a4ae0051d89718a1c2bd29 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 20:54:34 +0300
+Subject: [PATCH 03/10] feat: account checkpoint staging with temporary quota
+ tickets
+
+---
+ nova/checkpoints/contracts_v2.py              |  15 ++
+ nova/checkpoints/quota.py                     |  81 +++++++
+ nova/db/api/checkpoint_temporary.py           | 143 ++++++++++++
+ nova/db/api/checkpoints.py                    |   4 +
+ ...b3c951d0_add_checkpoint_temporary_quota.py |  48 ++++
+ nova/db/api/models.py                         |  18 ++
+ nova/db/main/checkpoint_effects.py            |  54 ++++-
+ nova/db/main/checkpoint_temporary.py          | 183 +++++++++++++++
+ nova/db/main/checkpoints.py                   |  43 ++--
+ ...49c32710_add_checkpoint_temporary_quota.py |  42 ++++
+ nova/db/main/models.py                        |  11 +
+ nova/objects/__init__.py                      |   1 +
+ nova/objects/checkpoint.py                    |  20 ++
+ nova/objects/checkpoint_temporary.py          |  41 ++++
+ .../functional/db/test_checkpoint_effects.py  |  80 ++++++-
+ .../db/test_checkpoint_temporary_quota.py     | 211 ++++++++++++++++++
+ nova/tests/unit/db/api/test_migrations.py     |  10 +
+ nova/tests/unit/db/main/test_migrations.py    |  12 +
+ nova/tests/unit/objects/test_objects.py       |   3 +-
+ 19 files changed, 995 insertions(+), 25 deletions(-)
+ create mode 100644 nova/db/api/checkpoint_temporary.py
+ create mode 100644 nova/db/api/migrations/versions/82e7b3c951d0_add_checkpoint_temporary_quota.py
+ create mode 100644 nova/db/main/checkpoint_temporary.py
+ create mode 100644 nova/db/main/migrations/versions/6eaf49c32710_add_checkpoint_temporary_quota.py
+ create mode 100644 nova/objects/checkpoint_temporary.py
+ create mode 100644 nova/tests/functional/db/test_checkpoint_temporary_quota.py
+
+diff --git a/nova/checkpoints/contracts_v2.py b/nova/checkpoints/contracts_v2.py
+index 44f252223ce6159898732be8ca1b429923474a5e..647b97551faf7dc9cdce5e11f10f5cc27b3579bb 100644
+--- a/nova/checkpoints/contracts_v2.py
++++ b/nova/checkpoints/contracts_v2.py
+@@ -409,3 +409,18 @@ def validate_child_result(action, value):
+         return _validate(value, lambda e: _child_success(action, e))
+     except (ValueError, TypeError, KeyError, AttributeError):
+         return EffectResult('unknown', {}, 'invalid_executor_result')
++
++
++def temporary_identity(operation, total_bytes):
++    v1._integer(total_bytes, minimum=1)
++    if operation.kind != 'revert' or operation.generation != 1:
++        raise ValueError('Temporary quota requires a revert operation')
++    if operation.admission.get('schema_version') == 2:
++        v1._require(total_bytes >= operation.admission['restore_bytes_limit'])
++    return dict(operation_id=operation.uuid,
++                checkpoint_id=operation.checkpoint_id,
++                project_id=operation.project_id,
++                instance_uuid=operation.instance_uuid,
++                cell_uuid=operation.cell_uuid, reserved_bytes=total_bytes,
++                version=1, admission_hash=v1.canonical_payload_hash(
++                    operation.admission))
+diff --git a/nova/checkpoints/quota.py b/nova/checkpoints/quota.py
+index 345026bcbec66973a543d80b1476059b9fa1d70b..2a3eb80077fa8399762f157b7c40daf0e98ca512 100644
+--- a/nova/checkpoints/quota.py
++++ b/nova/checkpoints/quota.py
+@@ -17,7 +17,9 @@ the cell must first fence late admission with an immutable cancellation.
+ """
+ 
+ from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
+ from nova import context as nova_context
++from nova.db.api import checkpoint_temporary as temporary_db
+ from nova.db.api import checkpoints as db
+ from nova import exception
+ from nova import objects
+@@ -207,3 +209,82 @@ class QuotaLedger:
+         if len(rows) == limit:
+             report['next_marker'] = rows[-1]['id']
+         return report
++
++    @staticmethod
++    def _temporary_object(context, row):
++        return objects.CheckpointTemporaryTicket._from_row(context, row)
++
++    @staticmethod
++    def _temporary_payload(ticket):
++        return dict(id=ticket.id, identity=ticket.identity,
++                    payload_hash=ticket.payload_hash)
++
++    def get_temporary(self, context, ticket_id):
++        return self._temporary_object(
++            context, temporary_db.get(context, ticket_id))
++
++    def reserve_temporary(self, context, operation_id, cell_uuid, total_bytes):
++        c._uuid(operation_id)
++        c._uuid(cell_uuid)
++        cell = objects.CellMapping.get_by_uuid(context, cell_uuid)
++        if cell.is_cell0():
++            raise exception.CheckpointUnavailable(reason='cell_unavailable')
++        with nova_context.target_cell(context, cell) as ctx:
++            operation = objects.InstanceCheckpointOperation.get_by_uuid(
++                ctx, operation_id)
++        if (operation.cell_uuid != cell_uuid or operation.kind != 'revert' or
++                operation.state not in ('reserved', 'running',
++                                        'recovery_required')):
++            raise exception.CheckpointConflict(reason='identity_changed')
++        value = v2.temporary_identity(operation, total_bytes)
++        return self._temporary_object(
++            context, temporary_db.reserve(context, value))
++
++    def confirm_temporary(self, context, ticket_id):
++        ticket = self.get_temporary(context, ticket_id)
++        if ticket.state == 'released':
++            raise exception.CheckpointConflict()
++        payload = self._temporary_payload(ticket)
++        with self._cell(context, ticket) as ctx:
++            objects.InstanceCheckpointOperation.bind_temporary(ctx, payload)
++        ticket = self._temporary_object(context, temporary_db.confirm(
++            context, ticket.id, ticket.payload_hash, ticket.version))
++        with self._cell(context, ticket) as ctx:
++            objects.InstanceCheckpointOperation.confirm_temporary(ctx, payload)
++        return ticket
++
++    def release_temporary(self, context, ticket_id):
++        ticket = self.get_temporary(context, ticket_id)
++        if ticket.state == 'released':
++            return ticket
++        with self._cell(context, ticket) as ctx:
++            proof = objects.InstanceCheckpointOperation.temporary_close_proof(
++                ctx, ticket.operation_id, ticket.id)
++            if proof is None:
++                proof = objects.InstanceCheckpointOperation.cancel_temporary(
++                    ctx, ticket.operation_id, ticket.id)
++        return self._temporary_object(context, temporary_db.release(
++            context, ticket_id, proof))
++
++    def reconcile_temporary(self, context, limit=100, marker=None):
++        rows = temporary_db.list_tickets(context, limit=limit, marker=marker)
++        report = dict(processed=0, failed=0, next_marker=None)
++        for row in rows:
++            try:
++                ticket = self._temporary_object(context, row)
++                if ticket.state != 'released':
++                    with self._cell(context, ticket) as ctx:
++                        proof = (objects.InstanceCheckpointOperation.
++                            temporary_close_proof(ctx, ticket.operation_id,
++                                                  ticket.id))
++                    if proof:
++                        self._temporary_object(context, temporary_db.release(
++                            context, ticket.id, proof))
++                    else:
++                        self.confirm_temporary(context, ticket.id)
++                report['processed'] += 1
++            except Exception:
++                report['failed'] += 1
++        if len(rows) == limit:
++            report['next_marker'] = rows[-1]['id']
++        return report
+diff --git a/nova/db/api/checkpoint_temporary.py b/nova/db/api/checkpoint_temporary.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ec4c5886829a793ef053a481d3aac3f7d70baf69
+--- /dev/null
++++ b/nova/db/api/checkpoint_temporary.py
+@@ -0,0 +1,143 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Temporary bytes share the permanent project lock and mapping fence."""
++
++from oslo_serialization import jsonutils
++from oslo_utils import uuidutils
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova.db.api import checkpoints as ledger
++from nova.db.api import models as m
++from nova.db.utils import require_context
++from nova import exception
++
++
++def _row(row):
++    values = ledger._row(row)
++    for key in ('identity', 'closing_proof'):
++        if values[key] is not None:
++            values[key] = jsonutils.loads(values[key])
++    return values
++
++
++def _ticket(context, ticket_id):
++    row = context.session.get(m.CheckpointTemporaryTicket, ticket_id)
++    if row is None:
++        raise exception.NotFound()
++    ledger._authorize(context, row.project_id)
++    return row
++
++
++def _locked(context, ticket_id):
++    row = _ticket(context, ticket_id)
++    usage = ledger._usage(context, row.project_id)
++    context.session.refresh(row, with_for_update=True)
++    return usage, row
++
++
++@require_context
++@ledger._reader
++def get(context, ticket_id):
++    return _row(_ticket(context, ticket_id))
++
++
++@require_context
++@ledger._retry
++@ledger._writer
++def reserve(context, value):
++    c._keys(value, ('operation_id', 'checkpoint_id', 'project_id',
++                   'instance_uuid', 'cell_uuid', 'reserved_bytes',
++                   'version', 'admission_hash'))
++    for name in ('operation_id', 'checkpoint_id',
++                 'instance_uuid', 'cell_uuid'):
++        c._uuid(value[name])
++    c._integer(value['reserved_bytes'], minimum=1)
++    c._integer(value['version'], minimum=1, maximum=1)
++    c._digest(value['admission_hash'])
++    usage = ledger._usage(context, value['project_id'])
++    digest = c.canonical_payload_hash(value)
++    existing = context.session.query(m.CheckpointTemporaryTicket).filter_by(
++        operation_id=value['operation_id']).first()
++    if existing:
++        ledger._authorize(context, existing.project_id)
++        if existing.payload_hash != digest:
++            ledger._conflict()
++        return _row(existing)
++    mapping = ledger.lock_instance_mapping(context, value['instance_uuid'])
++    cell = context.session.get(m.CellMapping, mapping.cell_id) if (
++        mapping is not None and mapping.cell_id is not None) else None
++    if cell is None or cell.uuid != value['cell_uuid'] or (
++            mapping.project_id != value['project_id']):
++        raise exception.CheckpointConflict(reason='identity_changed')
++    ledger._charge(usage, usage.checkpoint_count,
++                   usage.artifact_bytes + value['reserved_bytes'])
++    fields = {k: v for k, v in value.items() if k != 'admission_hash'}
++    row = m.CheckpointTemporaryTicket(
++        id=uuidutils.generate_uuid(), **fields, payload_hash=digest,
++        identity=jsonutils.dumps(value, sort_keys=True), state='held')
++    context.session.add(row)
++    context.session.flush()
++    return _row(row)
++
++
++@require_context
++@ledger._retry
++@ledger._writer
++def confirm(context, ticket_id, payload_hash, version):
++    usage, row = _locked(context, ticket_id)
++    if (row.state == 'released' or row.payload_hash != payload_hash or
++            row.version != version):
++        ledger._conflict()
++    row.state = 'confirmed'
++    context.session.flush()
++    return _row(row)
++
++
++@require_context
++@ledger._retry
++@ledger._writer
++def release(context, ticket_id, primitive):
++    usage, row = _locked(context, ticket_id)
++    proof = v2.TemporaryProof.from_primitive(primitive)
++    if (proof.ticket_id, proof.operation_id,
++            proof.cell_uuid, proof.version) != (
++            row.id, row.operation_id, row.cell_uuid, row.version):
++        ledger._conflict()
++    encoded = jsonutils.dumps(proof.to_primitive(), sort_keys=True)
++    if row.state == 'released':
++        if row.closing_proof != encoded:
++            ledger._conflict()
++        return _row(row)
++    usage.artifact_bytes -= row.reserved_bytes
++    if usage.artifact_bytes < 0:
++        ledger._conflict()
++    usage.version += 1
++    row.state = 'released'
++    row.closing_proof = encoded
++    context.session.flush()
++    return _row(row)
++
++
++@require_context
++@ledger._reader
++def list_tickets(context, limit=100, marker=None):
++    c._integer(limit, minimum=1, maximum=1000)
++    query = context.session.query(m.CheckpointTemporaryTicket)
++    if not context.is_admin:
++        query = query.filter_by(project_id=context.project_id)
++    if marker:
++        c._uuid(marker)
++        query = query.filter(m.CheckpointTemporaryTicket.id > marker)
++    return [_row(row) for row in query.order_by(
++        m.CheckpointTemporaryTicket.id).limit(limit)]
+diff --git a/nova/db/api/checkpoints.py b/nova/db/api/checkpoints.py
+index 63846c028781f5bdfa0a63d1e0d56b411065bed6..92f2c7d1a1d137a07dea82fbd665b85571fd818b 100644
+--- a/nova/db/api/checkpoints.py
++++ b/nova/db/api/checkpoints.py
+@@ -160,6 +160,10 @@ def guard_mapping_mutation(context, mapping, updates=None):
+         .first()
+     ):
+         raise exception.CheckpointConflict(reason='identity_changed')
++    if context.session.query(m.CheckpointTemporaryTicket).filter_by(
++            instance_uuid=mapping.instance_uuid).filter(
++                m.CheckpointTemporaryTicket.state != 'released').first():
++        raise exception.CheckpointConflict(reason='identity_changed')
+ 
+ 
+ @require_context
+diff --git a/nova/db/api/migrations/versions/82e7b3c951d0_add_checkpoint_temporary_quota.py b/nova/db/api/migrations/versions/82e7b3c951d0_add_checkpoint_temporary_quota.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7aa1432a5f232aca5f837fc19f8759e3a1bfee13
+--- /dev/null
++++ b/nova/db/api/migrations/versions/82e7b3c951d0_add_checkpoint_temporary_quota.py
+@@ -0,0 +1,48 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Add durable temporary checkpoint quota to the api database.
++
++Revision ID: 82e7b3c951d0
++Revises: 71be90d2c402
++"""
++
++from alembic import op
++import sqlalchemy as sa
++
++revision = '82e7b3c951d0'
++down_revision = '71be90d2c402'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    op.create_table(
++        'checkpoint_temporary_tickets',
++        sa.Column('id', sa.String(36), primary_key=True, nullable=False),
++        sa.Column('operation_id', sa.String(36), nullable=False),
++        sa.Column('checkpoint_id', sa.String(36), nullable=False),
++        sa.Column('project_id', sa.String(255), nullable=False),
++        sa.Column('instance_uuid', sa.String(36), nullable=False),
++        sa.Column('cell_uuid', sa.String(36), nullable=False),
++        sa.Column('reserved_bytes', sa.BigInteger, nullable=False),
++        sa.Column('version', sa.Integer, nullable=False),
++        sa.Column('state', sa.String(32), nullable=False),
++        sa.Column('payload_hash', sa.String(64), nullable=False),
++        sa.Column('identity', sa.Text, nullable=False),
++        sa.Column('closing_proof', sa.Text, nullable=True),
++        sa.UniqueConstraint('operation_id',
++                            name='uniq_checkpoint_temporary_operation'),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        mysql_engine='InnoDB', mysql_charset='utf8',
++    )
+diff --git a/nova/db/api/models.py b/nova/db/api/models.py
+index b8569eaf6ff9786b739059cd49d7822d71594bd9..4d73f6bfbdbe69edf48c728a1df9a3123fc039d6 100644
+--- a/nova/db/api/models.py
++++ b/nova/db/api/models.py
+@@ -526,3 +526,21 @@ class CheckpointQuotaTicket(BASE):
+     version = sa.Column(sa.Integer, nullable=False)
+     settled_proof_revision = sa.Column(sa.Integer, nullable=False)
+     admission = sa.Column(sa.Text, nullable=False)
++
++
++class CheckpointTemporaryTicket(BASE):
++    __tablename__ = 'checkpoint_temporary_tickets'
++    __table_args__ = (sa.UniqueConstraint(
++        'operation_id', name='uniq_checkpoint_temporary_operation'),)
++    id = sa.Column(sa.String(36), primary_key=True, nullable=False)
++    operation_id = sa.Column(sa.String(36), nullable=False)
++    checkpoint_id = sa.Column(sa.String(36), nullable=False)
++    project_id = sa.Column(sa.String(255), nullable=False)
++    instance_uuid = sa.Column(sa.String(36), nullable=False)
++    cell_uuid = sa.Column(sa.String(36), nullable=False)
++    reserved_bytes = sa.Column(sa.BigInteger, nullable=False)
++    version = sa.Column(sa.Integer, nullable=False)
++    state = sa.Column(sa.String(32), nullable=False)
++    payload_hash = sa.Column(sa.String(64), nullable=False)
++    identity = sa.Column(sa.Text, nullable=False)
++    closing_proof = sa.Column(sa.Text, nullable=True)
+diff --git a/nova/db/main/checkpoint_effects.py b/nova/db/main/checkpoint_effects.py
+index 4f143df2ce6c6f3a814f83cde1417c7d4b1366b0..3156b39158b06dbf72560fb296288ea370932a11 100644
+--- a/nova/db/main/checkpoint_effects.py
++++ b/nova/db/main/checkpoint_effects.py
+@@ -145,9 +145,16 @@ def claim_parent(context, instance, checkpoint, operation, phase):
+                      volume_ids=[d.volume_id for d in journal._disks(
+                          context, checkpoint.uuid)], artifacts=artifacts)
+     graph = workflow.child_plan(operation.kind, phase, resources)
++    from nova.db.main import checkpoint_temporary as temporary
++    # Preflight/reserve may precede the temporary ticket confirmation.
++    if operation.kind == 'revert' and phase in (
++            'preflight', 'cinder_reserve', 'cinder_release',
++            'cleanup_cinder_release'):
++        total, version = 0, 1
++    else:
++        total, version = temporary.write_budget(context, operation, checkpoint)
+     payload = dict(binding=binding, kind=operation.kind, generation=1,
+-                   budgets=dict(total_bytes=checkpoint.artifact_upper_bound,
+-                                version=checkpoint.artifact_budget_version),
++                   budgets=dict(total_bytes=total, version=version),
+                    children=[item['id'] for item in graph],
+                    resources=resources,
+                    prior={name: jsonutils.loads(step.result)
+@@ -221,6 +228,8 @@ def claim(context, child_id, generation, executor_id, expected_revision):
+     v2.validate_generation(generation)
+     c._integer(expected_revision, minimum=1)
+     parent, checkpoint, operation, child, rows = _child(context, child_id)
++    from nova.db.main import checkpoint_temporary as temporary
++    temporary.assert_dispatch(context, operation, parent.phase)
+     if operation.executor_id != executor_id or not operation.quota_ready:
+         journal._conflict('identity_changed')
+     if child.status != 'prepared' or parent.version != expected_revision:
+@@ -376,6 +385,14 @@ def _reserve(context, child, checkpoint, operation, artifact_id, location,
+                 child.id, namespace, location, upper_bound):
+             journal._conflict('identity_changed')
+         return row
++    from nova.db.main import checkpoint_temporary as temporary
++    total, version = temporary.write_budget(context, operation, checkpoint)
++    charged = sum(r.upper_bound
++                  for r in _reservations(context, checkpoint.uuid)
++                  if r.operation_id == operation.uuid and
++                  r.writer_state != 'deleted')
++    if charged + upper_bound > total:
++        journal._conflict('resources_remaining')
+     row = m.InstanceCheckpointArtifactReservation(
+         id=artifact_id, child_id=child.id, operation_id=operation.uuid,
+         checkpoint_id=checkpoint.uuid, namespace_hash=namespace,
+@@ -528,3 +545,36 @@ def resources_closed(context, checkpoint):
+                    for row in _rows(context, parent)):
+                 return False
+     return True
++
++
++def settlement_resources(context, checkpoint, manifest):
++    steps = {s.phase: s for s in journal._steps(
++        context, checkpoint.create_operation_id)}
++    required = ('artifact_publish_shared', 'runtime_restore_current',
++                'staging_cleanup')
++    if any(p not in steps or steps[p].status != 'succeeded' for p in required):
++        journal._conflict('resources_remaining')
++    if manifest != jsonutils.loads(
++            steps['artifact_publish_shared'].result)['evidence']:
++        journal._conflict('identity_changed')
++    for parent in steps.values():
++        if any(c.status not in TERMINAL for c in _rows(context, parent)):
++            journal._conflict('resources_remaining')
++    rows = _reservations(context, checkpoint.uuid)
++    if any(r.location == 'staging' and r.writer_state != 'deleted'
++           for r in rows):
++        journal._conflict('resources_remaining')
++    shared = [r for r in rows if r.location == 'shared' and
++              r.writer_state != 'deleted']
++    if not shared or any(
++            r.writer_state != 'closed' or r.actual_bytes is None or
++            r.checksum is None for r in shared):
++        journal._conflict('resources_remaining')
++    refs = [v2.ArtifactRef(
++        r.id, r.kind, r.logical_id, r.actual_bytes,
++        r.checksum, r.location).to_primitive() for r in shared]
++    if sorted(refs, key=lambda r: r['id']) != sorted(
++            manifest['artifacts'], key=lambda r: r['id']):
++        journal._conflict('identity_changed')
++    return [dict(id=r.id, checksum=r.checksum, bytes=r.actual_bytes)
++            for r in shared]
+diff --git a/nova/db/main/checkpoint_temporary.py b/nova/db/main/checkpoint_temporary.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fc472ea212906543eadb5265fd537bf2592d765
+--- /dev/null
++++ b/nova/db/main/checkpoint_temporary.py
+@@ -0,0 +1,183 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Cell write authorization and durable temporary quota closing proofs."""
++
++from types import SimpleNamespace
++
++from oslo_serialization import jsonutils
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import contracts_v2 as v2
++from nova.db.main import api as db
++from nova.db.main import checkpoint_effects as effects
++from nova.db.main import checkpoints as journal
++from nova.db.main import models as m
++from nova.db.utils import require_context
++
++
++def _locked(context, operation_id):
++    op = journal._operation(context, operation_id)
++    journal._instance(context, op.instance_uuid, lock=True)
++    journal._guard(context, op.instance_uuid)
++    journal._checkpoint(context, op.checkpoint_id, lock=True)
++    context.session.refresh(op, with_for_update=True)
++    if op.kind != 'revert' or op.generation != 1:
++        journal._conflict()
++    row = context.session.get(m.InstanceCheckpointTemporaryBudget, op.uuid)
++    return op, row
++
++
++def _bind(context, value, confirmed=False):
++    c._keys(value, ('id', 'identity', 'payload_hash'))
++    c._uuid(value['id'])
++    identity = value['identity']
++    op, row = _locked(context, identity['operation_id'])
++    expected = v2.temporary_identity(
++        SimpleNamespace(**journal._row(op)), identity['reserved_bytes'])
++    if (identity != expected or value['payload_hash'] !=
++            c.canonical_payload_hash(identity)):
++        journal._conflict('identity_changed')
++    encoded = journal._encode(identity)
++    if row:
++        if (row.ticket_id != value['id'] or row.identity != encoded or
++                row.state in ('closed', 'cancelled')):
++            journal._conflict()
++    else:
++        journal._owned(context, op.uuid)
++        row = m.InstanceCheckpointTemporaryBudget(
++            operation_id=op.uuid, ticket_id=value['id'], version=1,
++            reserved_bytes=identity['reserved_bytes'], identity=encoded,
++            state='bound')
++        context.session.add(row)
++    if confirmed:
++        row.state = 'confirmed'
++    context.session.flush()
++
++
++@require_context
++@db.pick_context_manager_writer
++def bind(context, value):
++    _bind(context, value)
++
++
++@require_context
++@db.pick_context_manager_writer
++def confirm(context, value):
++    _bind(context, value, confirmed=True)
++
++
++def assert_dispatch(context, operation, phase=None):
++    row = context.session.get(m.InstanceCheckpointTemporaryBudget,
++                              operation.uuid)
++    if row is not None and row.state in ('closed', 'cancelled') and (
++            phase in ('cinder_release', 'cleanup_cinder_release')):
++        return
++    if row is not None and row.state != 'confirmed':
++        journal._conflict('resources_remaining')
++    if operation.contract_version == 2 and operation.kind == 'revert' and (
++            phase not in ('preflight', 'cinder_reserve')):
++        if row is None or row.state != 'confirmed':
++            journal._conflict('resources_remaining')
++
++
++def write_budget(context, operation, checkpoint):
++    if operation.kind != 'revert':
++        return (checkpoint.artifact_upper_bound,
++                checkpoint.artifact_budget_version)
++    assert_dispatch(context, operation, 'artifact_stage')
++    row = context.session.get(m.InstanceCheckpointTemporaryBudget,
++                              operation.uuid)
++    if row is None:
++        journal._conflict('resources_remaining')
++    return row.reserved_bytes, row.version
++
++
++def _closed_proof(context, op, row):
++    if row.closing_proof:
++        return jsonutils.loads(row.closing_proof)
++    phases = {s.phase: s for s in journal._steps(context, op.uuid)}
++    required = ('staging_cleanup' if op.contract_version == 2 else
++                'runtime_restore_checkpoint')
++    if required not in phases or phases[required].status != 'succeeded':
++        return None
++    children = context.session.query(m.InstanceCheckpointEffect).filter_by(
++        operation_id=op.uuid).all()
++    if any(child.status not in effects.TERMINAL for child in children):
++        return None
++    if any(r.writer_state != 'deleted' for r in effects._reservations(
++            context, op.checkpoint_id) if r.operation_id == op.uuid):
++        return None
++    if any(s.status not in effects.TERMINAL for s in phases.values()):
++        return None
++    proof = v2.TemporaryProof(row.ticket_id, op.uuid, op.cell_uuid,
++        row.version, 'staging_deleted', tuple(sorted(c.id for c in children)))
++    row.state = 'closed'
++    row.closing_proof = journal._encode(proof.to_primitive())
++    return proof.to_primitive()
++
++
++@require_context
++@db.pick_context_manager_writer
++def close_proof(context, operation_id, ticket_id):
++    op, row = _locked(context, operation_id)
++    if row is None:
++        return None
++    if row.ticket_id != ticket_id:
++        journal._conflict('identity_changed')
++    return _closed_proof(context, op, row)
++
++
++@require_context
++@db.pick_context_manager_writer
++def cancel(context, operation_id, ticket_id):
++    c._uuid(ticket_id)
++    op, row = _locked(context, operation_id)
++    if row is not None:
++        if row.ticket_id != ticket_id:
++            journal._conflict('identity_changed')
++        proof = _closed_proof(context, op, row)
++        if proof:
++            return proof
++    # Even before bind has arrived, a durable tombstone must reject its late
++    # delivery. Active ownership prevents a cancelled operation being revived.
++    journal._owned(context, operation_id)
++    for parent in journal._steps(context, operation_id):
++        if parent.contract_version == 1:
++            if parent.status == 'failed_no_effect' or (
++                    parent.phase in ('preflight', 'cinder_reserve') and
++                    parent.status == 'succeeded'):
++                continue
++            journal._conflict('resources_remaining')
++        children = effects._rows(context, parent)
++        for child in children:
++            if child.status in ('prepared', 'failed_no_effect'):
++                continue
++            if child.action in ('inspect', 'reserve') and (
++                    child.status == 'succeeded'):
++                continue
++            journal._conflict('resources_remaining')
++    if op.contract_version == 2:
++        effects.cancel_prepared(context, operation_id, 1)
++    if row is None:
++        row = m.InstanceCheckpointTemporaryBudget(
++            operation_id=op.uuid, ticket_id=ticket_id, version=1,
++            reserved_bytes=0, state='cancelled')
++        context.session.add(row)
++    row.state = 'cancelled'
++    children = context.session.query(m.InstanceCheckpointEffect).filter_by(
++        operation_id=op.uuid).all()
++    proof = v2.TemporaryProof(ticket_id, op.uuid, op.cell_uuid, row.version,
++        'cancelled_before_write', tuple(sorted(c.id for c in children)))
++    row.closing_proof = journal._encode(proof.to_primitive())
++    context.session.flush()
++    return proof.to_primitive()
+diff --git a/nova/db/main/checkpoints.py b/nova/db/main/checkpoints.py
+index 781525a77dfbd218ea9e67f1426637ba93e1eb49..a1ce92e0307942e883171a36a66c56f55345db50 100644
+--- a/nova/db/main/checkpoints.py
++++ b/nova/db/main/checkpoints.py
+@@ -617,6 +617,8 @@ def claim_step(context, operation_id, generation, phase, executor_id):
+         (instance.host, instance.node) != (operation.host, operation.node)
+     ):
+         _conflict()
++    from nova.db.main import checkpoint_temporary as temporary
++    temporary.assert_dispatch(context, operation, phase)
+     if operation.contract_version == 2:
+         from nova.db.main import checkpoint_effects as effects
+         return effects.claim_parent(
+@@ -1128,21 +1130,27 @@ def set_artifact_budget(context, operation_id, ticket_version, total_bytes):
+ @db.pick_context_manager_writer
+ def confirm_artifact_usage(context, operation_id, manifest):
+     checkpoint = _budget_checkpoint(context, operation_id)
+-    publish = (
+-        context.session.query(m.InstanceCheckpointStep)
+-        .filter_by(operation_id=operation_id, phase='artifact_publish')
+-        .first()
+-    )
+-    if (
+-        not publish or
+-        publish.status != 'succeeded' or
+-        manifest != jsonutils.loads(publish.result)['evidence']
+-    ):
+-        _conflict('resources_remaining')
+-    artifacts = _artifacts(context, checkpoint.uuid)
+-    if not artifacts or any(item.state != 'available' for item in artifacts):
+-        _conflict('resources_remaining')
+-    byte_count = sum(item.actual_bytes for item in artifacts)
++    if checkpoint.contract_version == 2:
++        from nova.db.main import checkpoint_effects as effects
++        resources = effects.settlement_resources(context, checkpoint, manifest)
++    else:
++        publish = (
++            context.session.query(m.InstanceCheckpointStep)
++            .filter_by(operation_id=operation_id, phase='artifact_publish')
++            .first()
++        )
++        if (
++            not publish or
++            publish.status != 'succeeded' or
++            manifest != jsonutils.loads(publish.result)['evidence']
++        ):
++            _conflict('resources_remaining')
++        artifacts = _artifacts(context, checkpoint.uuid)
++        if not artifacts or any(a.state != 'available' for a in artifacts):
++            _conflict('resources_remaining')
++        resources = [dict(id=a.uuid, checksum=a.checksum, bytes=a.actual_bytes)
++                     for a in artifacts]
++    byte_count = sum(a['bytes'] for a in resources)
+     if byte_count > checkpoint.artifact_upper_bound:
+         _conflict()
+     proof = dict(
+@@ -1151,10 +1159,7 @@ def confirm_artifact_usage(context, operation_id, manifest):
+         cell_uuid=checkpoint.cell_uuid,
+         bytes=byte_count,
+         ticket_version=checkpoint.artifact_budget_version,
+-        artifacts=[
+-            dict(id=item.uuid, checksum=item.checksum, bytes=item.actual_bytes)
+-            for item in artifacts
+-        ],
++        artifacts=resources,
+     )
+     if checkpoint.artifact_usage_proof:
+         previous = jsonutils.loads(checkpoint.artifact_usage_proof)
+diff --git a/nova/db/main/migrations/versions/6eaf49c32710_add_checkpoint_temporary_quota.py b/nova/db/main/migrations/versions/6eaf49c32710_add_checkpoint_temporary_quota.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..58fd44c3f05e277e3765659890042ca599deb9f4
+--- /dev/null
++++ b/nova/db/main/migrations/versions/6eaf49c32710_add_checkpoint_temporary_quota.py
+@@ -0,0 +1,42 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Add durable temporary checkpoint quota to the main database.
++
++Revision ID: 6eaf49c32710
++Revises: 5d9b2ea784c1
++"""
++
++from alembic import op
++import sqlalchemy as sa
++
++revision = '6eaf49c32710'
++down_revision = '5d9b2ea784c1'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    op.create_table(
++        'instance_checkpoint_temporary_budgets',
++        sa.Column('operation_id', sa.String(36),
++                  primary_key=True, nullable=False),
++        sa.Column('ticket_id', sa.String(36), nullable=False),
++        sa.Column('reserved_bytes', sa.BigInteger, nullable=False),
++        sa.Column('version', sa.Integer, nullable=False),
++        sa.Column('state', sa.String(32), nullable=False),
++        sa.Column('identity', sa.Text, nullable=True),
++        sa.Column('closing_proof', sa.Text, nullable=True),
++        sa.Column('created_at', sa.DateTime),
++        sa.Column('updated_at', sa.DateTime),
++        mysql_engine='InnoDB', mysql_charset='utf8',
++    )
+diff --git a/nova/db/main/models.py b/nova/db/main/models.py
+index 5391f7f40f6c3687f9a4c63ff8d93c810a517595..2428665edca7b5de7e2539f82d702e206ae50646 100644
+--- a/nova/db/main/models.py
++++ b/nova/db/main/models.py
+@@ -1460,3 +1460,14 @@ class InstanceCheckpointArtifactReservation(BASE, NovaBase):
+     checksum = sa.Column(sa.String(64), nullable=True)
+     writer_state = sa.Column(sa.String(32), nullable=False)
+     cleanup_child_id = sa.Column(sa.String(36), nullable=True)
++
++
++class InstanceCheckpointTemporaryBudget(BASE, NovaBase):
++    __tablename__ = 'instance_checkpoint_temporary_budgets'
++    operation_id = sa.Column(sa.String(36), primary_key=True, nullable=False)
++    ticket_id = sa.Column(sa.String(36), nullable=False)
++    reserved_bytes = sa.Column(sa.BigInteger, nullable=False)
++    version = sa.Column(sa.Integer, nullable=False)
++    state = sa.Column(sa.String(32), nullable=False)
++    identity = sa.Column(sa.Text, nullable=True)
++    closing_proof = sa.Column(sa.Text, nullable=True)
+diff --git a/nova/objects/__init__.py b/nova/objects/__init__.py
+index e94032b780a8a7807e8db1345c3e0dcc9b23ef43..5b8eaedac87b0a985fbb8f1ca2d01ed287e177c3 100644
+--- a/nova/objects/__init__.py
++++ b/nova/objects/__init__.py
+@@ -30,6 +30,7 @@ def register_all():
+     __import__('nova.objects.cell_mapping')
+     __import__('nova.objects.checkpoint')
+     __import__('nova.objects.checkpoint_effect')
++    __import__('nova.objects.checkpoint_temporary')
+     __import__('nova.objects.compute_node')
+     __import__('nova.objects.diagnostics')
+     __import__('nova.objects.console_auth_token')
+diff --git a/nova/objects/checkpoint.py b/nova/objects/checkpoint.py
+index deebe04b76a769173d3e8d408662ea04d5ba75b5..769b21fc5458473fd4c6f6f9a783d6fec3bcd51c 100644
+--- a/nova/objects/checkpoint.py
++++ b/nova/objects/checkpoint.py
+@@ -201,6 +201,26 @@ class InstanceCheckpointOperation(_VersionTwo, _Projection):
+         'admission': CheckpointJSONField(),
+     }
+ 
++    @base.remotable_classmethod
++    def bind_temporary(cls, context, ticket):
++        from nova.db.main import checkpoint_temporary as temporary
++        temporary.bind(context, ticket)
++
++    @base.remotable_classmethod
++    def confirm_temporary(cls, context, ticket):
++        from nova.db.main import checkpoint_temporary as temporary
++        temporary.confirm(context, ticket)
++
++    @base.remotable_classmethod
++    def temporary_close_proof(cls, context, operation_id, ticket_id):
++        from nova.db.main import checkpoint_temporary as temporary
++        return temporary.close_proof(context, operation_id, ticket_id)
++
++    @base.remotable_classmethod
++    def cancel_temporary(cls, context, operation_id, ticket_id):
++        from nova.db.main import checkpoint_temporary as temporary
++        return temporary.cancel(context, operation_id, ticket_id)
++
+     @base.remotable_classmethod
+     def admit(cls, context, admission, ticket_id):
+         admission = contracts_v2.decode_admission(admission)
+diff --git a/nova/objects/checkpoint_temporary.py b/nova/objects/checkpoint_temporary.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f514ca2f92ce1c0d297d8e851d62b0d23dd09cc
+--- /dev/null
++++ b/nova/objects/checkpoint_temporary.py
+@@ -0,0 +1,41 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Read-only projection of an API DB temporary byte reservation."""
++
++from nova.db.api import checkpoint_temporary as db
++from nova.objects import base
++from nova.objects import checkpoint
++from nova.objects import fields
++
++
++@base.NovaObjectRegistry.register
++class CheckpointTemporaryTicket(checkpoint._Projection):
++    VERSION = '1.0'
++    fields = {
++        'id': fields.UUIDField(),
++        'operation_id': fields.UUIDField(),
++        'checkpoint_id': fields.UUIDField(),
++        'project_id': fields.StringField(),
++        'instance_uuid': fields.UUIDField(),
++        'cell_uuid': fields.UUIDField(),
++        'reserved_bytes': fields.IntegerField(),
++        'version': fields.IntegerField(),
++        'state': fields.StringField(),
++        'payload_hash': fields.StringField(),
++        'identity': checkpoint.CheckpointJSONField(),
++        'closing_proof': checkpoint.CheckpointJSONField(nullable=True),
++    }
++
++    @base.remotable_classmethod
++    def get_by_uuid(cls, context, ticket_id):
++        return cls._from_row(context, db.get(context, ticket_id))
+diff --git a/nova/tests/functional/db/test_checkpoint_effects.py b/nova/tests/functional/db/test_checkpoint_effects.py
+index c53cef4883b8539a0f503c8ae4f9df29307c801f..b046b68d8ff0a2222d89e39d5c26afe17772b24c 100644
+--- a/nova/tests/functional/db/test_checkpoint_effects.py
++++ b/nova/tests/functional/db/test_checkpoint_effects.py
+@@ -19,6 +19,7 @@ from oslo_db.sqlalchemy import test_fixtures
+ from oslo_utils.fixture import uuidsentinel as uuids
+ from oslo_versionedobjects import exception as ovo_exception
+ 
++from nova.checkpoints import contracts as c
+ from nova.checkpoints import contracts_v2 as v2
+ from nova import context
+ from nova.db.main import api as db_api
+@@ -233,9 +234,9 @@ class EffectTests:
+                 exception.CheckpointConflict, journal.claim_step,
+                 self.ctx, other.operation_id, 1,
+                 'runtime_save', 'test-executor')
+-        self.assertEqual(['preflight', 'cinder_reserve'], [r['phase'] for r in
+-            sorted(journal.steps_get(self.ctx, other.operation_id),
+-                   key=lambda r: r['created_at'])])
++        self.assertCountEqual(['preflight', 'cinder_reserve'],
++            [r['phase'] for r in journal.steps_get(
++                self.ctx, other.operation_id)])
+         self.assertEqual([], effects.get_reservations(self.ctx,
+                                                       uuids.checkpoint2))
+         self.assertEqual(original, effects.get_reservations(
+@@ -272,6 +273,79 @@ class EffectTests:
+         self.assertEqual('unknown', journal.step_get(
+             self.ctx, self.parent.id)['status'])
+ 
++    def test_peak_budget_reserves_both_copies_before_writing(self):
++        with mock.patch.object(effects, '_artifact_plan', return_value=[
++                dict(id=uuids.ram, kind='ram', location='staging',
++                     upper_bound=4096),
++                dict(id=uuids.config, kind='config', location='staging',
++                     upper_bound=4096)]):
++            self.assertRaises(exception.CheckpointConflict, self.save_parent)
++        self.assertEqual([], effects.get_reservations(self.ctx,
++                                                      uuids.checkpoint))
++        self.assertNotIn('runtime_save', [s['phase'] for s in
++            journal.steps_get(self.ctx, uuids.operation)])
++
++    def prepare_settlement_state(self):
++        value = self.complete_save_child()
++        objects.InstanceCheckpointOperation.finish_step(
++            self.ctx, self.parent.id, 1, value.to_primitive())
++        original = effects.get_reservations(self.ctx, uuids.checkpoint)[0]
++        shared = v2.ArtifactRef(uuids.shared, 'ram', 'shared-logical',
++                               1024, 'c' * 64, 'shared').to_primitive()
++        manifest = dict(artifacts=[shared])
++
++        @db_api.pick_context_manager_writer
++        def completed_adapter_state(ctx):
++            # Seed the post-adapter state for this isolated accounting test.
++            # Full execution reaches it through adapters in the N2 suite.
++            writer = ctx.session.get(models.InstanceCheckpointEffect,
++                                     original['child_id'])
++            ctx.session.add(models.InstanceCheckpointArtifactReservation(
++                id=uuids.shared, child_id=writer.id,
++                operation_id=uuids.operation, checkpoint_id=uuids.checkpoint,
++                namespace_hash='d' * 64, logical_id='shared-logical',
++                kind='ram', location='shared', upper_bound=1024,
++                actual_bytes=1024, checksum='c' * 64, writer_state='closed'))
++            for phase, ident in (
++                    ('artifact_publish_shared', uuids.published),
++                    ('runtime_restore_current', uuids.restored),
++                    ('staging_cleanup', uuids.cleaned)):
++                result = v2.EffectResult('succeeded', manifest, None)
++                ctx.session.add(models.InstanceCheckpointStep(
++                    uuid=ident, operation_id=uuids.operation, generation=1,
++                    phase=phase, executor_id='test-executor',
++                    payload_hash=c.canonical_payload_hash({}), payload='{}',
++                    status='succeeded', result=journal._encode(
++                        result.to_primitive()), version=1, contract_version=2,
++                    child_plan_count=0,
++                    child_plan_hash=c.canonical_payload_hash(
++                        {'children': []})))
++        completed_adapter_state(self.ctx)
++        return original, manifest
++
++    def test_v2_settlement_waits_for_real_staging_deletion(self):
++        original, manifest = self.prepare_settlement_state()
++        self.assertRaises(exception.CheckpointConflict,
++            objects.InstanceCheckpointOperation.confirm_artifact_usage,
++            self.ctx, uuids.operation, manifest)
++        self.assertIsNone(objects.InstanceCheckpointOperation.
++            artifact_usage_proof(self.ctx, uuids.operation))
++
++        @db_api.pick_context_manager_writer
++        def mark_deleted(ctx):
++            row = ctx.session.get(models.InstanceCheckpointArtifactReservation,
++                                  original['id'])
++            row.writer_state = 'deleted'
++        mark_deleted(self.ctx)
++        objects.InstanceCheckpointOperation.confirm_artifact_usage(
++            self.ctx, uuids.operation, manifest)
++        proof = objects.InstanceCheckpointOperation.artifact_usage_proof(
++            self.ctx, uuids.operation)
++        self.assertEqual(1024, proof['bytes'])
++        self.assertEqual([uuids.shared], [r['id'] for r in proof['artifacts']])
++        self.assertEqual(1024, objects.InstanceCheckpoint.get_by_uuid(
++            self.ctx, uuids.checkpoint).artifact_upper_bound)
++
+     def test_v2_objects_cannot_be_downgraded(self):
+         self.assertRaises(ovo_exception.UnsupportedObjectError,
+                           self.operation.obj_to_primitive,
+diff --git a/nova/tests/functional/db/test_checkpoint_temporary_quota.py b/nova/tests/functional/db/test_checkpoint_temporary_quota.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d78976563aa9f5d0b2149ccca74db7c3d9fe2d53
+--- /dev/null
++++ b/nova/tests/functional/db/test_checkpoint_temporary_quota.py
+@@ -0,0 +1,211 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import threading
++from unittest import mock
++
++from oslo_db.sqlalchemy import test_fixtures
++
++from nova.checkpoints import contracts
++from nova.checkpoints import quota
++from nova import context
++from nova.db.api import checkpoint_temporary as temporary_db
++from nova.db.main import checkpoints as journal
++from nova import exception
++from nova import objects
++from nova import test
++from nova.tests.fixtures import checkpoints
++from nova.tests.functional.db import test_checkpoint_quota
++
++
++class TemporaryQuotaTest(checkpoints.CheckpointTestCase):
++    """Quota protocol uses real settled points, cell journals and API SQL.
++
++    The existing executor fixture supplies completed points. This tests the
++    independent quota protocol; v2 runtime adapter integration is tested with
++    the executor in its own suite.
++    """
++    def setUp(self):
++        super().setUp()
++        self.ledger = quota.QuotaLedger()
++        self.reverts = []
++        for index in range(2):
++            point = self.create(index=index)
++            self.assertEqual(
++                'succeeded', self.operation(point, index)['state'])
++            with mock.patch.object(self.conductor.compute_task_mgr,
++                    'checkpoint_run', side_effect=TimeoutError()):
++                result = self.action(point['checkpoint']['id'], 'revert',
++                                     index=index)
++            self.reverts.append(result['operation']['id'])
++        self.assertEqual(2048, self.usage()['artifact_bytes'])
++        self.assertEqual(2, self.usage()['checkpoint_count'])
++
++    def reserve_temp(self, index=0, size=4096):
++        return self.ledger.reserve_temporary(
++            self.ctx, self.reverts[index], self.cells[index].uuid, size)
++
++    def test_permanent_and_temporary_share_project_limit(self):
++        self.flags(max_artifact_bytes_per_project=8192, group='checkpoint')
++        ticket = self.reserve_temp(size=6144)
++        self.assertEqual(8192, self.usage()['artifact_bytes'])
++        self.assertEqual(2, self.usage()['checkpoint_count'])
++        self.assertRaises(exception.CheckpointQuotaExceeded,
++                          self.reserve_temp, 1, 1)
++        self.assertEqual(ticket.id, self.reserve_temp(size=6144).id)
++        self.assertRaises(exception.CheckpointConflict,
++                          self.reserve_temp, 0, 6143)
++
++    def test_cancelled_ticket_fences_late_confirmation_and_dispatch(self):
++        ticket = self.reserve_temp()
++        released = self.ledger.release_temporary(self.ctx, ticket.id)
++        self.assertEqual('released', released.state)
++        self.assertEqual(2048, self.usage()['artifact_bytes'])
++        self.assertEqual(2, self.usage()['checkpoint_count'])
++        self.assertRaises(exception.CheckpointConflict,
++            self.ledger.confirm_temporary, self.ctx, ticket.id)
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            op = objects.InstanceCheckpointOperation.get_by_uuid(
++                ctx, self.reverts[0])
++            self.assertRaises(exception.CheckpointConflict, journal.claim_step,
++                ctx, op.uuid, 1, 'preflight', op.executor_id)
++            self.assertEqual(op.uuid, journal.guard_get(
++                ctx, op.instance_uuid)['operation_id'])
++        self.assertEqual('released', self.ledger.release_temporary(
++            self.ctx, ticket.id).state)
++
++    def test_unknown_writer_does_not_refund(self):
++        ticket = self.reserve_temp()
++        self.ledger.confirm_temporary(self.ctx, ticket.id)
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            op = objects.InstanceCheckpointOperation.get_by_uuid(
++                ctx, self.reverts[0])
++            step = journal.claim_step(ctx, op.uuid, 1, 'preflight',
++                                      op.executor_id)
++            journal.finish_step(ctx, step.id, 1, contracts.StepResult(
++                'unknown', {}, 'recovery_required'))
++        self.assertRaises(exception.CheckpointConflict,
++            self.ledger.release_temporary, self.ctx, ticket.id)
++        self.assertEqual('confirmed', self.ledger.get_temporary(
++            self.ctx, ticket.id).state)
++        self.assertEqual(6144, self.usage()['artifact_bytes'])
++
++    def test_lost_cell_confirmation_is_repaired(self):
++        ticket = self.reserve_temp()
++        with mock.patch.object(objects.InstanceCheckpointOperation,
++                'confirm_temporary', side_effect=TimeoutError()):
++            self.assertRaises(TimeoutError, self.ledger.confirm_temporary,
++                              self.ctx, ticket.id)
++        self.assertEqual('confirmed', self.ledger.get_temporary(
++            self.ctx, ticket.id).state)
++        report = self.ledger.reconcile_temporary(self.ctx)
++        self.assertEqual(0, report['failed'])
++        with context.target_cell(self.ctx, self.cells[0]) as ctx:
++            op = objects.InstanceCheckpointOperation.get_by_uuid(
++                ctx, self.reverts[0])
++            self.assertIsNotNone(journal.claim_step(
++                ctx, op.uuid, 1, 'preflight', op.executor_id))
++
++    def test_lost_refund_reply_does_not_subtract_twice(self):
++        ticket = self.reserve_temp()
++        release = temporary_db.release
++
++        def lose_reply(*args):
++            release(*args)
++            raise TimeoutError()
++
++        with mock.patch.object(
++                temporary_db, 'release', side_effect=lose_reply):
++            self.assertRaises(TimeoutError, self.ledger.release_temporary,
++                              self.ctx, ticket.id)
++        self.assertEqual(2048, self.usage()['artifact_bytes'])
++        self.assertEqual('released', self.ledger.release_temporary(
++            self.ctx, ticket.id).state)
++        self.assertEqual(2048, self.usage()['artifact_bytes'])
++        self.assertEqual(2, self.usage()['checkpoint_count'])
++
++    def test_cell_down_does_not_refund(self):
++        ticket = self.reserve_temp()
++        with mock.patch.object(self.ledger, '_cell',
++                               side_effect=TimeoutError()):
++            self.assertRaises(TimeoutError, self.ledger.release_temporary,
++                              self.ctx, ticket.id)
++        self.assertEqual(6144, self.usage()['artifact_bytes'])
++
++    def test_wrong_cell_and_project_are_rejected(self):
++        self.assertRaises(exception.NotFound, self.ledger.reserve_temporary,
++            self.ctx, self.reverts[0], self.cells[1].uuid, 4096)
++        other = context.RequestContext('actor', 'other')
++        self.assertRaises(exception.NotFound, self.ledger.reserve_temporary,
++            other, self.reverts[0], self.cells[0].uuid, 4096)
++        self.assertEqual(2048, self.usage()['artifact_bytes'])
++
++
++class TemporaryQuotaRaceMixin(test_checkpoint_quota.QuotaRaceMixin):
++    def value(self, index, size):
++        admission = self.candidates[index]
++        return dict(operation_id=admission.operation_id,
++            checkpoint_id=admission.checkpoint_id,
++            project_id=admission.key.project_id,
++            instance_uuid=admission.key.instance_uuid,
++            cell_uuid=admission.cell_uuid, reserved_bytes=size, version=1,
++            admission_hash=contracts.canonical_payload_hash(
++                admission.to_primitive()))
++
++    def test_temporary_race_shares_permanent_project_lock(self):
++        # This API SQL test receives the identity already checked by the
++        # ledger's cell read; the functional protocol tests cover that read.
++        quota.QuotaLedger().reserve(self.ctx, self.candidates[0])
++        barrier = threading.Barrier(2)
++        outcomes, failures = [], []
++
++        def reserve(index):
++            ctx = context.RequestContext('actor', 'project')
++            try:
++                barrier.wait(timeout=10)
++                temporary_db.reserve(ctx, self.value(index, 4096))
++                outcomes.append(True)
++            except exception.CheckpointQuotaExceeded:
++                outcomes.append(False)
++            except Exception as exc:
++                failures.append(exc)
++
++        workers = [threading.Thread(target=reserve, args=(i,)) for i in (0, 1)]
++        for worker in workers:
++            worker.start()
++        for worker in workers:
++            worker.join(timeout=20)
++            self.assertFalse(worker.is_alive())
++        self.assertEqual([], failures)
++        self.assertEqual([False, True], sorted(outcomes))
++        usage = test_checkpoint_quota.quota_db.get_usage(self.ctx, 'project')
++        self.assertEqual(1, usage['checkpoint_count'])
++        self.assertEqual(8192, usage['artifact_bytes'])
++
++    def test_temporary_ticket_alone_fences_mapping_change(self):
++        temporary_db.reserve(self.ctx, self.value(0, 4096))
++        mapping = objects.InstanceMapping.get_by_instance_uuid(
++            self.ctx, self.candidates[0].key.instance_uuid)
++        mapping.cell_mapping = self.cell_mappings['cell2']
++        self.assertRaises(exception.CheckpointConflict, mapping.save)
++
++
++class TemporaryMySQLTest(TemporaryQuotaRaceMixin,
++                        test_fixtures.OpportunisticDBTestMixin,
++                        test.NoDBTestCase):
++    FIXTURE = test_fixtures.MySQLOpportunisticFixture
++
++
++class TemporaryPostgreSQLTest(TemporaryQuotaRaceMixin,
++                             test_fixtures.OpportunisticDBTestMixin,
++                             test.NoDBTestCase):
++    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
+diff --git a/nova/tests/unit/db/api/test_migrations.py b/nova/tests/unit/db/api/test_migrations.py
+index 39feb2cc8f5a90476f2e19da6a5ace6a74a91ce2..eb27373111d5f1f7e5dabf896f0785ff6f42100a 100644
+--- a/nova/tests/unit/db/api/test_migrations.py
++++ b/nova/tests/unit/db/api/test_migrations.py
+@@ -205,6 +205,16 @@ class NovaMigrationsWalk(
+         self.assertIn(['project_id', 'instance_uuid', 'request_id'],
+                       [c['column_names'] for c in unique])
+ 
++    def _check_82e7b3c951d0(self, connection):
++        inspector = sqlalchemy.inspect(connection)
++        name = 'checkpoint_temporary_tickets'
++        self.assertIn(name, inspector.get_table_names())
++        self.assertIn(['operation_id'], [item['column_names'] for item in
++            inspector.get_unique_constraints(name)])
++        columns = {item['name'] for item in inspector.get_columns(name)}
++        self.assertTrue({'identity', 'closing_proof', 'reserved_bytes',
++                         'version', 'payload_hash'} <= columns)
++
+     def test_single_base_revision(self):
+         """Ensure we only have a single base revision.
+ 
+diff --git a/nova/tests/unit/db/main/test_migrations.py b/nova/tests/unit/db/main/test_migrations.py
+index 0702314c8c20268f7ef28c301897ad146090ca21..1c6b0872776711c9473f8de6afc4c70e11d984f4 100644
+--- a/nova/tests/unit/db/main/test_migrations.py
++++ b/nova/tests/unit/db/main/test_migrations.py
+@@ -447,6 +447,18 @@ class NovaMigrationsWalk(
+         self.assertIn(['parent_step_id', 'action', 'resource_id'],
+                       [item['column_names'] for item in uniques])
+ 
++    def _check_6eaf49c32710(self, connection):
++        inspector = sa.inspect(connection)
++        name = 'instance_checkpoint_temporary_budgets'
++        self.assertIn(name, inspector.get_table_names())
++        self.assertNotIn('shadow_' + name, inspector.get_table_names())
++        self.assertEqual(
++            ['operation_id'],
++            inspector.get_pk_constraint(name)['constrained_columns'])
++        for column in ('ticket_id', 'state', 'closing_proof', 'identity',
++                       'reserved_bytes', 'version'):
++            self.assertColumnExists(connection, name, column)
++
+     def test_single_base_revision(self):
+         """Ensure we only have a single base revision.
+ 
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 66f40cf013fd8a844d5ee1817cd405253d01ea2c..b5e3a3c3fb53c899aa467a8db4349ff0de909b9b 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1080,6 +1080,7 @@ object_data = {
+     'CheckpointQuotaTicketList': '1.0-9eef9c15e15020a0109f01c50e13d512',
+     'CheckpointArtifactReservation': '1.0-9f6b8a6916e0371c680d06dd63981f96',
+     'CheckpointEffect': '1.0-13cf039b4ec72f2f3ed688650759d4bb',
++    'CheckpointTemporaryTicket': '1.0-675a7eb2102718702736bbda431c1c5e',
+     'CheckpointQuotaTicket': '1.0-123c9a95dc1d0bcfc8aa604d0b84f236',
+     'InstanceCheckpoint': '1.1-ea9a09e3cc68cbe3aa8030418eef7950',
+     'InstanceCheckpointArtifact': '1.0-230a6b36d1ee8416232da223889e465e',
+@@ -1088,7 +1089,7 @@ object_data = {
+     'InstanceCheckpointDiskList': '1.0-980a2e851b91058a2b688bee649202ef',
+     'InstanceCheckpointGuard': '1.0-5e31c03abf15dacea7608da5f153c4d8',
+     'InstanceCheckpointList': '1.1-df8bec672e55a3a45b40eaded98ec218',
+-    'InstanceCheckpointOperation': '1.1-0118dc03189a367f0d383b15b3db9c73',
++    'InstanceCheckpointOperation': '1.1-e541e0e0f839aa239a3474bfa5599458',
+     'InstanceCheckpointOperationList': '1.1-833a632736c862175708703dba0e8e9e',
+     'InstanceCheckpointStep': '1.1-4d410c24789820813df06e5149911dfb',
+     'InstanceCheckpointStepList': '1.1-380130b03f40b317487ed802199130bb',

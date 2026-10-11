@@ -1,0 +1,1137 @@
+From fdce6de683b8bf6186bb1c4bb6d00d592f38c5ce Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 00:24:48 +0300
+Subject: [PATCH 09/10] test: cover and document the Cinder checkpoint contract
+
+---
+ api-ref/source/v3/checkpoints.inc             | 138 +++++++++
+ api-ref/source/v3/index.rst                   |   1 +
+ api-ref/source/v3/parameters.yaml             |  36 +++
+ .../checkpoint-create-request.json            |  12 +
+ .../checkpoint-create-response.json           |  47 ++++
+ .../checkpoint-execute-request.json           |   5 +
+ cinder/db/sqlalchemy/checkpoints.py           |   4 +-
+ .../v3.72/checkpoint-create-request.json.tpl  |  12 +
+ .../v3.72/checkpoint-create-response.json.tpl |  47 ++++
+ .../v3.72/checkpoint-execute-request.json.tpl |   5 +
+ .../api_sample_tests/test_checkpoints.py      |  58 ++++
+ .../functional/test_checkpoint_contract.py    | 265 ++++++++++++++++++
+ .../unit/api/contrib/test_admin_actions.py    |   8 +
+ .../tests/unit/backup/test_backup_messages.py |   5 +
+ cinder/tests/unit/objects/test_base.py        |  21 +-
+ cinder/tests/unit/volume/test_connection.py   |  15 +-
+ .../tests/unit/volume/test_volume_manager.py  |   6 +
+ cinder/volume/manager.py                      |   9 +-
+ doc/source/admin/checkpoint-contract.rst      | 145 ++++++++++
+ doc/source/admin/index.rst                    |   1 +
+ .../checkpoint-contract-7fa82e10c601.yaml     |  20 ++
+ 21 files changed, 844 insertions(+), 16 deletions(-)
+ create mode 100644 api-ref/source/v3/checkpoints.inc
+ create mode 100644 api-ref/source/v3/samples/checkpoints/checkpoint-create-request.json
+ create mode 100644 api-ref/source/v3/samples/checkpoints/checkpoint-create-response.json
+ create mode 100644 api-ref/source/v3/samples/checkpoints/checkpoint-execute-request.json
+ create mode 100644 cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.72/checkpoint-create-request.json.tpl
+ create mode 100644 cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.72/checkpoint-create-response.json.tpl
+ create mode 100644 cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.72/checkpoint-execute-request.json.tpl
+ create mode 100644 cinder/tests/functional/api_sample_tests/test_checkpoints.py
+ create mode 100644 cinder/tests/functional/test_checkpoint_contract.py
+ create mode 100644 doc/source/admin/checkpoint-contract.rst
+ create mode 100644 releasenotes/notes/checkpoint-contract-7fa82e10c601.yaml
+
+diff --git a/api-ref/source/v3/checkpoints.inc b/api-ref/source/v3/checkpoints.inc
+new file mode 100644
+index 0000000..0fa99be
+--- /dev/null
++++ b/api-ref/source/v3/checkpoints.inc
+@@ -0,0 +1,138 @@
++.. -*- rst -*-
++
++Native checkpoint service contract (private 3.72)
++=================================================
++
++This is a private extension of this fork, requiring microversion 3.72. It is
++not the upstream API with the same version number. It coordinates disk
++snapshots for a future Nova RAM checkpoint workflow; it does not save RAM.
++
++Every request requires the project user's token and a verified service token.
++The service user must be in ``[checkpoint] nova_service_user_ids``. Project
++member/admin policy is necessary but cannot substitute for service identity.
++An operation is readable and replayable only by its original project, user,
++and service user, including when the caller is an administrator.
++
++Reserve a checkpoint operation
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. rest_method:: POST /v3/{project_id}/checkpoint-operations
++
++Reserve every volume atomically. ``kind`` is ``create``, ``revert``, or
++``delete``. Create requires one attached volume per disk, all attached to the
++specified instance. The list must contain 1 to 64 unique UUIDs. The configured
++limit may be lower. Revert/delete require exactly the saved checkpoint volume
++set; the server selects snapshot IDs from its journal.
++
++``request_id`` provides durable idempotency. An exact replay returns the same
++operation after release or snapshot deletion. Reusing it with another payload
++returns 409. A checkpoint UUID cannot be reused after deletion or abort.
++
++Normal response code: 202. Errors: 400 schema, 403 authorization, 404 resource
++not found or not owned, 409 conflict/unsupported backend, 413 quota, and 503
++backend unavailable. No supported driver is enabled by this patch alone.
++
++.. rest_parameters:: parameters.yaml
++
++   - project_id: project_id_path
++   - checkpoint_operation: checkpoint_operation
++   - request_id: checkpoint_request_id
++   - checkpoint_id: checkpoint_id
++   - instance_uuid: checkpoint_instance_uuid
++   - kind: checkpoint_kind
++   - volume_ids: checkpoint_volume_ids
++
++Request example
++---------------
++
++.. literalinclude:: samples/checkpoints/checkpoint-create-request.json
++   :language: javascript
++
++Response example
++----------------
++
++.. literalinclude:: samples/checkpoints/checkpoint-create-response.json
++   :language: javascript
++
++Read an operation
++~~~~~~~~~~~~~~~~~
++
++.. rest_method:: GET /v3/{project_id}/checkpoint-operations/{operation_id}
++
++Returns 200 with ``checkpoint_operation``. Resources contain Cinder volume,
++snapshot and association UUIDs, size and status. Steps contain their UUID,
++resource UUID, phase, generation, status and a safe error code. Backend native
++IDs/references, credentials, quota reservations and raw errors are never part
++of this response. A foreign or missing operation returns 404.
++
++List operations
++~~~~~~~~~~~~~~~
++
++.. rest_method:: GET /v3/{project_id}/checkpoint-operations
++
++Returns 200 with ``checkpoint_operations`` and pagination links if needed.
++Only the original project/user/service identity's operations are listed.
++Filters: ``checkpoint_id``, ``instance_uuid``, ``status``; pagination:
++``marker`` and ``limit``. Unknown parameters return 400. Tombstones remain
++visible. The list does not expose another user's operations to project admin.
++
++Operate on a reservation
++~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. rest_method:: POST /v3/{project_id}/checkpoint-operations/{operation_id}/action
++
++The body contains exactly one of ``execute``, ``reconcile``, ``cleanup``,
++``release``. Each takes integer ``generation`` (1 in C1). Release additionally
++takes ``outcome`` equal to ``commit`` or ``abort``. The response is 202 with the
++current operation; asynchronous dispatch is not proof of backend completion.
++Poll the operation and its steps.
++
++* ``execute`` dispatches each prepared native step at most once. Revert requires
++  every volume to be available and without attachments.
++* ``reconcile`` queries pending/unknown results without replaying an effect.
++* ``cleanup`` applies only to an unfinished create after every create outcome
++  is known. It cancels undispatched steps and creates separate native delete
++  steps for confirmed snapshots. Repetition keeps the same step UUIDs.
++* ``release(commit)`` requires all steps to have succeeded. Revert additionally
++  requires completed attachments to the original instance and in-use volumes.
++* ``release(abort)`` is allowed before effects, or after confirmed create
++  cleanup. Partial revert, unknown outcomes or unfinished cleanup return 409.
++
++.. literalinclude:: samples/checkpoints/checkpoint-execute-request.json
++   :language: javascript
++
++States: ``reserved``, ``running``, ``succeeded``, ``failed``,
++``recovery_required``, ``released``. Step states: ``prepared``, ``dispatching``,
++``pending``, ``succeeded``, ``failed_no_effect``, ``unknown``. Disabling new
++checkpoints, elapsed time, restart and query success never release ownership.
++There is no force-unlock, ownership transfer or automatic retry of an effect.
++
++Query a volume's capabilities
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. rest_method:: GET /v3/{project_id}/volumes/{volume_id}/checkpoint-capabilities
++
++Returns 200 with ``checkpoint_capabilities`` for the current backend. The
++contract version is 1. Required booleans are ``native_snapshot``,
++``arbitrary_inplace_revert``, ``preserves_other_checkpoints``,
++``independent_snapshot_delete`` and ``operation_reconciliation``.
++``snapshot_semantics`` must be ``cow`` or ``row``; neither is inferred from a
++product name. ``consistent_group_snapshot`` is optional for support and is
++reported explicitly. ``driver_identity`` contains driver class, driver version
++and validated profile. Invalid/unverified capabilities return
++``supported=false`` with safe ``unsupported_reasons``. All existing production
++drivers report unsupported until a separately validated adapter implements
++this contract. In particular, this patch does not certify Dorado or TATLIN.
++
++Attachment scope
++~~~~~~~~~~~~~~~~
++
++The existing attachment create/update/delete/complete APIs accept
++``OpenStack-Checkpoint-Operation-ID`` and
++``OpenStack-Checkpoint-Generation`` together at microversion 3.72. They require
++the same service authorization and owner identity as the operation. Headers
++alone provide no authorization. Disconnect is limited to original attachments
++of the reserved revert. Reconnect is permitted only after all native reverts
++succeed, to the original instance. Volume UUIDs are preserved; new attachment
++UUIDs are expected. Old microversions reject these headers. Legacy
++initialize/terminate connection APIs have no checkpoint bypass.
+diff --git a/api-ref/source/v3/index.rst b/api-ref/source/v3/index.rst
+index 3c65a66..c465958 100644
+--- a/api-ref/source/v3/index.rst
++++ b/api-ref/source/v3/index.rst
+@@ -57,6 +57,7 @@ Block Storage API V3 (CURRENT)
+ .. include:: ext-backups.inc
+ .. include:: ext-backups-actions-v3.inc
+ .. include:: capabilities-v3.inc
++.. include:: checkpoints.inc
+ .. include:: clusters.inc
+ .. include:: consistencygroups-v3.inc
+ .. include:: os-cgsnapshots-v3.inc
+diff --git a/api-ref/source/v3/parameters.yaml b/api-ref/source/v3/parameters.yaml
+index f926241..9ee4279 100644
+--- a/api-ref/source/v3/parameters.yaml
++++ b/api-ref/source/v3/parameters.yaml
+@@ -891,6 +891,42 @@ cgsnapshots:
+   in: body
+   required: true
+   type: object
++checkpoint_id:
++  description: |
++    Checkpoint UUID, never reusable even after deletion or abort.
++  in: body
++  required: true
++  type: string
++checkpoint_instance_uuid:
++  description: |
++    Original instance UUID. Nova is responsible for instance authorization.
++  in: body
++  required: true
++  type: string
++checkpoint_kind:
++  description: |
++    Requested operation: create, revert, or delete.
++  in: body
++  required: true
++  type: string
++checkpoint_operation:
++  description: |
++    Private checkpoint reservation and its protected resources and steps.
++  in: body
++  required: true
++  type: object
++checkpoint_request_id:
++  description: |
++    Client request UUID used for durable deduplication within the project.
++  in: body
++  required: true
++  type: string
++checkpoint_volume_ids:
++  description: |
++    Nonempty unique UUID list, at most 64 volumes and subject to configuration.
++  in: body
++  required: true
++  type: array
+ cinder_id:
+   description: |
+     The UUID of the resource in Cinder.
+diff --git a/api-ref/source/v3/samples/checkpoints/checkpoint-create-request.json b/api-ref/source/v3/samples/checkpoints/checkpoint-create-request.json
+new file mode 100644
+index 0000000..93ff7f1
+--- /dev/null
++++ b/api-ref/source/v3/samples/checkpoints/checkpoint-create-request.json
+@@ -0,0 +1,12 @@
++{
++  "checkpoint_operation": {
++    "request_id": "de707cca-b01e-4c0d-b240-13dc1cf81b2a",
++    "checkpoint_id": "2cbafac1-ad92-4e39-8a35-c13a903217e1",
++    "instance_uuid": "de2a6ba1-42e6-407c-9bd8-518c326ebad2",
++    "kind": "create",
++    "volume_ids": [
++      "3ab9c2f8-b2e8-4eb2-8557-9d3f9b98cae8",
++      "69ae0131-9b4c-40bd-8e99-3bf95b207b1d"
++    ]
++  }
++}
+diff --git a/api-ref/source/v3/samples/checkpoints/checkpoint-create-response.json b/api-ref/source/v3/samples/checkpoints/checkpoint-create-response.json
+new file mode 100644
+index 0000000..973d717
+--- /dev/null
++++ b/api-ref/source/v3/samples/checkpoints/checkpoint-create-response.json
+@@ -0,0 +1,47 @@
++{
++  "checkpoint_operation": {
++    "id": "d566b5fb-0720-4e0c-9a50-682150d62541",
++    "request_id": "de707cca-b01e-4c0d-b240-13dc1cf81b2a",
++    "checkpoint_id": "2cbafac1-ad92-4e39-8a35-c13a903217e1",
++    "instance_uuid": "de2a6ba1-42e6-407c-9bd8-518c326ebad2",
++    "kind": "create",
++    "generation": 1,
++    "status": "reserved",
++    "release_outcome": null,
++    "error_code": null,
++    "resources": [
++      {
++        "id": "d5f58795-168e-49bb-b790-0af1fad2d53f",
++        "volume_id": "3ab9c2f8-b2e8-4eb2-8557-9d3f9b98cae8",
++        "snapshot_id": "0885609b-2d7a-4fe0-85ac-6a38367376e5",
++        "volume_size": 1,
++        "status": "creating"
++      },
++      {
++        "id": "aaf2d870-49f5-4162-918c-9c8e17920e63",
++        "volume_id": "69ae0131-9b4c-40bd-8e99-3bf95b207b1d",
++        "snapshot_id": "9cd31b3c-37ca-4a52-8682-f531c971105a",
++        "volume_size": 1,
++        "status": "creating"
++      }
++    ],
++    "steps": [
++      {
++        "id": "c0b29e83-5e77-412b-9a0a-7c92485de28d",
++        "resource_id": "d5f58795-168e-49bb-b790-0af1fad2d53f",
++        "phase": "snapshot",
++        "generation": 1,
++        "status": "prepared",
++        "error_code": null
++      },
++      {
++        "id": "e4f67739-d18c-4f59-958b-28f3de811286",
++        "resource_id": "aaf2d870-49f5-4162-918c-9c8e17920e63",
++        "phase": "snapshot",
++        "generation": 1,
++        "status": "prepared",
++        "error_code": null
++      }
++    ]
++  }
++}
+diff --git a/api-ref/source/v3/samples/checkpoints/checkpoint-execute-request.json b/api-ref/source/v3/samples/checkpoints/checkpoint-execute-request.json
+new file mode 100644
+index 0000000..2cdf610
+--- /dev/null
++++ b/api-ref/source/v3/samples/checkpoints/checkpoint-execute-request.json
+@@ -0,0 +1,5 @@
++{
++  "execute": {
++    "generation": 1
++  }
++}
+diff --git a/cinder/db/sqlalchemy/checkpoints.py b/cinder/db/sqlalchemy/checkpoints.py
+index 2da5b4c..a85bb48 100644
+--- a/cinder/db/sqlalchemy/checkpoints.py
++++ b/cinder/db/sqlalchemy/checkpoints.py
+@@ -142,13 +142,13 @@ def _check_volume(context, volume, instance_uuid, kind):
+         service = _current(_query(context, models.Service).filter_by(
+             host=volume.host.split('#')[0], topic='cinder-volume')).first()
+         if service and service.replication_status not in (
+-                None, 'enabled', 'disabled'):
++                None, 'enabled', 'disabled', 'not-capable'):
+             _conflict('backend_failover_in_progress')
+     if volume.cluster_name:
+         cluster = _current(_query(context, models.Cluster).filter_by(
+             name=volume.cluster_name.split('#')[0])).first()
+         if cluster and cluster.replication_status not in (
+-                None, 'enabled', 'disabled'):
++                None, 'enabled', 'disabled', 'not-capable'):
+             _conflict('backend_failover_in_progress')
+     attachments = _attachments(context, volume.id)
+     if ((attachments and volume.status != 'in-use') or
+diff --git a/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.72/checkpoint-create-request.json.tpl b/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.72/checkpoint-create-request.json.tpl
+new file mode 100644
+index 0000000..733c09f
+--- /dev/null
++++ b/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.72/checkpoint-create-request.json.tpl
+@@ -0,0 +1,12 @@
++{
++  "checkpoint_operation": {
++    "request_id": "%(request_id)s",
++    "checkpoint_id": "%(checkpoint_id)s",
++    "instance_uuid": "%(instance_uuid)s",
++    "kind": "create",
++    "volume_ids": [
++      "%(volume0)s",
++      "%(volume1)s"
++    ]
++  }
++}
+diff --git a/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.72/checkpoint-create-response.json.tpl b/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.72/checkpoint-create-response.json.tpl
+new file mode 100644
+index 0000000..7be43b1
+--- /dev/null
++++ b/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.72/checkpoint-create-response.json.tpl
+@@ -0,0 +1,47 @@
++{
++  "checkpoint_operation": {
++    "id": "%(operation_id)s",
++    "request_id": "%(request_id)s",
++    "checkpoint_id": "%(checkpoint_id)s",
++    "instance_uuid": "%(instance_uuid)s",
++    "kind": "create",
++    "generation": 1,
++    "status": "reserved",
++    "release_outcome": null,
++    "error_code": null,
++    "resources": [
++      {
++        "id": "%(resource0)s",
++        "volume_id": "%(volume0)s",
++        "snapshot_id": "%(snapshot0)s",
++        "volume_size": 1,
++        "status": "creating"
++      },
++      {
++        "id": "%(resource1)s",
++        "volume_id": "%(volume1)s",
++        "snapshot_id": "%(snapshot1)s",
++        "volume_size": 1,
++        "status": "creating"
++      }
++    ],
++    "steps": [
++      {
++        "id": "%(step0)s",
++        "resource_id": "%(resource0)s",
++        "phase": "snapshot",
++        "generation": 1,
++        "status": "prepared",
++        "error_code": null
++      },
++      {
++        "id": "%(step1)s",
++        "resource_id": "%(resource1)s",
++        "phase": "snapshot",
++        "generation": 1,
++        "status": "prepared",
++        "error_code": null
++      }
++    ]
++  }
++}
+diff --git a/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.72/checkpoint-execute-request.json.tpl b/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.72/checkpoint-execute-request.json.tpl
+new file mode 100644
+index 0000000..2cdf610
+--- /dev/null
++++ b/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.72/checkpoint-execute-request.json.tpl
+@@ -0,0 +1,5 @@
++{
++  "execute": {
++    "generation": 1
++  }
++}
+diff --git a/cinder/tests/functional/api_sample_tests/test_checkpoints.py b/cinder/tests/functional/api_sample_tests/test_checkpoints.py
+new file mode 100644
+index 0000000..017fa7d
+--- /dev/null
++++ b/cinder/tests/functional/api_sample_tests/test_checkpoints.py
+@@ -0,0 +1,58 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Check API examples against real WSGI/SQL/RPC responses."""
++
++import json
++import os
++from pathlib import Path
++
++from cinder.tests.functional import test_checkpoint_contract as functional
++
++
++class TestCheckpointSamples(functional.CheckpointFunctionalBase):
++    sample_dir = Path(__file__).parent / 'samples' / 'checkpoints' / 'v3.72'
++
++    def test_checkpoint_create_samples(self):
++        operation, payload = self.reserve_operation()
++        # Sort associations, retaining the actual server-generated UUIDs.
++        resources = sorted(operation['resources'],
++                           key=lambda r: r['volume_id'])
++        operation['resources'] = resources
++        operation['steps'] = [next(s for s in operation['steps']
++                                   if s['resource_id'] == resource['id'])
++                              for resource in resources]
++        subs = dict(payload, operation_id=operation['id'])
++        for index, resource in enumerate(resources):
++            subs.update({
++                'volume%s' % index: resource['volume_id'],
++                'resource%s' % index: resource['id'],
++                'snapshot%s' % index: resource['snapshot_id'],
++                'step%s' % index: operation['steps'][index]['id']})
++        request = json.loads((self.sample_dir /
++                              'checkpoint-create-request.json.tpl').read_text()
++                             % subs)
++        response = self.request('checkpoint-operations', request)
++        self.assertEqual(202, response.status_int, response.text)
++        self.assertEqual(operation['id'],
++                         response.json['checkpoint_operation']['id'])
++        template = self.sample_dir / 'checkpoint-create-response.json.tpl'
++        expected = json.loads(template.read_text() % subs)
++        self.assertEqual(expected, {'checkpoint_operation': operation})
++        if os.getenv('GENERATE_SAMPLES'):
++            destination = Path('api-ref/source/v3/samples/checkpoints')
++            destination.mkdir(parents=True, exist_ok=True)
++            for name in ('checkpoint-create-request',
++                         'checkpoint-create-response',
++                         'checkpoint-execute-request'):
++                content = (self.sample_dir / (name + '.json.tpl')).read_text()
++                (destination / (name + '.json')).write_text(content % subs)
+diff --git a/cinder/tests/functional/test_checkpoint_contract.py b/cinder/tests/functional/test_checkpoint_contract.py
+new file mode 100644
+index 0000000..94a1efb
+--- /dev/null
++++ b/cinder/tests/functional/test_checkpoint_contract.py
+@@ -0,0 +1,265 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""WSGI, SQL journal, serialized oslo RPC and fake native storage lifecycle."""
++
++import time
++
++import eventlet
++import oslo_messaging
++from oslo_serialization import jsonutils
++from oslo_utils import timeutils
++from oslo_utils import uuidutils
++import webob
++
++from cinder.api.middleware import fault
++from cinder.api.v3 import router
++from cinder import db
++from cinder import objects
++from cinder.objects import base as object_base
++from cinder import rpc
++from cinder.scheduler import manager as scheduler_manager
++from cinder.tests.unit.api import fakes
++from cinder.tests.unit.checkpoints import fake_driver
++from cinder.tests.unit.checkpoints import test_db
++from cinder.tests.unit import test
++from cinder.tests.unit import utils
++from cinder.volume import manager as volume_manager
++
++
++class CheckpointFunctionalBase(test_db.CheckpointDBHelpers, test.TestCase):
++    def setUp(self):
++        super().setUp()
++        self.prepare_volumes()
++        self.ctxt.roles = ['member']
++        self.ctxt.service_roles = ['service']
++        self.flags(enabled=True, nova_service_user_ids=[test_db.SERVICE_ID],
++                   group='checkpoint')
++        self.workers = {}
++        self.drivers = {}
++        for index, vid in enumerate(self.volumes):
++            host = 'node%s@checkpoint' % index
++            db.volume_update(self.ctxt, vid, {'host': host})
++            worker = volume_manager.VolumeManager(host=host)
++            driver = fake_driver.FakeCheckpointDriver()
++            driver.set_initialized()
++            worker.driver = driver
++            self.workers[vid] = worker
++            self.drivers[vid] = driver
++            self.mock_object(driver, 'create_snapshot', return_value=None)
++            self.mock_object(driver, 'validate_connector', return_value=None)
++            self.mock_object(driver, 'create_export', return_value=None)
++            self.mock_object(driver, 'initialize_connection', side_effect=(
++                lambda *args: {'driver_volume_type': 'fake', 'data': {}}))
++            self.mock_object(driver, 'terminate_connection',
++                             return_value=False)
++            self.mock_object(driver, 'remove_export', return_value=None)
++            db.service_create(self.ctxt.elevated(), {
++                'host': host, 'binary': 'cinder-volume',
++                'topic': 'cinder-volume',
++                'disabled': False, 'updated_at': timeutils.utcnow(),
++                'rpc_current_version': '3.21',
++                'object_current_version': '1.40'})
++            server = rpc.get_server(oslo_messaging.Target(
++                topic='cinder-volume.' + host, server='node%s' % index),
++                [worker], serializer=object_base.CinderObjectSerializer())
++            server.start()
++            self.addCleanup(self.stop_server, server)
++        scheduler = scheduler_manager.SchedulerManager()
++        self.mock_object(scheduler, '_wait_for_scheduler', return_value=None)
++        self.mock_object(scheduler.driver, 'backend_passes_filters')
++        server = rpc.get_server(oslo_messaging.Target(
++            topic='cinder-scheduler', server='scheduler'), [scheduler],
++            serializer=object_base.CinderObjectSerializer())
++        server.start()
++        self.addCleanup(self.stop_server, server)
++        app = fakes.urlmap.URLMap()
++        app['/v3'] = router.APIRouter()
++        self.app = fault.FaultWrapper(app)
++
++    @staticmethod
++    def stop_server(server):
++        server.stop()
++        server.wait()
++
++    def request(self, path, body=None, method=None, operation=None,
++                version='3.72'):
++        req = webob.Request.blank('/v3/%s/%s' % (self.ctxt.project_id, path))
++        req.method = method or ('POST' if body is not None else 'GET')
++        req.headers['Content-Type'] = 'application/json'
++        req.headers['OpenStack-API-Version'] = 'volume ' + version
++        req.environ['cinder.context'] = self.ctxt.deepcopy()
++        if operation:
++            req.headers['OpenStack-Checkpoint-Operation-ID'] = operation['id']
++            req.headers['OpenStack-Checkpoint-Generation'] = '1'
++        if body is not None:
++            req.body = jsonutils.dump_as_bytes(body)
++        return req.get_response(self.app)
++
++    def reserve_operation(self, kind='create', checkpoint_id=None):
++        payload = {'kind': kind, 'checkpoint_id': checkpoint_id or
++                   uuidutils.generate_uuid(), 'request_id':
++                   uuidutils.generate_uuid(), 'instance_uuid': self.instance,
++                   'volume_ids': self.volumes}
++        response = self.request('checkpoint-operations',
++                                {'checkpoint_operation': payload})
++        self.assertEqual(202, response.status_int, response.text)
++        return response.json['checkpoint_operation'], payload
++
++    def action(self, operation, name, outcome=None):
++        args = {'generation': operation['generation']}
++        if outcome:
++            args['outcome'] = outcome
++        response = self.request('checkpoint-operations/%s/action' %
++                                operation['id'], {name: args})
++        self.assertEqual(202, response.status_int, response.text)
++        return response.json['checkpoint_operation']
++
++    def wait_for(self, operation, status):
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline:
++            response = self.request('checkpoint-operations/' + operation['id'])
++            self.assertEqual(200, response.status_int, response.text)
++            actual = response.json['checkpoint_operation']
++            if actual['status'] == status:
++                return actual
++            eventlet.sleep(0.01)
++        self.fail('Checkpoint did not reach %s: %s' % (status, actual))
++
++    def checkpoint(self):
++        operation, payload = self.reserve_operation()
++        self.action(operation, 'execute')
++        self.wait_for(operation, 'succeeded')
++        self.action(operation, 'release', 'commit')
++        return operation, payload
++
++    def data(self, value):
++        for vid, driver in self.drivers.items():
++            driver.data[vid] = value
++
++    def native_count(self):
++        return sum(d.native_call_count for d in self.drivers.values())
++
++    def revert(self, checkpoint):
++        operation, unused = self.reserve_operation(
++            'revert', checkpoint['checkpoint_id'])
++        original = []
++        for vid in self.volumes:
++            attachment = objects.Volume.get_by_id(
++                self.ctxt, vid).volume_attachment[0]
++            original.append(attachment.id)
++            response = self.request('attachments/' + attachment.id,
++                                    method='DELETE', operation=operation)
++            self.assertEqual(200, response.status_int, response.text)
++        self.action(operation, 'execute')
++        self.wait_for(operation, 'succeeded')
++        for vid in self.volumes:
++            response = self.request('attachments', {'attachment': {
++                'volume_uuid': vid, 'instance_uuid': self.instance,
++                'connector': {'host': 'compute-one', 'ip': '192.0.2.10'}}},
++                operation=operation)
++            self.assertEqual(200, response.status_int, response.text)
++            aid = response.json['attachment']['id']
++            self.assertNotIn(aid, original)
++            response = self.request('attachments/%s/action' % aid,
++                                    {'os-complete': {}}, operation=operation)
++            self.assertEqual(204, response.status_int, response.text)
++        self.action(operation, 'release', 'commit')
++        return operation
++
++
++class TestCheckpointContract(CheckpointFunctionalBase):
++    def test_two_checkpoints_revert_old_and_keep_new(self):
++        self.data(b'point-A')
++        first, unused = self.checkpoint()
++        self.data(b'point-B')
++        second, unused = self.checkpoint()
++        first_ids = {r['snapshot_id'] for r in first['resources']}
++        self.assertTrue(first_ids.isdisjoint(
++            r['snapshot_id'] for r in second['resources']))
++        self.data(b'current')
++        self.revert(first)
++        self.assertEqual([b'point-A'] * 2,
++                         [self.drivers[v].data[v] for v in self.volumes])
++        self.revert(second)
++        self.assertEqual([b'point-B'] * 2,
++                         [self.drivers[v].data[v] for v in self.volumes])
++        self.assertEqual([], self.locks())
++        self.assertEqual(8, self.native_count())
++
++    def test_delete_a_preserves_b_and_current_data(self):
++        self.data(b'point-A')
++        first, unused = self.checkpoint()
++        self.data(b'point-B')
++        second, unused = self.checkpoint()
++        self.data(b'current')
++        deletion, unused = self.reserve_operation(
++            'delete', first['checkpoint_id'])
++        self.action(deletion, 'execute')
++        self.wait_for(deletion, 'succeeded')
++        self.action(deletion, 'release', 'commit')
++        self.assertEqual([b'current'] * 2,
++                         [self.drivers[v].data[v] for v in self.volumes])
++        self.assertEqual({r['snapshot_id'] for r in second['resources']},
++                         {sid for d in self.drivers.values()
++                          for sid in d.snapshots})
++        self.assertEqual(2, db.quota_usage_get_all_by_project(
++            self.ctxt.elevated(), self.ctxt.project_id)['snapshots']['in_use'])
++
++    def test_cross_backend_partial_failure_holds_all_locks(self):
++        operation, unused = self.reserve_operation()
++        self.drivers[self.volumes[1]].outcomes['snapshot'].append(
++            RuntimeError('lost reply after effect'))
++        self.action(operation, 'execute')
++        self.wait_for(operation, 'recovery_required')
++        response = self.request('checkpoint-operations/%s/action' %
++                                operation['id'], {'release': {
++                                    'generation': 1, 'outcome': 'abort'}})
++        self.assertEqual(409, response.status_int, response.text)
++        self.assertEqual(sorted(self.volumes), sorted(self.locks()))
++        self.action(operation, 'execute')
++        self.action(operation, 'reconcile')
++        self.wait_for(operation, 'succeeded')
++        self.assertEqual(2, self.native_count())
++
++    def test_released_request_replay_creates_nothing(self):
++        first, payload = self.checkpoint()
++        deletion, unused = self.reserve_operation(
++            'delete', first['checkpoint_id'])
++        self.action(deletion, 'execute')
++        self.wait_for(deletion, 'succeeded')
++        self.action(deletion, 'release', 'commit')
++        response = self.request('checkpoint-operations',
++                                {'checkpoint_operation': payload})
++        self.assertEqual(202, response.status_int, response.text)
++        self.assertEqual(first['id'],
++                         response.json['checkpoint_operation']['id'])
++        self.assertEqual(4, self.native_count())
++        self.assertEqual(0, db.quota_usage_get_all_by_project(
++            self.ctxt.elevated(), self.ctxt.project_id)['snapshots']['in_use'])
++
++    def test_legacy_snapshot_api_unchanged(self):
++        host = self.workers[self.volumes[0]].host
++        volume = utils.create_volume(self.ctxt, host=host, volume_type_id=None)
++        response = self.request('snapshots', {'snapshot': {
++            'volume_id': volume.id}}, version='3.71')
++        self.assertEqual(202, response.status_int, response.text)
++        sid = response.json['snapshot']['id']
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline:
++            status = objects.Snapshot.get_by_id(self.ctxt, sid).status
++            if status != 'creating':
++                break
++            eventlet.sleep(0.01)
++        self.assertEqual('available', status)
++        self.drivers[self.volumes[0]].create_snapshot.assert_called_once()
++        self.assertEqual(0, self.native_count())
+diff --git a/cinder/tests/unit/api/contrib/test_admin_actions.py b/cinder/tests/unit/api/contrib/test_admin_actions.py
+index a8aa413..b6988e5 100644
+--- a/cinder/tests/unit/api/contrib/test_admin_actions.py
++++ b/cinder/tests/unit/api/contrib/test_admin_actions.py
+@@ -1286,6 +1286,8 @@ class AdminActionsAttachDetachTest(BaseAdminTest):
+             req.body = jsonutils.dump_as_bytes(body)
+             # attach admin context to request
+             req.environ['cinder.context'] = self.ctx
++            # Connection barriers have advanced updated_at since attach.
++            volume.refresh()
+             # make request
+             resp = req.get_response(app())
+             self.assertEqual(HTTPStatus.BAD_REQUEST, resp.status_int)
+@@ -1309,6 +1311,8 @@ class AdminActionsAttachDetachTest(BaseAdminTest):
+ 
+             # attach admin context to request
+             req.environ['cinder.context'] = self.ctx
++            # Connection barriers have advanced updated_at since attach.
++            volume.refresh()
+             # make request
+             self.assertRaises(messaging.RemoteError,
+                               req.get_response,
+@@ -1356,6 +1360,8 @@ class AdminActionsAttachDetachTest(BaseAdminTest):
+             req.body = jsonutils.dump_as_bytes(body)
+             # attach admin context to request
+             req.environ['cinder.context'] = self.ctx
++            # Connection barriers have advanced updated_at since attach.
++            volume.refresh()
+             # make request
+             self.assertRaises(messaging.RemoteError,
+                               req.get_response,
+@@ -1399,6 +1405,8 @@ class AdminActionsAttachDetachTest(BaseAdminTest):
+             req.body = jsonutils.dump_as_bytes(body)
+             # attach admin context to request
+             req.environ['cinder.context'] = self.ctx
++            # Connection barriers have advanced updated_at since attach.
++            volume.refresh()
+             # make request
+             resp = req.get_response(app())
+             self.assertEqual(HTTPStatus.ACCEPTED, resp.status_int)
+diff --git a/cinder/tests/unit/backup/test_backup_messages.py b/cinder/tests/unit/backup/test_backup_messages.py
+index a243b2e..914d3b7 100644
+--- a/cinder/tests/unit/backup/test_backup_messages.py
++++ b/cinder/tests/unit/backup/test_backup_messages.py
+@@ -26,6 +26,11 @@ from cinder.tests.unit import test
+ 
+ class BackupUserMessagesTest(test.TestCase):
+ 
++    def setUp(self):
++        super().setUp()
++        # These tests isolate user messages with mock contexts and resources.
++        self.patch('cinder.checkpoints.guards.check_volume')
++
+     @mock.patch('cinder.db.volume_update')
+     @mock.patch('cinder.objects.volume.Volume.get_by_id')
+     @mock.patch('cinder.message.api.API.create_from_request_context')
+diff --git a/cinder/tests/unit/objects/test_base.py b/cinder/tests/unit/objects/test_base.py
+index 5f0619a..273dbef 100644
+--- a/cinder/tests/unit/objects/test_base.py
++++ b/cinder/tests/unit/objects/test_base.py
+@@ -648,7 +648,12 @@ class TestCinderObjectConditionalUpdate(test.TestCase):
+                   'previous_status': volume.model.status,
+                   'migration_status': case_values}
+ 
+-        with mock.patch('cinder.db.sqlalchemy.api.model_query') as model_query:
++        # Isolate SQL update argument construction; guard admission has its
++        # own real-database and concurrency tests.
++        with mock.patch('cinder.db.sqlalchemy.checkpoints.guard_update',
++                        side_effect=lambda ctxt, model, query, vals: query), \
++                mock.patch('cinder.db.sqlalchemy.api.model_query') as query:
++            model_query = query
+             update = model_query.return_value.filter.return_value.update
+             update.return_value = 0
+             self.assertFalse(volume.conditional_update(
+@@ -682,7 +687,12 @@ class TestCinderObjectConditionalUpdate(test.TestCase):
+ 
+         order = ['status']
+ 
+-        with mock.patch('cinder.db.sqlalchemy.api.model_query') as model_query:
++        # Isolate SQL update argument construction; guard admission has its
++        # own real-database and concurrency tests.
++        with mock.patch('cinder.db.sqlalchemy.checkpoints.guard_update',
++                        side_effect=lambda ctxt, model, query, vals: query), \
++                mock.patch('cinder.db.sqlalchemy.api.model_query') as query:
++            model_query = query
+             update = model_query.return_value.filter.return_value.update
+             update.return_value = 0
+             self.assertFalse(volume.conditional_update(
+@@ -708,7 +718,12 @@ class TestCinderObjectConditionalUpdate(test.TestCase):
+                   'previous_status': 'available',
+                   'migration_status': None}
+ 
+-        with mock.patch('cinder.db.sqlalchemy.api.model_query') as model_query:
++        # Isolate SQL update argument construction; guard admission has its
++        # own real-database and concurrency tests.
++        with mock.patch('cinder.db.sqlalchemy.checkpoints.guard_update',
++                        side_effect=lambda ctxt, model, query, vals: query), \
++                mock.patch('cinder.db.sqlalchemy.api.model_query') as query:
++            model_query = query
+             update = model_query.return_value.filter.return_value.update
+             update.return_value = 0
+             self.assertFalse(volume.conditional_update(
+diff --git a/cinder/tests/unit/volume/test_connection.py b/cinder/tests/unit/volume/test_connection.py
+index 8fd9690..de52ca4 100644
+--- a/cinder/tests/unit/volume/test_connection.py
++++ b/cinder/tests/unit/volume/test_connection.py
+@@ -96,14 +96,10 @@ class DiscardFlagTestCase(base.BaseVolumeTestCase):
+ 
+         self.volume.driver.configuration.safe_get.side_effect = _safe_get
+ 
+-        with mock.patch.object(objects, 'Volume') as mock_vol:
+-            volume = tests_utils.create_volume(self.context)
+-            volume.volume_type_id = None
+-            mock_vol.get_by_id.return_value = volume
+-
+-            conn_info = self.volume.initialize_connection(self.context,
+-                                                          volume,
+-                                                          connector)
++        volume = tests_utils.create_volume(self.context)
++        volume.volume_type_id = None
++        conn_info = self.volume.initialize_connection(self.context,
++                                                      volume, connector)
+ 
+         self.assertEqual(expected_flag, conn_info['data'].get('discard'))
+ 
+@@ -502,7 +498,8 @@ class VolumeAttachDetachTestCase(base.BaseVolumeTestCase):
+ 
+     @mock.patch('cinder.volume.manager.LOG', mock.Mock())
+     def test_initialize_connection(self):
+-        volume = mock.Mock(save=mock.Mock(side_effect=Exception))
++        volume = tests_utils.create_volume(self.context)
++        self.mock_object(volume, 'save', side_effect=Exception)
+         with mock.patch.object(self.volume, 'driver') as driver_mock:
+             self.assertRaises(exception.ExportFailure,
+                               self.volume.initialize_connection, self.context,
+diff --git a/cinder/tests/unit/volume/test_volume_manager.py b/cinder/tests/unit/volume/test_volume_manager.py
+index 7be7c0e..94315c0 100644
+--- a/cinder/tests/unit/volume/test_volume_manager.py
++++ b/cinder/tests/unit/volume/test_volume_manager.py
+@@ -30,6 +30,12 @@ from cinder.volume import manager as vol_manager
+ @ddt.ddt
+ class VolumeManagerTestCase(base.BaseVolumeTestCase):
+ 
++    def setUp(self):
++        super().setUp()
++        # These tests isolate user messages with mock contexts and resources.
++        self.patch('cinder.checkpoints.guards.check_volume')
++        self.patch('cinder.checkpoints.guards.check_snapshot')
++
+     @mock.patch('cinder.message.api.API.create')
+     @mock.patch('cinder.volume.volume_utils.require_driver_initialized')
+     @mock.patch('cinder.volume.manager.VolumeManager.'
+diff --git a/cinder/volume/manager.py b/cinder/volume/manager.py
+index 82657f1..eb453b9 100644
+--- a/cinder/volume/manager.py
++++ b/cinder/volume/manager.py
+@@ -1486,7 +1486,6 @@ class VolumeManager(manager.CleanableManager,
+         return None
+ 
+     @coordination.synchronized('{volume_id}')
+-    @checkpoint_guards.connection_worker('attach_volume', 'volume_id')
+     def attach_volume(self, context, volume_id, instance_uuid, host_name,
+                       mountpoint, mode,
+                       volume=None) -> objects.VolumeAttachment:
+@@ -1577,7 +1576,6 @@ class VolumeManager(manager.CleanableManager,
+         return attachment
+ 
+     @coordination.synchronized('{volume_id}-{f_name}')
+-    @checkpoint_guards.connection_worker('detach_volume', 'volume_id')
+     def detach_volume(self, context, volume_id, attachment_id=None,
+                       volume=None) -> None:
+         """Updates db to show volume is detached."""
+@@ -1625,6 +1623,13 @@ class VolumeManager(manager.CleanableManager,
+                 volume.save()
+                 return
+ 
++        # Validation above has no backend effect. Acquire the persistent
++        # barrier only after it succeeds, so an invalid request can be retried.
++        with checkpoint_guards.connection(context, volume_id, 'detach'):
++            self._finish_legacy_detach(context, volume, attachment)
++
++    def _finish_legacy_detach(self, context, volume, attachment):
++        volume_id = volume.id
+         self._notify_about_volume_usage(context, volume, "detach.start")
+         try:
+             volume_utils.require_driver_initialized(self.driver)
+diff --git a/doc/source/admin/checkpoint-contract.rst b/doc/source/admin/checkpoint-contract.rst
+new file mode 100644
+index 0000000..80fdc2a
+--- /dev/null
++++ b/doc/source/admin/checkpoint-contract.rst
+@@ -0,0 +1,145 @@
++==============================
++Контракт native checkpoints C1
++==============================
++
++Краткий вывод
++~~~~~~~~~~~~~
++
++C1 добавляет сервисный API и durable-журнал Cinder для будущих checkpoints
++Nova с RAM. Nova, RAM-файлы, libvirt и vendor adapters в этот пакет не входят.
++Unit и functional tests используют fake native storage. Поддержка Huawei
++Dorado и YADRO TATLIN не заявляется: для каждого нужны отдельный адаптер,
++верифицированный профиль и испытания на целевой версии массива.
++
++Версии и включение
++~~~~~~~~~~~~~~~~~~
++
++Пакет предназначен для исходного архива этого форка с API 3.71, Volume RPC
++3.20 и object manifest 1.39. Частные новые версии: API 3.72, RPC 3.21 и OVO
++manifest 1.40. Номер API не означает совместимость с одноимённым upstream API.
++Migration ``7fa82e10c601`` следует за ``9c74c1c6971f`` и добавляет пять таблиц.
++Обычные Volume/Snapshot OVO не меняют версии.
++
++Порядок развёртывания будущего проверенного пакета:
++
++#. Сохранить резервную копию БД и проверить цепочку migrations на её копии.
++#. Применить migration штатным ``cinder-manage db sync`` перед запуском кода.
++#. Обновить все API, volume, backup, scheduler и другие процессы, способные
++   изменять тома, attachments и snapshots; до этого checkpoints отсутствуют.
++#. Настроить Nova на передачу штатного Keystone service token вместе с токеном
++   пользователя. ``service_token_roles_required=true`` рекомендуется для
++   middleware; C1 дополнительно проверяет service roles и service user UUID.
++#. Проверить capabilities конкретного volume на конкретном backend.
++#. Включать новые create только после N1/N2, D1/D2 и стендовых испытаний V1.
++
++Пример настроек с безопасными значениями по умолчанию::
++
++    [checkpoint]
++    enabled = false
++    nova_service_user_ids =
++    reconcile_interval = 60
++    max_volumes_per_operation = 64
++
++Allowlist содержит UUID сервисной учётной записи Nova, не имя роли и не UUID
++пользователя ВМ. Пустой список запрещает сервисный доступ. Owner операции
++состоит из project/user/service user; admin не получает обход проверки.
++Изменяемые tenant metadata не используются как права или блокировка.
++
++RPC gate проверяет реальные объявления сервисов volume и доступность target,
++а не предполагает поддержку по локальной версии. Он не обнаруживает старый
++API-процесс; полное обновление всех писателей остаётся условием эксплуатации.
++Downgrade допустим только после завершения операций и cleanup всех ссылок.
++Удалять новые таблицы при живых checkpoints нельзя.
++
++Работа и ограничения
++~~~~~~~~~~~~~~~~~~~~
++
++Create резервирует весь набор томов и Snapshot UUID до dispatch. Штатные квоты
++snapshots/gigabytes, включая типы томов, начисляются один раз. Quota deltas
++сохраняются в журнале: изменение ``no_snapshot_gb_quota`` не меняет сумму,
++освобождаемую при подтверждённом delete/abort.
++
++Поддерживаются только тома без multiattach, group/consistencygroup,
++replication и migration; не допускаются переходные snapshots/attachments.
++Несколько checkpoints разрешены для одного project/instance и одного набора
++томов. Снимок каждого диска принадлежит именно его исходному volume UUID.
++Групповые native snapshots не обязательны: согласованность между дисками
++обеспечит Nova остановкой записей на время сохранения RAM и snapshots.
++Cinder не доказывает, что QEMU остановлен или SAN физически отключён.
++
++Драйвер обязан обеспечивать native snapshot, произвольный in-place revert,
++сохранность остальных checkpoints, независимое удаление snapshot и query
++по стабильному step UUID. CoW и RoW сохраняют своё значение. Общего fallback
++с копированием здесь нет; обычный незащищённый Cinder revert не меняется.
++
++Защищены delete/unmanage, изменение размера/типа, migration, reimage,
++transfer, backup restore, обычные attach/detach и legacy connections,
++group/failover и admin reset. Checkpoint snapshots нельзя удалять, менять
++статус или использовать как источник обычного clone/export. Активная операция
++также блокирует обычные snapshots, clone, backup и upload исходных томов.
++Между операциями возможен read-only backup исходного тома, если конкретный
++путь не изменяет защищённые подключения и не использует защищённый snapshot.
++
++Для revert Nova должна остановить текущую ВМ, физически отключить SAN через
++compute/os-brick и удалить исходные attachments с operation headers. Затем
++Cinder требует ``available`` и отсутствие attachments всех томов. После
++подтверждения всех native reverts Nova создаёт новые attachments для той же
++ВМ и завершает подключения. Release требует завершённых записей и статусов
++томов; это проверка Cinder, а не проверка физического соединения compute.
++
++Восстановление и диагностика
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Операции имеют generation=1 и неизменяемый UUID. Claim ``prepared`` в
++``dispatching`` фиксируется до native I/O. Потеря ответа означает ``unknown``,
++а не отсутствие эффекта. Повтор execute не вызывает драйвер второй раз.
++После перезапуска и периодически worker выполняет только query незавершённых
++шагов своего backend. Другому executor операция автоматически не передаётся.
++
++Безопасный порядок диагностики:
++
++#. Прочитать operation и все steps через сервисный API владельца.
++#. Проверить поколение, исходный набор томов, service identity и backend.
++#. Для ``dispatching/pending/unknown`` вызвать reconcile и дождаться
++   результата.
++#. Для неудачного create после выяснения всех исходов вызвать cleanup; каждый
++   подтверждённый snapshot удаляется отдельным durable delete-step.
++#. Выполнять release только после подтверждённого результата и этапа Nova.
++
++Результат query сам по себе не снимает locks. Timeout, истечение времени,
++выключение ``enabled`` и обычный DB purge тоже их не снимают. ``enabled=false``
++запрещает только новые create; read/revert/delete/recovery сохраняются.
++Allowlist нужно сохранять для прежних владельцев незавершённых операций.
++Отсутствующий Snapshot в БД не доказывает отсутствия backend snapshot.
++
++Типичные безопасные коды: ``driver_exception``, ``query_exception``,
++``invalid_driver_result``, ``driver_profile_changed``,
++``snapshot_record_missing``, ``create_outcome_unknown``,
++``effect_not_cleaned``, ``reattachment_required`` и ``quota_usage_missing``.
++Подробности массива и credentials отсутствуют в публичном ответе.
++
++При невыясненном исходе или частичном revert защита остаётся. В C1 нет
++force-unlock, повторного destructive dispatch того же шага или универсального
++автоматического исправления backend. Не обходить journal прямыми правками БД.
++Смена host, повреждение provider mapping, неподдержанный driver profile,
++ошибка очистки или отсутствующий quota usage требуют отдельной диагностики.
++Штатная startup-очистка не меняет protected artifacts и не переэкспортирует
++их поверх незавершённой операции; вместо этого выполняется native query.
++
++Проверки
++~~~~~~~~
++
++Тесты ``cinder.tests.unit.checkpoints`` проверяют admission, реальные SQL
++гонки,
++авторизацию, quotas, RPC, attachments и recovery. Functional suite
++``cinder.tests.functional.test_checkpoint_contract`` проводит WSGI-запросы
++через настоящие SQL, RPC serializer, volume manager и два fake backend.
++Проверяются A/B, откат старой точки, независимое удаление, потерянный ответ,
++replay после удаления и обычный snapshot API. Capacity scheduler в legacy
++сценарии имитируется. API sample tests сверяют примеры с реальным ответом.
++
++Эти проверки не являются RAM restore, проверкой времени паузы, libvirt/SAN
++или испытанием Dorado/TATLIN. Для исходного архива использовались Linux и
++Python 3.11 с constraints 2025.1; закрытый ``storage_client`` и SberCloud tests
++исключены по согласованию. Фактические результаты и воспроизводимые команды
++поставляются рядом с серией патчей.
+diff --git a/doc/source/admin/index.rst b/doc/source/admin/index.rst
+index 6596805..8814f19 100644
+--- a/doc/source/admin/index.rst
++++ b/doc/source/admin/index.rst
+@@ -55,6 +55,7 @@ Amazon EC2 Elastic Block Storage (EBS) offering.
+    default-volume-types
+    api-configuration
+    upgrades
++   checkpoint-contract
+ 
+ .. _`Storage Decisions`: https://docs.openstack.org/arch-design/design-storage/design-storage-arch.html
+ .. _`OpenStack Operations Guide`: https://wiki.openstack.org/wiki/OpsGuide
+diff --git a/releasenotes/notes/checkpoint-contract-7fa82e10c601.yaml b/releasenotes/notes/checkpoint-contract-7fa82e10c601.yaml
+new file mode 100644
+index 0000000..54851fb
+--- /dev/null
++++ b/releasenotes/notes/checkpoint-contract-7fa82e10c601.yaml
+@@ -0,0 +1,20 @@
++---
++features:
++  - |
++    Adds a disabled-by-default private Cinder checkpoint service contract:
++    API 3.72, Volume RPC 3.21 and object manifest 1.40. It provides durable
++    all-volume ownership, native-only execution, query-based reconciliation,
++    scoped attachments, idempotent quotas and protected checkpoint snapshots.
++    Existing drivers remain unsupported. Nova RAM integration and validated
++    Huawei Dorado/YADRO TATLIN adapters are separate work.
++upgrade:
++  - |
++    Apply migration 7fa82e10c601 and upgrade every Cinder resource writer before
++    enabling checkpoints. Configure verified Nova service tokens and the
++    checkpoint nova_service_user_ids allowlist. RPC gates do not detect old
++    API processes. Downgrade requires all operations and references cleaned up.
++security:
++  - |
++    Tenant metadata, administrator status and tenant service roles cannot
++    bypass checkpoint ownership. Unknown native outcomes retain protection;
++    no timeout-based unlock or copy fallback is provided.

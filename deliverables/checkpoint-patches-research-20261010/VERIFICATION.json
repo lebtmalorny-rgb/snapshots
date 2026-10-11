@@ -1,0 +1,58 @@
+{
+  "date": "2026-10-10",
+  "method": "original_zip -> pinned_base_tree -> git_am_each_packaged_patch -> exact_intermediate_and_final_trees",
+  "new_runtime_run": false,
+  "new_tests_run": false,
+  "products": {
+    "cinder": {
+      "source_sha256": "a635f0e994c786c27c729d07e14eeaa8c92a887652f2cb69daca808d8754eaed",
+      "base_tree": "bee7674a1009f0d22a0db9f2e0f6b98b68e3a448",
+      "patches_applied": 17,
+      "stages": [
+        {
+          "stage": "c1",
+          "patch_count": 10,
+          "tree": "18b12459d77cab89657611f4ea1daeb3168fda10",
+          "matches": true
+        },
+        {
+          "stage": "c11",
+          "patch_count": 7,
+          "tree": "53888d9cea7fa1b12d35a0b9afd894eeee270843",
+          "matches": true
+        }
+      ],
+      "final_tree": "53888d9cea7fa1b12d35a0b9afd894eeee270843",
+      "clean": true,
+      "passed": true
+    },
+    "nova": {
+      "source_sha256": "5e20485c94a525a758141bf1d2dadfd78c88c9166fac704e8e18346f207957a7",
+      "base_tree": "28f04c77ac8f3d973f58d1b4724e11f17ccf6629",
+      "patches_applied": 23,
+      "stages": [
+        {
+          "stage": "n1",
+          "patch_count": 10,
+          "tree": "969f58e0ab7684587266fe3730d2c08b5d7cf783",
+          "matches": true
+        },
+        {
+          "stage": "n2",
+          "patch_count": 10,
+          "tree": "4d24555083fea5d547fe2e8ebf6ed39937c0733c",
+          "matches": true
+        },
+        {
+          "stage": "fixes",
+          "patch_count": 3,
+          "tree": "5e968fbae851c47b321991e8cccd573b06e7e362",
+          "matches": true
+        }
+      ],
+      "final_tree": "5e968fbae851c47b321991e8cccd573b06e7e362",
+      "clean": true,
+      "passed": true
+    }
+  }
+}

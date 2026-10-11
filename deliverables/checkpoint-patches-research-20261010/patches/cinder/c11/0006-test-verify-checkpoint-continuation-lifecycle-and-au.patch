@@ -1,0 +1,1113 @@
+From 54cd029866247a098c308177d5565b7e5a7b1271 Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 16:57:21 +0300
+Subject: [PATCH 6/7] test: verify checkpoint continuation lifecycle and
+ authentication
+
+---
+ api-ref/source/checkpoint-continuation.inc    | 128 +++++++
+ api-ref/source/v3/index.rst                   |   1 +
+ .../checkpoint-create-request.json            |  14 +
+ .../checkpoint-create-response.json           |  55 +++
+ .../v3.73/checkpoint-create-request.json.tpl  |  14 +
+ .../v3.73/checkpoint-create-response.json.tpl |  55 +++
+ .../test_checkpoint_continuation.py           |  60 ++++
+ .../checkpoint_continuation_fixture.py        | 327 ++++++++++++++++++
+ .../test_checkpoint_continuation.py           | 156 +++++++++
+ .../test_checkpoint_continuation_auth.py      |  49 +++
+ doc/source/admin/checkpoint-continuation.rst  | 130 +++++++
+ doc/source/admin/index.rst                    |   1 +
+ test-requirements.txt                         |   1 +
+ 13 files changed, 991 insertions(+)
+ create mode 100644 api-ref/source/checkpoint-continuation.inc
+ create mode 100644 api-ref/source/v3/samples/checkpoint-continuation/checkpoint-create-request.json
+ create mode 100644 api-ref/source/v3/samples/checkpoint-continuation/checkpoint-create-response.json
+ create mode 100644 cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.73/checkpoint-create-request.json.tpl
+ create mode 100644 cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.73/checkpoint-create-response.json.tpl
+ create mode 100644 cinder/tests/functional/api_sample_tests/test_checkpoint_continuation.py
+ create mode 100644 cinder/tests/functional/checkpoint_continuation_fixture.py
+ create mode 100644 cinder/tests/functional/test_checkpoint_continuation.py
+ create mode 100644 cinder/tests/unit/api/middleware/test_checkpoint_continuation_auth.py
+ create mode 100644 doc/source/admin/checkpoint-continuation.rst
+
+diff --git a/api-ref/source/checkpoint-continuation.inc b/api-ref/source/checkpoint-continuation.inc
+new file mode 100644
+index 0000000..dcb0280
+--- /dev/null
++++ b/api-ref/source/checkpoint-continuation.inc
+@@ -0,0 +1,128 @@
++.. -*- rst -*-
++
++Checkpoint continuation (private 3.73)
++======================================
++
++This private fork extension adds a durable grant to the 3.72 checkpoint
++contract. It does not correspond to an upstream API with the same number.
++RPC 3.22 and object manifest 1.41 are required before delegated reserve.
++
++Initial delegation
++~~~~~~~~~~~~~~~~~~
++
++.. rest_method:: POST /v3/{project_id}/checkpoint-operations
++
++The 3.72 request gains two paired fields: ``nova_operation_id`` (canonical
++UUID) and ``allow_service_continuation`` (explicit boolean true). Both may be
++omitted for the original contract. Both are required to create a grant. The
++initial request still requires the project user's token and a verified Nova
++service token. A service-only token cannot reserve or impersonate the actor.
++
++A successful 202 response includes ``continuation`` with ``version=1``,
++``nova_operation_id``, ``owner_project_id``, ``actor_user_id``,
++``executor_service_user_id`` and ``generation=1``. The response has no grant
++mutation API, credentials, connection data or backend references. Exact
++replay returns the same operation; actor/payload changes conflict or are
++not found. Legacy operations cannot gain a grant through replay.
++
++.. literalinclude:: /v3/samples/checkpoint-continuation/checkpoint-create-request.json
++   :language: javascript
++
++.. literalinclude:: /v3/samples/checkpoint-continuation/checkpoint-create-response.json
++   :language: javascript
++
++Service-scoped operation
++~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. rest_method:: GET /v3/checkpoint-service-operations/{nova_operation_id}
++
++The service's own project-scoped token is the primary ``X-Auth-Token``. Its
++subject must match the saved executor, have the service role and be in the
++local allowlist. Original actor/project are selected from the verified grant,
++never from a caller-supplied context. Admin and secondary service identities
++do not bypass the check. A missing or foreign operation returns 404.
++
++All service paths optionally accept ``/v3/{service_project_id}/``. The project
++must be the authenticated service project; it cannot select a tenant owner.
++There is no service collection/list route. GET returns 200 with the same safe
++``checkpoint_operation`` view and continuation binding, including released
++tombstones. A revoked grant cannot be read or continued.
++
++Continue an operation
++~~~~~~~~~~~~~~~~~~~~~
++
++.. rest_method:: POST /v3/checkpoint-service-operations/{nova_operation_id}/action
++
++The body and 202 response follow the 3.72 operation contract: one of execute,
++reconcile, cleanup or release, generation 1, and commit/abort for release.
++Reconcile queries disk results without redispatch. Released operations accept
++only reads; reconcile/cleanup/release retries return 409. Read the tombstone
++to resolve a lost release response.
++
++Read scoped capabilities
++~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. rest_method:: GET /v3/checkpoint-service-operations/{nova_operation_id}/volumes/{volume_id}/capabilities
++
++Returns 200 with the C1 capabilities schema for a volume in the bound set.
++Unbound volumes return 404; no generic tenant-volume query is authorized.
++
++Durable attachment requests
++~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. rest_method:: POST /v3/checkpoint-service-operations/{nova_operation_id}/attachment-requests
++
++The closed body is::
++
++    {"attachment_request": {
++      "id": "<child-uuid>", "generation": 1, "volume_id": "<volume-uuid>",
++      "action": "create", "attachment_id": null,
++      "connector": null, "mountpoint": null
++    }}
++
++All seven fields are required. Actions are create/update/complete/delete.
++Create requires the three nullable fields to be null. Update requires a
++newly created attachment ID and connector, with optional mountpoint.
++Complete/delete require the attachment ID and null connector/mountpoint.
++The instance UUID is taken from the grant. Connector allows host, ip,
++initiator, platform, os_type, nqn, uuid, system uuid, wwpns/wwnns, multipath,
++enforce_multipath and nvme_native_multipath, with their declared types.
++Unknown fields and credentials are rejected with 400.
++
++Response 202 contains ``attachment_request`` with id, operation_id,
++generation, volume_id, action, status, attachment_id and nullable error_code.
++There is no connection_info, connector or schema_version in this REST view.
++Status is prepared, dispatching, pending, succeeded, failed_no_effect or
++unknown. The error code is from a closed safe set, never backend text.
++
++One UUID is accepted for each operation/generation/volume/action. Exact replay
++returns its stored result. Changed payload or a second UUID for the same
++action returns 409. Delete is restricted to original attachments before disk
++revert; reconnect is allowed after every disk step succeeds. Complete requires
++a successful update. The legacy attachment-header bypass is forbidden for a
++delegated operation. Release rejects unfinished attachment requests.
++
++Read an attachment request
++~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. rest_method:: GET /v3/checkpoint-service-operations/{nova_operation_id}/attachment-requests/{child_id}
++
++Returns the same safe result with 200. This is a read, never a new claim or
++backend dispatch. Unknown initialize/terminate results stay unknown without
++backend-specific proof; no universal automatic retry is provided.
++
++Read current attachment data
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. rest_method:: GET /v3/checkpoint-service-operations/{nova_operation_id}/attachments/{attachment_id}
++
++Returns 200 with the standard attachment detail fields, including current
++connection_info, for the operation's current original/new attachment. This
++transient response is not copied into the checkpoint journal. Released grants
++cannot read mutable attachment data.
++
++Authentication errors use 401/403; missing or foreign bindings use 404;
++stale generation, unsupported capabilities and state conflicts use 409.
++Initial reserve can also return quota 413 and unavailable backend 503.
++Expiry/revocation is subject to normal Keystone token validation and caching;
++it does not cancel already accepted RPC or backend I/O.
+diff --git a/api-ref/source/v3/index.rst b/api-ref/source/v3/index.rst
+index c465958..4f6bb40 100644
+--- a/api-ref/source/v3/index.rst
++++ b/api-ref/source/v3/index.rst
+@@ -58,6 +58,7 @@ Block Storage API V3 (CURRENT)
+ .. include:: ext-backups-actions-v3.inc
+ .. include:: capabilities-v3.inc
+ .. include:: checkpoints.inc
++.. include:: ../checkpoint-continuation.inc
+ .. include:: clusters.inc
+ .. include:: consistencygroups-v3.inc
+ .. include:: os-cgsnapshots-v3.inc
+diff --git a/api-ref/source/v3/samples/checkpoint-continuation/checkpoint-create-request.json b/api-ref/source/v3/samples/checkpoint-continuation/checkpoint-create-request.json
+new file mode 100644
+index 0000000..5ba548d
+--- /dev/null
++++ b/api-ref/source/v3/samples/checkpoint-continuation/checkpoint-create-request.json
+@@ -0,0 +1,14 @@
++{
++  "checkpoint_operation": {
++    "request_id": "98e58c8b-d67f-4d5e-9ec2-5c9d811f1efb",
++    "checkpoint_id": "922c8a4d-39d7-4f90-965c-ad88d0b50618",
++    "instance_uuid": "7eec2f55-499f-4201-a071-9f450ea5dd8d",
++    "kind": "create",
++    "volume_ids": [
++      "9b724378-55e2-4ac9-8c60-eed2a696bf40",
++      "dddfbdcf-c6fb-4f8d-b337-66f87f3773dc"
++    ],
++    "nova_operation_id": "73337d2f-0561-4f79-a586-d6c9bd9cc3d1",
++    "allow_service_continuation": true
++  }
++}
+diff --git a/api-ref/source/v3/samples/checkpoint-continuation/checkpoint-create-response.json b/api-ref/source/v3/samples/checkpoint-continuation/checkpoint-create-response.json
+new file mode 100644
+index 0000000..683399a
+--- /dev/null
++++ b/api-ref/source/v3/samples/checkpoint-continuation/checkpoint-create-response.json
+@@ -0,0 +1,55 @@
++{
++  "checkpoint_operation": {
++    "id": "99913af5-bef2-4805-bdb5-b5228d552cfc",
++    "request_id": "98e58c8b-d67f-4d5e-9ec2-5c9d811f1efb",
++    "checkpoint_id": "922c8a4d-39d7-4f90-965c-ad88d0b50618",
++    "instance_uuid": "7eec2f55-499f-4201-a071-9f450ea5dd8d",
++    "kind": "create",
++    "generation": 1,
++    "status": "reserved",
++    "release_outcome": null,
++    "error_code": null,
++    "resources": [
++      {
++        "id": "638cbb01-6051-4691-ad5c-3040b8198b4b",
++        "volume_id": "9b724378-55e2-4ac9-8c60-eed2a696bf40",
++        "snapshot_id": "e653f52d-2910-40e1-a066-b4e8996c522c",
++        "volume_size": 1,
++        "status": "creating"
++      },
++      {
++        "id": "ece9d04e-bb0a-400a-9843-f04f51d7021d",
++        "volume_id": "dddfbdcf-c6fb-4f8d-b337-66f87f3773dc",
++        "snapshot_id": "e9f91bd3-1e5d-4c3e-85c4-e1f69f503aec",
++        "volume_size": 1,
++        "status": "creating"
++      }
++    ],
++    "steps": [
++      {
++        "id": "69aa9530-7f47-48d1-a494-4baf6725f2a6",
++        "resource_id": "638cbb01-6051-4691-ad5c-3040b8198b4b",
++        "phase": "snapshot",
++        "generation": 1,
++        "status": "prepared",
++        "error_code": null
++      },
++      {
++        "id": "65b1a8df-174f-430b-9531-bd0314dd526b",
++        "resource_id": "ece9d04e-bb0a-400a-9843-f04f51d7021d",
++        "phase": "snapshot",
++        "generation": 1,
++        "status": "prepared",
++        "error_code": null
++      }
++    ],
++    "continuation": {
++      "version": 1,
++      "nova_operation_id": "73337d2f-0561-4f79-a586-d6c9bd9cc3d1",
++      "owner_project_id": "89afd400-b646-4bbc-b12b-c0a4d63e5bd3",
++      "actor_user_id": "c853ca26-e8ea-4797-8a52-ee124a013d0e",
++      "executor_service_user_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
++      "generation": 1
++    }
++  }
++}
+diff --git a/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.73/checkpoint-create-request.json.tpl b/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.73/checkpoint-create-request.json.tpl
+new file mode 100644
+index 0000000..40ffc30
+--- /dev/null
++++ b/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.73/checkpoint-create-request.json.tpl
+@@ -0,0 +1,14 @@
++{
++  "checkpoint_operation": {
++    "request_id": "%(request_id)s",
++    "checkpoint_id": "%(checkpoint_id)s",
++    "instance_uuid": "%(instance_uuid)s",
++    "kind": "create",
++    "volume_ids": [
++      "%(volume0)s",
++      "%(volume1)s"
++    ],
++    "nova_operation_id": "%(nova_operation_id)s",
++    "allow_service_continuation": true
++  }
++}
+diff --git a/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.73/checkpoint-create-response.json.tpl b/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.73/checkpoint-create-response.json.tpl
+new file mode 100644
+index 0000000..e9f677f
+--- /dev/null
++++ b/cinder/tests/functional/api_sample_tests/samples/checkpoints/v3.73/checkpoint-create-response.json.tpl
+@@ -0,0 +1,55 @@
++{
++  "checkpoint_operation": {
++    "id": "%(operation_id)s",
++    "request_id": "%(request_id)s",
++    "checkpoint_id": "%(checkpoint_id)s",
++    "instance_uuid": "%(instance_uuid)s",
++    "kind": "create",
++    "generation": 1,
++    "status": "reserved",
++    "release_outcome": null,
++    "error_code": null,
++    "resources": [
++      {
++        "id": "%(resource0)s",
++        "volume_id": "%(volume0)s",
++        "snapshot_id": "%(snapshot0)s",
++        "volume_size": 1,
++        "status": "creating"
++      },
++      {
++        "id": "%(resource1)s",
++        "volume_id": "%(volume1)s",
++        "snapshot_id": "%(snapshot1)s",
++        "volume_size": 1,
++        "status": "creating"
++      }
++    ],
++    "steps": [
++      {
++        "id": "%(step0)s",
++        "resource_id": "%(resource0)s",
++        "phase": "snapshot",
++        "generation": 1,
++        "status": "prepared",
++        "error_code": null
++      },
++      {
++        "id": "%(step1)s",
++        "resource_id": "%(resource1)s",
++        "phase": "snapshot",
++        "generation": 1,
++        "status": "prepared",
++        "error_code": null
++      }
++    ],
++    "continuation": {
++      "version": 1,
++      "nova_operation_id": "%(nova_operation_id)s",
++      "owner_project_id": "%(owner_project_id)s",
++      "actor_user_id": "%(actor_user_id)s",
++      "executor_service_user_id": "%(executor_service_user_id)s",
++      "generation": 1
++    }
++  }
++}
+diff --git a/cinder/tests/functional/api_sample_tests/test_checkpoint_continuation.py b/cinder/tests/functional/api_sample_tests/test_checkpoint_continuation.py
+new file mode 100644
+index 0000000..891d668
+--- /dev/null
++++ b/cinder/tests/functional/api_sample_tests/test_checkpoint_continuation.py
+@@ -0,0 +1,60 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import json
++import os
++from pathlib import Path
++
++from cinder.tests.functional import checkpoint_continuation_fixture as fixture
++
++
++class TestContinuationSamples(fixture.ContinuationFunctionalBase):
++    sample_dir = (Path(__file__).parent / 'samples' / 'checkpoints' / 'v3.73')
++
++    def test_delegated_reserve_samples_match_actual_response(self):
++        operation = self.reserve_with_dual_tokens()
++        resources = sorted(operation['resources'],
++                           key=lambda r: r['volume_id'])
++        operation['resources'] = resources
++        operation['steps'] = [next(s for s in operation['steps']
++                                   if s['resource_id'] == resource['id'])
++                              for resource in resources]
++        subs = dict(self.reserve_body['checkpoint_operation'],
++                    operation_id=operation['id'],
++                    owner_project_id=self.ctxt.project_id,
++                    actor_user_id=self.actor_id,
++                    executor_service_user_id=self.executor_id)
++        for index, resource in enumerate(resources):
++            subs.update({
++                'volume%s' % index: resource['volume_id'],
++                'resource%s' % index: resource['id'],
++                'snapshot%s' % index: resource['snapshot_id'],
++                'step%s' % index: operation['steps'][index]['id']})
++        sample = self.sample_dir / 'checkpoint-create-response.json.tpl'
++        self.assertEqual(json.loads(sample.read_text() % subs),
++                         {'checkpoint_operation': operation})
++        sample = self.sample_dir / 'checkpoint-create-request.json.tpl'
++        response = self.request_with_token(
++            self.user_token, 'POST', '/checkpoint-operations',
++            json.loads(sample.read_text() % subs),
++            service_token=self.valid_service_token)
++        self.assertEqual(202, response.status_int, response.text)
++        self.assertEqual(operation['id'],
++                         response.json['checkpoint_operation']['id'])
++        if os.getenv('GENERATE_SAMPLES'):
++            output = Path('api-ref/source/v3/samples/checkpoint-continuation')
++            output.mkdir(parents=True, exist_ok=True)
++            for name in ('checkpoint-create-request',
++                         'checkpoint-create-response'):
++                template = self.sample_dir / (name + '.json.tpl')
++                (output / (name + '.json')).write_text(
++                    template.read_text() % subs)
+diff --git a/cinder/tests/functional/checkpoint_continuation_fixture.py b/cinder/tests/functional/checkpoint_continuation_fixture.py
+new file mode 100644
+index 0000000..2831a1a
+--- /dev/null
++++ b/cinder/tests/functional/checkpoint_continuation_fixture.py
+@@ -0,0 +1,327 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""Test-only HTTP fixture using auth middleware, SQL and serialized RPC."""
++
++import argparse
++import json
++from pathlib import Path
++import signal
++import time
++from unittest import mock
++
++import eventlet
++from eventlet import wsgi as eventlet_wsgi
++from keystoneauth1 import fixture as token_fixture
++from keystonemiddleware import auth_token
++from oslo_serialization import jsonutils
++from oslo_utils.fixture import uuidsentinel as uuids
++from oslo_utils import uuidutils
++from requests_mock.contrib import fixture as requests_fixture
++import webob
++
++from cinder.api.middleware import auth
++from cinder.api.middleware import fault
++from cinder.api.v3 import router
++from cinder import db
++from cinder.db.sqlalchemy import api as sqla_api
++from cinder.db.sqlalchemy import models
++from cinder import objects
++from cinder.objects import base as object_base
++from cinder import rpc
++from cinder.tests.functional import test_checkpoint_contract
++from cinder.tests.unit.api import fakes
++from cinder.tests.unit.checkpoints import test_db
++from cinder.volume import manager as volume_manager
++
++
++class TokenServer:
++    """Controlled Keystone HTTP responder, never a trusted-context injector."""
++    def __init__(self, owner):
++        self.owner = owner
++        self.expired_user = False
++        self.revoked_service = False
++        self.validated = []
++        self.http = owner.useFixture(requests_fixture.Fixture())
++        self.http.register_uri('GET', 'http://keystone.test/v3/auth/tokens',
++                               json=self.validate)
++
++    def validate(self, request, response):
++        marker = request.headers.get('X-Subject-Token')
++        self.validated.append(marker)
++        identities = {
++            self.owner.user_token: (self.owner.actor_id,
++                                    self.owner.ctxt.project_id, 'member'),
++            self.owner.valid_service_token: (self.owner.executor_id,
++                                             self.owner.service_project,
++                                             'service'),
++            self.owner.foreign_service_token: (uuids.foreign_service,
++                                               self.owner.service_project,
++                                               'service'),
++        }
++        if (marker not in identities or
++                marker == self.owner.user_token and self.expired_user or
++                marker == self.owner.valid_service_token and
++                self.revoked_service):
++            response.status_code = 404
++            return {'error': {'message': 'fixture token rejected'}}
++        user_id, project_id, role = identities[marker]
++        token = token_fixture.V3Token(user_id=user_id, project_id=project_id)
++        token.add_role(name=role)
++        return token
++
++    def expire_user_token(self):
++        self.expired_user = True
++
++    def revoke_service(self):
++        self.revoked_service = True
++
++
++class ContinuationFunctionalBase(
++        test_checkpoint_contract.CheckpointFunctionalBase):
++    user_token = 'c11-test-user-marker'
++    valid_service_token = 'c11-test-service-marker'
++    foreign_service_token = 'c11-test-foreign-service-marker'
++
++    def setUp(self):
++        self.rpc_servers = []
++        factory = rpc.get_server
++
++        def record(target, endpoints, **kwargs):
++            server = factory(target, endpoints, **kwargs)
++            self.rpc_servers.append((target, endpoints, server))
++            return server
++
++        with mock.patch.object(rpc, 'get_server', side_effect=record):
++            super().setUp()
++        self.actor_id = self.ctxt.user_id
++        self.executor_id = test_db.SERVICE_ID
++        self.service_project = uuids.service_project
++        self.flags(nova_service_user_ids=[self.executor_id,
++                                          uuids.foreign_service],
++                   group='checkpoint')
++        for service in objects.ServiceList.get_all_by_binary(
++                self.ctxt.elevated(), 'cinder-volume'):
++            db.service_update(self.ctxt.elevated(), service.id, {
++                'rpc_current_version': '3.22',
++                'object_current_version': '1.41',
++                'uuid': uuidutils.generate_uuid()})
++        # Initial fixtures must represent connected VM disks, including their
++        # original connector. No backend effects run during this setup.
++        with sqla_api.main_context_manager.writer.using(self.ctxt):
++            self.ctxt.session.query(models.VolumeAttachment).filter(
++                models.VolumeAttachment.volume_id.in_(self.volumes)).update({
++                    'connector': json.dumps({'host': 'compute-one',
++                                             'ip': '192.0.2.10'})},
++                    synchronize_session=False)
++        self.token_server = TokenServer(self)
++        self.build_authenticated_app()
++
++    def build_authenticated_app(self):
++        rpc.LAST_RPC_VERSIONS.clear()
++        rpc.LAST_OBJ_VERSIONS.clear()
++        app = fakes.urlmap.URLMap()
++        app['/v3'] = router.APIRouter()
++        pipeline = auth.CinderKeystoneContext(fault.FaultWrapper(app))
++        self.authenticated_app = auth_token.AuthProtocol(pipeline, {
++            'auth_type': 'admin_token',
++            'endpoint': 'http://keystone.test/v3',
++            'token': 'c11-test-validation-marker',
++            'www_authenticate_uri': 'http://keystone.test/v3',
++            'auth_version': 'v3', 'token_cache_time': '0',
++            'service_token_roles': ['service'],
++            'service_token_roles_required': True,
++        })
++
++    def restart_api_and_workers(self):
++        replacements = []
++        for target, endpoints, server in self.rpc_servers:
++            if not isinstance(endpoints[0], volume_manager.VolumeManager):
++                replacements.append((target, endpoints, server))
++                continue
++            self.stop_server(server)
++            worker = volume_manager.VolumeManager(host=endpoints[0].host)
++            worker.driver = endpoints[0].driver
++            for vid, previous in list(self.workers.items()):
++                if previous is endpoints[0]:
++                    self.workers[vid] = worker
++            server = rpc.get_server(target, [worker],
++                                    serializer=object_base.
++                                    CinderObjectSerializer())
++            server.start()
++            self.addCleanup(self.stop_server, server)
++            replacements.append((target, [worker], server))
++        self.rpc_servers = replacements
++        self.build_authenticated_app()
++
++    def request_with_token(self, token, method, path, body=None,
++                           headers=None, service_token=None):
++        request = webob.Request.blank('/v3' + path)
++        request.method = method
++        request.headers.update({
++            'Content-Type': 'application/json',
++            'OpenStack-API-Version': 'volume 3.73', 'X-Auth-Token': token})
++        if service_token:
++            request.headers['X-Service-Token'] = service_token
++        if headers:
++            request.headers.update(headers)
++        if body is not None:
++            request.body = jsonutils.dump_as_bytes(body)
++        return request.get_response(self.authenticated_app)
++
++    def reserve_with_dual_tokens(self, kind='create', checkpoint_id=None):
++        self.nova_operation_id = uuidutils.generate_uuid()
++        self.service_path = ('/checkpoint-service-operations/' +
++                             self.nova_operation_id)
++        self.reserve_body = {'checkpoint_operation': {
++            'request_id': uuidutils.generate_uuid(),
++            'checkpoint_id': checkpoint_id or uuidutils.generate_uuid(),
++            'instance_uuid': self.instance, 'kind': kind,
++            'volume_ids': self.volumes,
++            'nova_operation_id': self.nova_operation_id,
++            'allow_service_continuation': True}}
++        response = self.request_with_token(
++            self.user_token, 'POST', '/checkpoint-operations',
++            self.reserve_body, service_token=self.valid_service_token)
++        self.assertEqual(202, response.status_int, response.text)
++        return response.json['checkpoint_operation']
++
++    def service_action(self, name, outcome=None):
++        args = {'generation': 1}
++        if outcome:
++            args['outcome'] = outcome
++        response = self.request_with_token(
++            self.valid_service_token, 'POST', self.service_path + '/action',
++            {name: args})
++        self.assertEqual(202, response.status_int, response.text)
++        return response.json['checkpoint_operation']
++
++    def wait_service(self, status, suffix='', field='checkpoint_operation'):
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline:
++            response = self.request_with_token(
++                self.valid_service_token, 'GET', self.service_path + suffix)
++            self.assertEqual(200, response.status_int, response.text)
++            actual = response.json[field]
++            if actual['status'] == status:
++                return actual
++            eventlet.sleep(0.01)
++        self.fail('Continuation did not reach %s: %s' % (status, actual))
++
++    def service_checkpoint(self):
++        operation = self.reserve_with_dual_tokens()
++        self.service_action('execute')
++        self.wait_service('succeeded')
++        self.service_action('release', 'commit')
++        return operation
++
++    def attachment_request(self, action, volume_id, attachment_id=None,
++                           reply_loss=False):
++        body = {'attachment_request': {
++            'id': uuidutils.generate_uuid(), 'generation': 1,
++            'volume_id': volume_id, 'action': action,
++            'attachment_id': attachment_id,
++            'connector': {'host': 'compute-one', 'ip': '192.0.2.10'}
++            if action == 'update' else None,
++            'mountpoint': '/dev/vda' if action == 'update' else None}}
++        response = self.request_with_token(
++            self.valid_service_token, 'POST',
++            self.service_path + '/attachment-requests', body)
++        self.assertEqual(202, response.status_int, response.text)
++        child_id = body['attachment_request']['id']
++        observed = self.wait_service(
++            'succeeded', '/attachment-requests/' + child_id,
++            'attachment_request')
++        if reply_loss:
++            # Discard the original response. Retry exactly the durable UUID;
++            # the server may have finished the operation before this replay.
++            replay = self.request_with_token(
++                self.valid_service_token, 'POST',
++                self.service_path + '/attachment-requests', body)
++            self.assertEqual(202, replay.status_int, replay.text)
++            self.assertEqual(observed, replay.json['attachment_request'])
++        return observed
++
++    def service_revert(self, reply_loss=False):
++        originals = []
++        for vid in self.volumes:
++            aid = objects.Volume.get_by_id(
++                self.ctxt, vid).volume_attachment[0].id
++            originals.append(aid)
++            self.attachment_request('delete', vid, aid, reply_loss)
++        self.service_action('execute')
++        self.wait_service('succeeded')
++        for vid in self.volumes:
++            created = self.attachment_request(
++                'create', vid, reply_loss=reply_loss)
++            aid = created['attachment_id']
++            self.assertNotIn(aid, originals)
++            self.attachment_request('update', vid, aid, reply_loss)
++            response = self.request_with_token(
++                self.valid_service_token, 'GET',
++                self.service_path + '/attachments/' + aid)
++            self.assertEqual(200, response.status_int, response.text)
++            self.assertIsInstance(
++                response.json['attachment']['connection_info'], dict)
++            self.attachment_request('complete', vid, aid, reply_loss)
++        self.service_action('release', 'commit')
++
++    def serialized_journals(self):
++        with sqla_api.main_context_manager.reader.using(self.ctxt):
++            return str({model.__tablename__: [dict(row) for row in
++                       self.ctxt.session.query(model).all()]
++                        for model in (models.CheckpointOperation,
++                                      models.CheckpointStep,
++                                      models.CheckpointContinuationGrant,
++                                      models.CheckpointAttachmentIntent)})
++
++
++def serve_fixture(bind_host, port, ready_path):
++    fixture = ContinuationFunctionalBase()
++    listener = None
++    try:
++        fixture.setUp()
++        listener = eventlet.listen((bind_host, port))
++        host, selected_port = listener.getsockname()[:2]
++        manifest = {
++            'endpoint': 'http://%s:%s/v3' % (host, selected_port),
++            'user_token': fixture.user_token,
++            'service_token': fixture.valid_service_token,
++            'foreign_service_token': fixture.foreign_service_token,
++            'owner_project_id': fixture.ctxt.project_id,
++            'actor_user_id': fixture.actor_id,
++            'executor_service_user_id': fixture.executor_id,
++            'service_project_id': fixture.service_project,
++            'instance_uuid': fixture.instance, 'volume_ids': fixture.volumes,
++        }
++        Path(ready_path).write_text(json.dumps(manifest))
++
++        def terminate(signum, frame):
++            raise SystemExit(0)
++
++        signal.signal(signal.SIGTERM, terminate)
++        eventlet_wsgi.server(listener, fixture.authenticated_app,
++                             log_output=False)
++    finally:
++        if listener:
++            listener.close()
++        fixture.tearDown()
++        fixture.doCleanups()
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--host', default='127.0.0.1')
++    parser.add_argument('--port', type=int, default=0)
++    parser.add_argument('--ready', required=True)
++    args = parser.parse_args()
++    serve_fixture(args.host, args.port, args.ready)
+diff --git a/cinder/tests/functional/test_checkpoint_continuation.py b/cinder/tests/functional/test_checkpoint_continuation.py
+new file mode 100644
+index 0000000..1ecd882
+--- /dev/null
++++ b/cinder/tests/functional/test_checkpoint_continuation.py
+@@ -0,0 +1,156 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import time
++from urllib import request as http
++
++from oslo_utils import uuidutils
++
++from cinder import db
++from cinder.tests.functional.checkpoint_continuation_fixture import (  # noqa
++    ContinuationFunctionalBase)
++from cinder.tests.unit import test
++
++
++class TestCheckpointContinuation(ContinuationFunctionalBase):
++    def test_expired_user_restart_service_completes_same_operation(self):
++        accepted = self.reserve_with_dual_tokens()
++        self.token_server.expire_user_token()
++        self.restart_api_and_workers()
++        response = self.request_with_token(
++            self.valid_service_token, 'GET', self.service_path)
++        operation = response.json['checkpoint_operation']
++        self.assertEqual(200, response.status_int, response.text)
++        self.assertEqual(accepted['id'], operation['id'])
++        self.assertEqual(self.actor_id,
++                         operation['continuation']['actor_user_id'])
++        self.service_action('execute')
++        self.wait_service('succeeded')
++        self.service_action('reconcile')
++        self.service_action('release', 'commit')
++        self.assertEqual(2, self.native_count())
++        self.assertEqual([], self.locks())
++        self.assertNotIn(self.user_token, self.serialized_journals())
++        self.assertNotIn(self.valid_service_token, self.serialized_journals())
++        denied = self.request_with_token(
++            self.user_token, 'POST', '/checkpoint-operations',
++            self.reserve_body)
++        self.assertEqual(401, denied.status_int, denied.text)
++
++    def test_service_only_missing_grant_cannot_reserve(self):
++        self.reserve_with_dual_tokens()
++        response = self.request_with_token(
++            self.valid_service_token, 'POST', '/checkpoint-operations',
++            self.reserve_body)
++        self.assertEqual(403, response.status_int, response.text)
++        response = self.request_with_token(
++            self.valid_service_token, 'GET',
++            '/checkpoint-service-operations/' + uuidutils.generate_uuid())
++        self.assertEqual(404, response.status_int, response.text)
++
++    def test_attachment_response_loss_full_revert(self):
++        self.data(b'point-A')
++        checkpoint = self.service_checkpoint()
++        self.data(b'current')
++        self.reserve_with_dual_tokens('revert', checkpoint['checkpoint_id'])
++        self.token_server.expire_user_token()
++        self.service_revert(reply_loss=True)
++        self.assertEqual([b'point-A'] * 2,
++                         [self.drivers[v].data[v] for v in self.volumes])
++        self.assertEqual([], self.locks())
++        self.assertEqual(4, self.native_count())
++        self.assertNotIn('auth_password', self.serialized_journals())
++        for driver in self.drivers.values():
++            self.assertEqual(1, driver.initialize_connection.call_count)
++            self.assertEqual(1, driver.terminate_connection.call_count)
++
++    def test_create_delete_two_backends_keep_other_checkpoint(self):
++        self.data(b'point-A')
++        first = self.service_checkpoint()
++        self.data(b'point-B')
++        second = self.service_checkpoint()
++        self.data(b'current')
++        self.reserve_with_dual_tokens('delete', first['checkpoint_id'])
++        self.service_action('execute')
++        self.wait_service('succeeded')
++        self.service_action('release', 'commit')
++        self.assertEqual([b'current'] * 2,
++                         [self.drivers[v].data[v] for v in self.volumes])
++        self.assertEqual({r['snapshot_id'] for r in second['resources']},
++                         {sid for d in self.drivers.values()
++                          for sid in d.snapshots})
++        self.assertEqual(2, db.quota_usage_get_all_by_project(
++            self.ctxt.elevated(), self.ctxt.project_id)['snapshots']['in_use'])
++
++
++class TestContinuationHTTPFixture(test.TestCase):
++    def test_separate_process_serves_actual_authenticated_cinder(self):
++        with tempfile.TemporaryDirectory() as temporary:
++            ready = Path(temporary) / 'ready.json'
++            log = Path(temporary) / 'server.log'
++            with log.open('w') as output:
++                process = subprocess.Popen([
++                    sys.executable, '-m',
++                    'cinder.tests.functional.checkpoint_continuation_fixture',
++                    '--ready', str(ready)], stdout=output,
++                    stderr=subprocess.STDOUT, env=dict(os.environ))
++                try:
++                    deadline = time.monotonic() + 30
++                    while not ready.exists() and time.monotonic() < deadline:
++                        if process.poll() is not None:
++                            self.fail(log.read_text())
++                        time.sleep(0.02)
++                    self.assertTrue(ready.exists(), log.read_text())
++                    fixture = json.loads(ready.read_text())
++                    nova_id = uuidutils.generate_uuid()
++                    body = {'checkpoint_operation': {
++                        'request_id': uuidutils.generate_uuid(),
++                        'checkpoint_id': uuidutils.generate_uuid(),
++                        'instance_uuid': fixture['instance_uuid'],
++                        'volume_ids': fixture['volume_ids'], 'kind': 'create',
++                        'nova_operation_id': nova_id,
++                        'allow_service_continuation': True}}
++                    headers = {'Content-Type': 'application/json',
++                               'OpenStack-API-Version': 'volume 3.73',
++                               'X-Auth-Token': fixture['user_token'],
++                               'X-Service-Token': fixture['service_token']}
++                    url = fixture['endpoint'] + '/checkpoint-operations'
++                    with http.urlopen(http.Request(
++                            url, json.dumps(body).encode(), headers),
++                            timeout=10) as response:
++                        self.assertEqual(202, response.status)
++                        accepted = json.load(response)['checkpoint_operation']
++                    headers['X-Auth-Token'] = fixture['service_token']
++                    headers.pop('X-Service-Token')
++                    url = (fixture['endpoint'] +
++                           '/checkpoint-service-operations/' + nova_id)
++                    with http.urlopen(http.Request(url, headers=headers),
++                                      timeout=10) as response:
++                        operation = json.load(response)['checkpoint_operation']
++                    self.assertEqual(accepted['id'], operation['id'])
++                    self.assertEqual(
++                        fixture['actor_user_id'],
++                        operation['continuation']['actor_user_id'])
++                finally:
++                    process.terminate()
++                    try:
++                        process.wait(timeout=15)
++                    except subprocess.TimeoutExpired:
++                        process.kill()
++                        process.wait(timeout=5)
++                self.assertEqual(0, process.returncode, log.read_text())
+diff --git a/cinder/tests/unit/api/middleware/test_checkpoint_continuation_auth.py b/cinder/tests/unit/api/middleware/test_checkpoint_continuation_auth.py
+new file mode 100644
+index 0000000..b0f52cc
+--- /dev/null
++++ b/cinder/tests/unit/api/middleware/test_checkpoint_continuation_auth.py
+@@ -0,0 +1,49 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from cinder.tests.functional.checkpoint_continuation_fixture import (  # noqa
++    ContinuationFunctionalBase)
++
++
++class TestCheckpointContinuationAuth(ContinuationFunctionalBase):
++    def test_forged_identity_headers_overwritten_by_middleware(self):
++        self.reserve_with_dual_tokens()
++        response = self.request_with_token(
++            self.foreign_service_token, 'GET', self.service_path,
++            headers={'X-User-Id': self.executor_id,
++                     'X-Roles': 'admin,service',
++                     'X-Project-Id': self.service_project,
++                     'X-Service-User-Id': self.executor_id,
++                     'X-Identity-Status': 'Confirmed',
++                     'X-Service-Identity-Status': 'Confirmed'})
++        self.assertEqual(404, response.status_int, response.text)
++        self.assertIn(self.foreign_service_token, self.token_server.validated)
++
++    def test_unknown_token_cannot_supply_trusted_identity(self):
++        self.reserve_with_dual_tokens()
++        response = self.request_with_token(
++            'invalid-marker', 'GET', self.service_path,
++            headers={'X-User-Id': self.executor_id, 'X-Roles': 'service',
++                     'X-Identity-Status': 'Confirmed',
++                     'X-Project-Id': self.service_project})
++        self.assertEqual(401, response.status_int, response.text)
++
++    def test_service_identity_revocation_rejects_new_requests(self):
++        self.reserve_with_dual_tokens()
++        self.token_server.revoke_service()
++        self.restart_api_and_workers()
++        response = self.request_with_token(
++            self.valid_service_token, 'POST', self.service_path + '/action',
++            {'execute': {'generation': 1}})
++        self.assertEqual(401, response.status_int, response.text)
++        self.assertEqual(0, self.native_count())
++        self.assertEqual(2, len(self.locks()))
+diff --git a/doc/source/admin/checkpoint-continuation.rst b/doc/source/admin/checkpoint-continuation.rst
+new file mode 100644
+index 0000000..5f7c123
+--- /dev/null
++++ b/doc/source/admin/checkpoint-continuation.rst
+@@ -0,0 +1,130 @@
++===========================================
++Продолжение checkpoint сервисом Nova (C1.1)
++===========================================
++
++Назначение и граница проверки
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++C1.1 позволяет завершить заранее делегированную операцию после истечения
++пользовательского токена. Actor, проект владельца, instance UUID, набор томов,
++checkpoint UUID и generation сохраняются при первоначальном reserve.
++Сервис получает полномочие только на эту операцию. Общего доступа к чужим
++томам, начального reserve от имени сервиса и смены владельца grant нет.
++
++Локальные tests проверяют настоящий Keystone middleware с контролируемым
++HTTP-ответчиком проверки токенов, SQL, сериализацию RPC и два fake backend.
++Отдельный HTTP fixture предназначен для contract tests Nova. Это не live
++Keystone/RabbitMQ, не испытание SAN и не доказательство поддержки Dorado или
++TATLIN. Новые профили не включаются этим пакетом.
++
++Версии и зависимости
++~~~~~~~~~~~~~~~~~~~~
++
++Частные версии этого форка: API 3.73, volume RPC 3.22, object manifest 1.41.
++Миграции ``83d4e2a671c0`` и ``95b6d7f082e1`` следуют за C1
++``7fa82e10c601``; они добавляют grants и attachment intents, сохраняя старые
++строки. CheckpointOperation 1.1 содержит nullable continuation ID. Операцию
++с grant нельзя сериализовать как старый OVO 1.0.
++
++Перед delegated reserve проверяются доступность нужных volume services,
++их реальные объявления RPC/OVO и локальные caps. Требуется обновление всех
++писателей из runbook C1. Feature остаётся выключенной по умолчанию.
++Отключение новых create не отменяет существующую операцию.
++
++Аутентификация и отзыв
++~~~~~~~~~~~~~~~~~~~~~~
++
++Первоначальный POST требует user token и проверенный service token Nova.
++Поля ``nova_operation_id`` и ``allow_service_continuation=true`` передаются
++вместе. Согласие отсутствует в 3.72 и не добавляется к старой операции replay.
++Grant, квоты, snapshots и locks фиксируются одной транзакцией.
++
++После reserve Nova использует свежий собственный service token как основной
++``X-Auth-Token``. Subject этого токена должен совпадать с executor grant,
++иметь роль service, project scope и входить в
++``[checkpoint] nova_service_user_ids``. Второй service token, admin role или
++owner project в URL не заменяют subject. URL без project поддерживается;
++если project указан, это project аутентифицированного сервиса.
++
++Nova не сохраняет пользовательский bearer для восстановления. Cinder не
++записывает токены, пароли драйвера и connection_info в checkpoint journal.
++Нормальные request context и attachment records остаются штатными каналами
++передачи аутентификации и данных подключения.
++
++Локальное удаление service identity из allowlist запрещает дальнейшие
++обработчики. Worker повторно проверяет durable grant, его revision, scope,
++host и driver profile. Состояние ``revoked`` запрещает продолжение, но
++публичного API редактирования grants нет. Отзыв Keystone credentials
++проверяется обычной token validation новых REST-запросов с её штатной
++семантикой кэширования. Это не мгновенная отмена уже принятого RPC или I/O.
++Для исключения позднего эффекта нужно подтверждённое прекращение исполнения.
++
++Attachment requests при revert
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Nova сохраняет child UUID до обращения к Cinder. Новый route принимает
++``create``, ``update``, ``complete`` или ``delete``. UUID и hash payload
++фиксируются до эффекта; повтор возвращает тот же результат. Другая нагрузка
++с тем же UUID или другой UUID для того же volume/action дают конфликт.
++Первая версия допускает один attach cycle на том в одной revert-операции.
++
++* Delete разрешён только для исходного attachment и до native revert.
++* Create разрешён после успеха всех disk steps и создаёт новый attachment
++  только для сохранённых volume/instance UUID. UUID, reservation и результат
++  фиксируются одной DB-транзакцией.
++* Update фиксирует dispatch до create_export/initialize_connection. Только
++  подтверждённый ответ сохраняет connection_info в штатной attachment row.
++* Complete требует подтверждённого update и атомарно завершает attachment.
++
++Для delegated операций старый header-based attachment route запрещён,
++поскольку он не ведёт child journal. Операции C1 без grant работают как прежде.
++Scoped GET attachment возвращает текущие connection_info транзитно; их нет
++в attachment-request response. Connector payload содержит только разрешённые
++os-brick поля, без CHAP/management credentials.
++
++Timeout, потеря ответа или ошибка после dispatch приводят к ``unknown``.
++У штатных initialize/terminate_connection нет общего query-by-request-id;
++повторный POST/GET не вызывает их заново. Read-only query не превращает
++``prepared`` в dispatch. Автоматических remove_export/rollback после
++неопределённого initialize_connection нет. DB-only create/complete можно
++проверить по журналу. Для неизвестного backend update/delete нужны
++доказательства конкретного D/V1-профиля либо отдельная диагностика оператора.
++
++Восстановление
++~~~~~~~~~~~~~~
++
++#. Получить scoped operation по сохранённому Nova operation UUID и сверить
++   неизменяемые связи, generation и steps.
++#. Для disk steps вызвать reconcile; для attachment requests прочитать
++   сохранённый child UUID. Query не является повторным effect dispatch.
++#. При lost reserve response повторять только исходный reserve с тем же
++   actor и payload. Service-only GET 404 не доказывает отсутствия принятого
++   reserve; нельзя подменять actor или автоматически возвращать квоту.
++#. При lost release response прочитать operation. Released tombstone
++   подтверждает release и остаётся доступным; новые mutations запрещены.
++#. Если attachment result не терминален или create не завершён complete,
++   release отвергается. Unknown и частичный revert сохраняют locks.
++
++Не удалять intent, grant или lock вручную для повторного backend I/O.
++Пакет не содержит force-unlock и смену executor. RAM-store и libvirt executor
++относятся к следующему пакету Nova N2; NFS/NAS здесь не настраивается.
++
++Локальные команды проверки
++~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++В подготовленной Linux-среде Python 3.11, с requirements/test-requirements
++под constraints 2025.1::
++
++    python -m unittest -v cinder.tests.functional.test_checkpoint_continuation
++    python -m unittest -v cinder.tests.unit.api.middleware.test_checkpoint_continuation_auth
++    python -m unittest -v cinder.tests.unit.checkpoints.test_continuation_manager
++
++HTTP fixture использует только тестовые token markers и fake storage;
++он не является production service::
++
++    python -m cinder.tests.functional.checkpoint_continuation_fixture \
++      --host 127.0.0.1 --port 0 --ready /tmp/c11-fixture.json
++
++Ready JSON содержит endpoint, token markers и UUID тестовых ресурсов.
++SIGTERM завершает RPC и fixture. Nova contract gate должен использовать
++закреплённый C1.1 checkout и его interpreter, а не вторую реализацию Cinder.
+diff --git a/doc/source/admin/index.rst b/doc/source/admin/index.rst
+index 8814f19..e6c7c26 100644
+--- a/doc/source/admin/index.rst
++++ b/doc/source/admin/index.rst
+@@ -56,6 +56,7 @@ Amazon EC2 Elastic Block Storage (EBS) offering.
+    api-configuration
+    upgrades
+    checkpoint-contract
++   checkpoint-continuation
+ 
+ .. _`Storage Decisions`: https://docs.openstack.org/arch-design/design-storage/design-storage-arch.html
+ .. _`OpenStack Operations Guide`: https://wiki.openstack.org/wiki/OpsGuide
+diff --git a/test-requirements.txt b/test-requirements.txt
+index 70e647e..2c72889 100644
+--- a/test-requirements.txt
++++ b/test-requirements.txt
+@@ -21,3 +21,4 @@ doc8>=0.8.1 # Apache-2.0
+ mypy>=1.7.0,<1.16.0 # MIT
+ moto>=5.0.0 # Apache-2.0
+ distro>=1.8.0 # Apache-2.0
++requests-mock>=1.2.0 # Apache-2.0

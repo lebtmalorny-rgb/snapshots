@@ -1,0 +1,1590 @@
+From 98c81e12455949248745861458e75768365d234e Mon Sep 17 00:00:00 2001
+From: Lebt <lebtmalorny@gmail.com>
+Date: Wed, 7 Oct 2026 11:23:47 +0300
+Subject: [PATCH 06/10] feat: expose cell-aware Nova checkpoint API
+
+---
+ nova/api/openstack/api_version_request.py     |   2 +-
+ .../compute/rest_api_version_history.rst      |   9 +
+ nova/api/openstack/compute/routes.py          |  21 +
+ .../compute/schemas/server_checkpoints.py     |  70 ++++
+ .../openstack/compute/server_checkpoints.py   | 150 +++++++
+ .../compute/views/server_checkpoints.py       |  41 ++
+ nova/checkpoints/api.py                       | 309 +++++++++++++++
+ nova/checkpoints/coordinator.py               |  18 +-
+ nova/compute/manager.py                       |   4 +-
+ nova/compute/rpcapi.py                        |   6 +-
+ nova/conductor/api.py                         |   4 +-
+ nova/conductor/manager.py                     |   4 +-
+ nova/conductor/rpcapi.py                      |   6 +-
+ nova/policies/__init__.py                     |   2 +
+ nova/policies/server_checkpoints.py           |  42 ++
+ .../compute/test_server_checkpoints.py        | 250 ++++++++++++
+ nova/tests/unit/checkpoints/test_api.py       | 371 ++++++++++++++++++
+ .../unit/policies/test_server_checkpoints.py  |  52 +++
+ 18 files changed, 1347 insertions(+), 14 deletions(-)
+ create mode 100644 nova/api/openstack/compute/schemas/server_checkpoints.py
+ create mode 100644 nova/api/openstack/compute/server_checkpoints.py
+ create mode 100644 nova/api/openstack/compute/views/server_checkpoints.py
+ create mode 100644 nova/checkpoints/api.py
+ create mode 100644 nova/policies/server_checkpoints.py
+ create mode 100644 nova/tests/unit/api/openstack/compute/test_server_checkpoints.py
+ create mode 100644 nova/tests/unit/checkpoints/test_api.py
+ create mode 100644 nova/tests/unit/policies/test_server_checkpoints.py
+
+diff --git a/nova/api/openstack/api_version_request.py b/nova/api/openstack/api_version_request.py
+index 80a2342..acf8a06 100644
+--- a/nova/api/openstack/api_version_request.py
++++ b/nova/api/openstack/api_version_request.py
+@@ -282,7 +282,7 @@ REST_API_VERSION_HISTORY = """REST API Version History:
+ # Note(cyeoh): This only applies for the v2.1 API once microversions
+ # support is fully merged. It does not affect the V2 API.
+ _MIN_API_VERSION = '2.1'
+-_MAX_API_VERSION = '2.105'
++_MAX_API_VERSION = '2.106'
+ DEFAULT_API_VERSION = _MIN_API_VERSION
+ 
+ # Almost all proxy APIs which are related to network, images and baremetal
+diff --git a/nova/api/openstack/compute/rest_api_version_history.rst b/nova/api/openstack/compute/rest_api_version_history.rst
+index 7433a87..7b95b91 100644
+--- a/nova/api/openstack/compute/rest_api_version_history.rst
++++ b/nova/api/openstack/compute/rest_api_version_history.rst
+@@ -1300,3 +1300,12 @@ The ``GET /servers/{server_id}``, ``GET /servers/detail``
+ ``PUT /servers/{server_id}`` and ``POST /server/{server_id}/action``
+ (rebuild) responses now include the scheduler hints provided during
+ server creation.
++
++2.106 (private fork extension)
++------------------------------
++
++Adds project-scoped instance checkpoint capabilities, create, list, show,
++revert, delete and operation status. New creates require an explicit live
++executor capability and artifact budget. This N1 contract does not implement
++physical RAM or storage operations; the default driver reports unsupported.
++The private extension is not an upstream compatibility claim.
+diff --git a/nova/api/openstack/compute/routes.py b/nova/api/openstack/compute/routes.py
+index 75ce3a7..2f79571 100644
+--- a/nova/api/openstack/compute/routes.py
++++ b/nova/api/openstack/compute/routes.py
+@@ -66,6 +66,7 @@ from nova.api.openstack.compute import remote_consoles
+ from nova.api.openstack.compute import rescue
+ from nova.api.openstack.compute import security_group_default_rules
+ from nova.api.openstack.compute import security_groups
++from nova.api.openstack.compute import server_checkpoints
+ from nova.api.openstack.compute import server_diagnostics
+ from nova.api.openstack.compute import server_external_events
+ from nova.api.openstack.compute import server_groups
+@@ -312,6 +313,9 @@ server_remote_consoles_controller = functools.partial(_create_controller,
+ server_security_groups_controller = functools.partial(_create_controller,
+     security_groups.ServerSecurityGroupController, [])
+ 
++server_checkpoints_controller = functools.partial(_create_controller,
++    server_checkpoints.ServerCheckpointsController, [])
++
+ server_shares_controller = functools.partial(_create_controller,
+     server_shares.ServerSharesController, [])
+ 
+@@ -832,6 +836,23 @@ ROUTE_LIST = (
+     ('/servers/{server_id}/os-security-groups', {
+         'GET': [server_security_groups_controller, 'index']
+     }),
++    ('/servers/{server_id}/checkpoint-capabilities', {
++        'GET': [server_checkpoints_controller, 'capabilities'],
++    }),
++    ('/servers/{server_id}/checkpoints', {
++        'GET': [server_checkpoints_controller, 'index'],
++        'POST': [server_checkpoints_controller, 'create'],
++    }),
++    ('/servers/{server_id}/checkpoints/{id}', {
++        'GET': [server_checkpoints_controller, 'show'],
++        'DELETE': [server_checkpoints_controller, 'delete'],
++    }),
++    ('/servers/{server_id}/checkpoints/{id}/action', {
++        'POST': [server_checkpoints_controller, 'revert'],
++    }),
++    ('/servers/{server_id}/checkpoint-operations/{id}', {
++        'GET': [server_checkpoints_controller, 'operation_show'],
++    }),
+     ('/servers/{server_id}/shares', {
+         'GET': [server_shares_controller, 'index'],
+         'POST': [server_shares_controller, 'create'],
+diff --git a/nova/api/openstack/compute/schemas/server_checkpoints.py b/nova/api/openstack/compute/schemas/server_checkpoints.py
+new file mode 100644
+index 0000000..297aa0d
+--- /dev/null
++++ b/nova/api/openstack/compute/schemas/server_checkpoints.py
+@@ -0,0 +1,70 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++_uuid = {'type': 'string', 'format': 'uuid'}
++
++create = {
++    'type': 'object',
++    'properties': {
++        'checkpoint': {
++            'type': 'object',
++            'properties': {
++                'name': {'type': 'string', 'maxLength': 255},
++                'request_id': _uuid,
++                'include_memory': {'type': 'boolean', 'enum': [True]},
++            },
++            'required': ['request_id'],
++            'additionalProperties': False,
++        }
++    },
++    'required': ['checkpoint'],
++    'additionalProperties': False,
++}
++revert = {
++    'type': 'object',
++    'properties': {
++        'revert': {
++            'type': 'object',
++            'properties': {'request_id': _uuid},
++            'required': ['request_id'],
++            'additionalProperties': False,
++        }
++    },
++    'required': ['revert'],
++    'additionalProperties': False,
++}
++empty_query = {
++    'type': 'object',
++    'properties': {},
++    'additionalProperties': False,
++}
++index_query = {
++    'type': 'object',
++    'properties': {
++        'limit': {
++            'type': 'array',
++            'items': {
++                'type': 'string',
++                'pattern': '^(?:[1-9][0-9]{0,2}|1000)$',
++            },
++            'minItems': 1,
++            'maxItems': 1,
++        },
++        'marker': {
++            'type': 'array',
++            'items': _uuid,
++            'minItems': 1,
++            'maxItems': 1,
++        },
++    },
++    'additionalProperties': False,
++}
+diff --git a/nova/api/openstack/compute/server_checkpoints.py b/nova/api/openstack/compute/server_checkpoints.py
+new file mode 100644
+index 0000000..c482e2b
+--- /dev/null
++++ b/nova/api/openstack/compute/server_checkpoints.py
+@@ -0,0 +1,150 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import functools
++
++import webob
++
++from oslo_utils import uuidutils
++
++from nova.api.openstack.compute.schemas import server_checkpoints as schema
++from nova.api.openstack.compute.views import server_checkpoints as views
++from nova.api.openstack import wsgi
++from nova.api import validation
++from nova.checkpoints import api
++from nova import exception
++
++
++def _http_errors(method):
++    @functools.wraps(method)
++    def wrapped(*args, **kwargs):
++        try:
++            return method(*args, **kwargs)
++        except exception.NotFound:
++            raise webob.exc.HTTPNotFound(
++                explanation='Resource could not be found'
++            ) from None
++        except exception.CheckpointConflict as exc:
++            status = {
++                409: webob.exc.HTTPConflict,
++                413: webob.exc.HTTPRequestEntityTooLarge,
++                503: webob.exc.HTTPServiceUnavailable,
++            }[exc.code]
++            raise status(explanation=exc.format_message()) from None
++
++    return wrapped
++
++
++class ServerCheckpointsController(wsgi.Controller):
++    def __init__(self):
++        super().__init__()
++        self.api = api.API()
++
++    @wsgi.Controller.api_version('2.106')
++    @wsgi.expected_errors((400, 403, 404, 409, 503))
++    @_http_errors
++    @validation.query_schema(schema.empty_query)
++    def capabilities(self, req, server_id):
++        return {
++            'capabilities': self.api.capabilities(
++                req.environ['nova.context'], server_id
++            )
++        }
++
++    @wsgi.Controller.api_version('2.106')
++    @wsgi.expected_errors((400, 403, 404, 503))
++    @_http_errors
++    @validation.query_schema(schema.index_query)
++    def index(self, req, server_id):
++        checkpoints = self.api.list(
++            req.environ['nova.context'],
++            server_id,
++            marker=req.GET.get('marker'),
++            limit=int(req.GET.get('limit', 100)),
++        )
++        return {'checkpoints': [views.checkpoint(cp) for cp in checkpoints]}
++
++    @wsgi.Controller.api_version('2.106')
++    @wsgi.expected_errors((400, 403, 404, 503))
++    @_http_errors
++    @validation.query_schema(schema.empty_query)
++    def show(self, req, server_id, id):
++        return {
++            'checkpoint': views.checkpoint(
++                self.api.get(req.environ['nova.context'], server_id, id)
++            )
++        }
++
++    @wsgi.Controller.api_version('2.106')
++    @wsgi.response(202)
++    @wsgi.expected_errors((400, 403, 404, 409, 413, 503))
++    @_http_errors
++    @validation.query_schema(schema.empty_query)
++    @validation.schema(schema.create)
++    def create(self, req, server_id, body):
++        checkpoint, operation = self.api.create(
++            req.environ['nova.context'], server_id, body['checkpoint']
++        )
++        return {
++            'checkpoint': views.checkpoint(checkpoint),
++            'operation': views.operation(operation),
++        }
++
++    @wsgi.Controller.api_version('2.106')
++    @wsgi.response(202)
++    @wsgi.expected_errors((400, 403, 404, 409, 413, 503))
++    @_http_errors
++    @validation.query_schema(schema.empty_query)
++    @validation.schema(schema.revert)
++    def revert(self, req, server_id, id, body):
++        return {
++            'operation': views.operation(
++                self.api.revert(
++                    req.environ['nova.context'],
++                    server_id,
++                    id,
++                    body['revert']['request_id'],
++                )
++            )
++        }
++
++    @wsgi.Controller.api_version('2.106')
++    @wsgi.response(202)
++    @wsgi.expected_errors((400, 403, 404, 409, 413, 503))
++    @_http_errors
++    @validation.query_schema(schema.empty_query)
++    def delete(self, req, server_id, id):
++        request_id = req.headers.get('OpenStack-Checkpoint-Request-ID')
++        if not request_id or not uuidutils.is_uuid_like(request_id):
++            raise webob.exc.HTTPBadRequest(
++                explanation='OpenStack-Checkpoint-Request-ID must be a UUID'
++            )
++        return {
++            'operation': views.operation(
++                self.api.delete(
++                    req.environ['nova.context'], server_id, id, request_id
++                )
++            )
++        }
++
++    @wsgi.Controller.api_version('2.106')
++    @wsgi.expected_errors((400, 403, 404, 503))
++    @_http_errors
++    @validation.query_schema(schema.empty_query)
++    def operation_show(self, req, server_id, id):
++        return {
++            'operation': views.operation(
++                self.api.operation_get(
++                    req.environ['nova.context'], server_id, id
++                )
++            )
++        }
+diff --git a/nova/api/openstack/compute/views/server_checkpoints.py b/nova/api/openstack/compute/views/server_checkpoints.py
+new file mode 100644
+index 0000000..5f9c139
+--- /dev/null
++++ b/nova/api/openstack/compute/views/server_checkpoints.py
+@@ -0,0 +1,41 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Explicit public projections: never serialize a journal object wholesale."""
++
++
++def _timestamp(value):
++    return value.isoformat() if value else None
++
++
++def checkpoint(value):
++    return dict(
++        id=value.uuid,
++        server_id=value.instance_uuid,
++        name=value.name,
++        status=value.status,
++        created_at=_timestamp(value.created_at),
++        operation_id=value.active_operation_id,
++    )
++
++
++def operation(value):
++    return dict(
++        id=value.uuid,
++        checkpoint_id=value.checkpoint_id,
++        kind=value.kind,
++        state=value.state,
++        phase=value.phase,
++        error_code=value.error_code,
++        created_at=_timestamp(value.created_at),
++        updated_at=_timestamp(value.updated_at),
++    )
+diff --git a/nova/checkpoints/api.py b/nova/checkpoints/api.py
+new file mode 100644
+index 0000000..379f7b3
+--- /dev/null
++++ b/nova/checkpoints/api.py
+@@ -0,0 +1,309 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Cell-aware, project-scoped admission for private checkpoint API 2.106."""
++
++import contextlib
++import uuid
++
++from oslo_utils import uuidutils
++
++from nova.checkpoints import contracts as c
++from nova.checkpoints import quota
++from nova.conductor import api as conductor
++from nova import conf
++from nova import context as nova_context
++from nova import exception
++from nova import objects
++from nova.policies import server_checkpoints as policies
++
++
++class API:
++    def __init__(self, conductor_api=None, ledger=None):
++        self.conductor = conductor_api or conductor.ComputeTaskAPI()
++        self.ledger = ledger or quota.QuotaLedger()
++
++    @contextlib.contextmanager
++    def _server(self, context, instance_uuid, action):
++        try:
++            mapping = objects.InstanceMapping.get_by_instance_uuid(
++                context, instance_uuid
++            )
++            if (
++                not context.project_id or
++                context.project_id != mapping.project_id
++            ):
++                raise exception.NotFound()
++            context.can(
++                policies.POLICY_ROOT % action,
++                target={'project_id': mapping.project_id},
++            )
++            cell = mapping.cell_mapping
++            if cell is None or cell.is_cell0():
++                raise exception.CheckpointUnavailable(
++                    reason='cell_unavailable'
++                )
++            with nova_context.target_cell(context, cell) as ctx:
++                instance = objects.Instance.get_by_uuid(ctx, instance_uuid)
++                if instance.project_id != context.project_id:
++                    raise exception.NotFound()
++                yield ctx, instance, cell
++        except exception.NovaException:
++            raise
++        except Exception:
++            raise exception.CheckpointUnavailable(
++                reason='cell_unavailable'
++            ) from None
++
++    @staticmethod
++    def _checkpoint(context, instance_uuid, checkpoint_id):
++        checkpoint = objects.InstanceCheckpoint.get_by_uuid(
++            context, checkpoint_id
++        )
++        if (
++            checkpoint.instance_uuid != instance_uuid or
++            checkpoint.project_id != context.project_id
++        ):
++            raise exception.NotFound()
++        return checkpoint
++
++    @staticmethod
++    def _key(context, instance_uuid, request_id, kind, payload):
++        return c.RequestKey(
++            context.project_id,
++            instance_uuid,
++            str(uuid.UUID(request_id)),
++            context.user_id,
++            kind,
++            c.canonical_payload_hash(payload),
++        )
++
++    def _probe(self, context, instance_uuid, checkpoint_id=None):
++        try:
++            kwargs = (
++                {}
++                if checkpoint_id is None
++                else {'checkpoint_id': checkpoint_id}
++            )
++            result = self.conductor.checkpoint_probe(
++                context, instance_uuid, **kwargs
++            )
++            return c.validate_probe(result)
++        except exception.CheckpointConflict:
++            raise
++        except Exception:
++            raise exception.CheckpointUnavailable() from None
++
++    @staticmethod
++    def _supported(probe):
++        if probe.supported:
++            return
++        reason = probe.reasons[0]
++        if reason in ('executor_unavailable', 'cell_unavailable'):
++            raise exception.CheckpointUnavailable(reason=reason)
++        raise exception.CheckpointNotSupported(reason=reason)
++
++    def capabilities(self, context, instance_uuid):
++        with self._server(context, instance_uuid, 'capabilities'):
++            probe = (
++                self._probe(context, instance_uuid)
++                if conf.CONF.checkpoint.enabled
++                else c.unsupported('disabled')
++            )
++        return dict(
++            supported=probe.supported,
++            reasons=list(probe.reasons),
++            profile=probe.executor_profile if probe.supported else None,
++        )
++
++    def list(self, context, instance_uuid, marker=None, limit=100):
++        with self._server(context, instance_uuid, 'index') as (
++            ctx,
++            inst,
++            cell,
++        ):
++            return objects.InstanceCheckpointList.get_by_instance_uuid(
++                ctx, instance_uuid, marker=marker, limit=limit
++            )
++
++    def get(self, context, instance_uuid, checkpoint_id):
++        with self._server(context, instance_uuid, 'show') as (ctx, inst, cell):
++            checkpoint = self._checkpoint(ctx, instance_uuid, checkpoint_id)
++            if checkpoint.status == 'deleted':
++                raise exception.NotFound()
++            return checkpoint
++
++    def operation_get(self, context, instance_uuid, operation_id):
++        with self._server(context, instance_uuid, 'operation_show') as (
++            ctx,
++            inst,
++            cell,
++        ):
++            operation = objects.InstanceCheckpointOperation.get_by_uuid(
++                ctx, operation_id
++            )
++            if (
++                operation.instance_uuid != instance_uuid or
++                operation.project_id != context.project_id
++            ):
++                raise exception.NotFound()
++            return operation
++
++    def _finish_admission(self, context, cell, operation):
++        if operation.state in ('succeeded', 'released', 'failed'):
++            return operation
++        if not operation.quota_ready:
++            if operation.kind == 'create':
++                self.ledger.confirm(context, operation.quota_ticket_id)
++            else:
++                ticket = self.ledger.get(context, operation.quota_ticket_id)
++                with nova_context.target_cell(context, cell) as ctx:
++                    checkpoint = self._checkpoint(
++                        ctx, operation.instance_uuid, operation.checkpoint_id
++                    )
++                if (
++                    ticket.operation_id != checkpoint.create_operation_id or
++                    ticket.state != 'confirmed' or
++                    ticket.project_id != operation.project_id or
++                    ticket.instance_uuid != operation.instance_uuid or
++                    ticket.checkpoint_id != operation.checkpoint_id or
++                    ticket.cell_uuid != cell.uuid
++                ):
++                    raise exception.CheckpointConflict(
++                        reason='operation_conflict'
++                    )
++            with nova_context.target_cell(context, cell) as ctx:
++                objects.InstanceCheckpointOperation.mark_quota_ready(
++                    ctx, operation.uuid, operation.quota_ticket_id
++                )
++                operation = objects.InstanceCheckpointOperation.get_by_uuid(
++                    ctx, operation.uuid
++                )
++        try:
++            self.conductor.checkpoint_run(
++                context,
++                operation.instance_uuid,
++                operation.uuid,
++                operation.generation,
++            )
++        except Exception:
++            # Durable acceptance is not cancelled by a lost dispatch reply.
++            # Reconciliation will read this exact operation/step journal.
++            pass
++        return operation
++
++    def create(self, context, instance_uuid, body):
++        payload = dict(name=body.get('name', ''), include_memory=True)
++        with self._server(context, instance_uuid, 'create') as (
++            ctx,
++            inst,
++            cell,
++        ):
++            key = self._key(
++                context, instance_uuid, body['request_id'], 'create', payload
++            )
++            operation = objects.InstanceCheckpointOperation.find_request(
++                ctx, key.to_primitive()
++            )
++            if operation is None:
++                if not conf.CONF.checkpoint.enabled:
++                    raise exception.CheckpointNotSupported(reason='disabled')
++                probe = self._probe(context, instance_uuid)
++                self._supported(probe)
++                manifest = probe.to_primitive()['device_manifest']
++                admission = c.Admission(
++                    key,
++                    uuidutils.generate_uuid(),
++                    uuidutils.generate_uuid(),
++                    cell.uuid,
++                    manifest['host'],
++                    manifest['node'],
++                    probe.fingerprint,
++                    manifest,
++                    probe.artifact_upper_bound,
++                    probe.executor_id,
++                    name=payload['name'],
++                )
++                ticket = self.ledger.reserve(context, admission)
++                # A concurrent request may have won the unique ticket key.
++                admission = c.Admission.from_primitive(ticket.admission)
++                if (
++                    ticket.cell_uuid != cell.uuid or
++                    admission.cell_uuid != cell.uuid
++                ):
++                    raise exception.CheckpointConflict(
++                        reason='identity_changed'
++                    )
++                try:
++                    operation = objects.InstanceCheckpointOperation.admit(
++                        ctx, admission.to_primitive(), ticket.id
++                    )
++                except (exception.CheckpointConflict, exception.NotFound):
++                    objects.InstanceCheckpointOperation.cancel_admission(
++                        ctx, admission.to_primitive()
++                    )
++                    self.ledger.release(context, ticket.id)
++                    raise
++            operation = self._finish_admission(context, cell, operation)
++            checkpoint = self._checkpoint(
++                ctx, instance_uuid, operation.checkpoint_id
++            )
++            return checkpoint, operation
++
++    def _existing(
++        self, context, instance_uuid, checkpoint_id, request_id, kind
++    ):
++        with self._server(context, instance_uuid, kind) as (ctx, inst, cell):
++            key = self._key(
++                context,
++                instance_uuid,
++                request_id,
++                kind,
++                {'checkpoint_id': checkpoint_id},
++            )
++            operation = objects.InstanceCheckpointOperation.find_request(
++                ctx, key.to_primitive()
++            )
++            if operation is None:
++                checkpoint = self._checkpoint(
++                    ctx, instance_uuid, checkpoint_id
++                )
++                probe = self._probe(context, instance_uuid, checkpoint_id)
++                self._supported(probe)
++                manifest = probe.to_primitive()['device_manifest']
++                admission = c.Admission(
++                    key,
++                    uuidutils.generate_uuid(),
++                    checkpoint_id,
++                    cell.uuid,
++                    manifest['host'],
++                    manifest['node'],
++                    probe.fingerprint,
++                    manifest,
++                    checkpoint.artifact_upper_bound,
++                    probe.executor_id,
++                    name=checkpoint.name,
++                )
++                operation = objects.InstanceCheckpointOperation.admit(
++                    ctx, admission.to_primitive(), checkpoint.quota_ticket_id
++                )
++            return self._finish_admission(context, cell, operation)
++
++    def revert(self, context, instance_uuid, checkpoint_id, request_id):
++        return self._existing(
++            context, instance_uuid, checkpoint_id, request_id, 'revert'
++        )
++
++    def delete(self, context, instance_uuid, checkpoint_id, request_id):
++        return self._existing(
++            context, instance_uuid, checkpoint_id, request_id, 'delete'
++        )
+diff --git a/nova/checkpoints/coordinator.py b/nova/checkpoints/coordinator.py
+index d4d27d7..87512f5 100644
+--- a/nova/checkpoints/coordinator.py
++++ b/nova/checkpoints/coordinator.py
+@@ -35,13 +35,22 @@ class Coordinator:
+             raise exception.CheckpointUnavailable(reason='cell_unavailable')
+         return mapping.cell_mapping
+ 
+-    def probe(self, context, instance_uuid):
+-        if not conf.CONF.checkpoint.enabled:
++    def probe(self, context, instance_uuid, checkpoint_id=None):
++        if checkpoint_id is None and not conf.CONF.checkpoint.enabled:
+             return c.unsupported('disabled')
+         try:
+             cell = self._cell(context, instance_uuid)
+             with nova_context.target_cell(context, cell) as ctx:
+                 instance = objects.Instance.get_by_uuid(ctx, instance_uuid)
++                if checkpoint_id is not None:
++                    checkpoint = objects.InstanceCheckpoint.get_by_uuid(
++                        ctx, checkpoint_id
++                    )
++                    if (
++                        checkpoint.instance_uuid != instance_uuid or
++                        checkpoint.status != 'available'
++                    ):
++                        return c.unsupported('invalid_state')
+                 service = objects.Service.get_by_host_and_binary(
+                     ctx, instance.host, 'nova-compute'
+                 )
+@@ -51,8 +60,11 @@ class Coordinator:
+                     ctx, instance_uuid
+                 )
+                 # A supported version cap is not a positive live probe.
++                kwargs = {} if checkpoint_id is None else {'existing': True}
+                 probe = c.validate_probe(
+-                    self.compute_rpc.checkpoint_probe(ctx, instance, manifest)
++                    self.compute_rpc.checkpoint_probe(
++                        ctx, instance, manifest, **kwargs
++                    )
+                 )
+                 if probe.supported and probe.fingerprint != (
+                     c.device_fingerprint(manifest)
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 839b85d..e495c49 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -12277,10 +12277,10 @@ class ComputeManager(manager.Manager):
+                       "%(profile)s", {'port_id': port_id,
+                                       'profile': profile})
+ 
+-    def checkpoint_probe(self, context, instance, manifest):
++    def checkpoint_probe(self, context, instance, manifest, existing=False):
+         return checkpoint_compute.ComputeExecutor(
+             self.driver, host=self.host).probe(
+-                context, instance, manifest).to_primitive()
++                context, instance, manifest, existing=existing).to_primitive()
+ 
+     def checkpoint_execute(self, context, instance, operation_id, generation):
+         checkpoint_compute.ComputeExecutor(
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index 18db153..594f7bf 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -1595,9 +1595,11 @@ class ComputeAPI(object):
+         return client.prepare(server=_compute_host(None, instance),
+                               version='6.5')
+ 
+-    def checkpoint_probe(self, context, instance, manifest):
++    def checkpoint_probe(self, context, instance, manifest, existing=False):
++        kwargs = {'existing': True} if existing else {}
+         return self._checkpoint_client(context, instance).call(
+-            context, 'checkpoint_probe', instance=instance, manifest=manifest)
++            context, 'checkpoint_probe', instance=instance, manifest=manifest,
++            **kwargs)
+ 
+     def checkpoint_execute(self, context, instance, operation_id, generation):
+         return self._checkpoint_client(context, instance).call(
+diff --git a/nova/conductor/api.py b/nova/conductor/api.py
+index 0aada3e..f42e4c5 100644
+--- a/nova/conductor/api.py
++++ b/nova/conductor/api.py
+@@ -189,9 +189,9 @@ class ComputeTaskAPI(object):
+         self.conductor_compute_rpcapi.revert_snapshot_based_resize(
+             ctxt, instance, migration)
+ 
+-    def checkpoint_probe(self, context, instance_uuid):
++    def checkpoint_probe(self, context, instance_uuid, checkpoint_id=None):
+         return self.conductor_compute_rpcapi.checkpoint_probe(
+-            context, instance_uuid)
++            context, instance_uuid, checkpoint_id=checkpoint_id)
+ 
+     def checkpoint_run(self, context, instance_uuid, operation_id, generation):
+         self.conductor_compute_rpcapi.checkpoint_run(
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index 4845c51..3a40aab 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -2235,9 +2235,9 @@ class ComputeTaskManager:
+             context, instance, migration, self.notifier, self.compute_rpcapi)
+         task.execute()
+ 
+-    def checkpoint_probe(self, context, instance_uuid):
++    def checkpoint_probe(self, context, instance_uuid, checkpoint_id=None):
+         return checkpoint_coordinator.Coordinator().probe(
+-            context, instance_uuid).to_primitive()
++            context, instance_uuid, checkpoint_id=checkpoint_id).to_primitive()
+ 
+     def checkpoint_run(self, context, instance_uuid, operation_id, generation):
+         checkpoint_coordinator.Coordinator().run(
+diff --git a/nova/conductor/rpcapi.py b/nova/conductor/rpcapi.py
+index ed237e1..ea6b909 100644
+--- a/nova/conductor/rpcapi.py
++++ b/nova/conductor/rpcapi.py
+@@ -504,9 +504,11 @@ class ComputeTaskAPI(object):
+                 reason='incompatible_service')
+         return self.client.prepare(version='1.26')
+ 
+-    def checkpoint_probe(self, context, instance_uuid):
++    def checkpoint_probe(self, context, instance_uuid, checkpoint_id=None):
++        kwargs = {} if checkpoint_id is None else {
++            'checkpoint_id': checkpoint_id}
+         return self._checkpoint_client().call(
+-            context, 'checkpoint_probe', instance_uuid=instance_uuid)
++            context, 'checkpoint_probe', instance_uuid=instance_uuid, **kwargs)
+ 
+     def checkpoint_run(self, context, instance_uuid, operation_id, generation):
+         self._checkpoint_client().cast(
+diff --git a/nova/policies/__init__.py b/nova/policies/__init__.py
+index 46e643c..942e2df 100644
+--- a/nova/policies/__init__.py
++++ b/nova/policies/__init__.py
+@@ -51,6 +51,7 @@ from nova.policies import quota_sets
+ from nova.policies import remote_consoles
+ from nova.policies import rescue
+ from nova.policies import security_groups
++from nova.policies import server_checkpoints
+ from nova.policies import server_diagnostics
+ from nova.policies import server_external_events
+ from nova.policies import server_groups
+@@ -111,6 +112,7 @@ def list_rules():
+         remote_consoles.list_rules(),
+         rescue.list_rules(),
+         security_groups.list_rules(),
++        server_checkpoints.list_rules(),
+         server_diagnostics.list_rules(),
+         server_external_events.list_rules(),
+         server_groups.list_rules(),
+diff --git a/nova/policies/server_checkpoints.py b/nova/policies/server_checkpoints.py
+new file mode 100644
+index 0000000..0c2f8cf
+--- /dev/null
++++ b/nova/policies/server_checkpoints.py
+@@ -0,0 +1,42 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from oslo_policy import policy
++
++from nova.policies import base
++
++POLICY_ROOT = 'os_compute_api:server_checkpoints:%s'
++
++_ACTIONS = (
++    ('capabilities', 'GET', '/checkpoint-capabilities', False),
++    ('index', 'GET', '/checkpoints', False),
++    ('show', 'GET', '/checkpoints/{checkpoint_id}', False),
++    ('create', 'POST', '/checkpoints', True),
++    ('revert', 'POST', '/checkpoints/{checkpoint_id}/action', True),
++    ('delete', 'DELETE', '/checkpoints/{checkpoint_id}', True),
++    ('operation_show', 'GET', '/checkpoint-operations/{operation_id}', False),
++)
++
++
++def list_rules():
++    return [
++        policy.DocumentedRuleDefault(
++            name=POLICY_ROOT % action,
++            check_str=base.PROJECT_MEMBER if write else base.PROJECT_READER,
++            description='Private server checkpoint %s' % action,
++            operations=[
++                {'method': method, 'path': '/servers/{server_id}' + path}
++            ],
++            scope_types=['project'],
++        )
++        for action, method, path, write in _ACTIONS
++    ]
+diff --git a/nova/tests/unit/api/openstack/compute/test_server_checkpoints.py b/nova/tests/unit/api/openstack/compute/test_server_checkpoints.py
+new file mode 100644
+index 0000000..705ab69
+--- /dev/null
++++ b/nova/tests/unit/api/openstack/compute/test_server_checkpoints.py
+@@ -0,0 +1,250 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import ddt
++import fixtures
++from oslo_serialization import jsonutils
++from oslo_utils.fixture import uuidsentinel as uuids
++import webob
++
++from nova.checkpoints import contracts as c
++from nova import objects
++from nova.tests.unit.api.openstack import fakes
++from nova.tests.unit.checkpoints import test_api
++
++
++@ddt.ddt
++class ServerCheckpointsTest(test_api.APIFixture):
++    def setUp(self):
++        super().setUp()
++        self.useFixture(
++            fixtures.MockPatch(
++                'nova.checkpoints.api.API', return_value=self.api
++            )
++        )
++        self.app = fakes.wsgi_app_v21(fake_auth_context=self.ctx)
++
++    def request(
++        self, method, suffix, body=None, version='2.106', headers=None
++    ):
++        req = webob.Request.blank(
++            '/v2.1/servers/%s/%s' % (uuids.instance, suffix)
++        )
++        req.method = method
++        req.headers['OpenStack-API-Version'] = 'compute ' + version
++        if headers:
++            req.headers.update(headers)
++        if body is not None:
++            req.content_type = 'application/json'
++            req.body = jsonutils.dump_as_bytes(body)
++        return req.get_response(self.app)
++
++    @ddt.data(
++        ('GET', 'checkpoint-capabilities'),
++        ('GET', 'checkpoints'),
++        ('POST', 'checkpoints'),
++        ('GET', 'checkpoints/{id}'),
++        ('DELETE', 'checkpoints/{id}'),
++        ('POST', 'checkpoints/{id}/action'),
++        ('GET', 'checkpoint-operations/{id}'),
++    )
++    @ddt.unpack
++    def test_old_microversion_has_no_routes(self, method, path):
++        response = self.request(
++            method, path.format(id=uuids.cp), version='2.105'
++        )
++        self.assertEqual(404, response.status_int, response.text)
++
++    @ddt.data(
++        {'include_memory': False},
++        {'quiesce': True},
++        {'disks': []},
++        {'target_state': 'SHUTOFF'},
++        {'extra': 1},
++        {'name': 'x' * 256},
++        {'request_id': 'invalid'},
++    )
++    def test_strict_create_schema(self, extra):
++        body = dict(request_id=uuids.request)
++        body.update(extra)
++        response = self.request('POST', 'checkpoints', {'checkpoint': body})
++        self.assertEqual(400, response.status_int, response.text)
++        self.task_rpc.checkpoint_probe.assert_not_called()
++
++    @ddt.data(None, '', 'invalid')
++    def test_delete_requires_uuid_header(self, value):
++        headers = (
++            {} if value is None else {'OpenStack-Checkpoint-Request-ID': value}
++        )
++        response = self.request(
++            'DELETE', 'checkpoints/' + uuids.cp, headers=headers
++        )
++        self.assertEqual(400, response.status_int, response.text)
++
++    @ddt.data(
++        'checkpoints?limit=0',
++        'checkpoints?limit=1001',
++        'checkpoints?unknown=1',
++        'checkpoint-capabilities?unknown=1',
++    )
++    def test_strict_query_schema(self, path):
++        response = self.request('GET', path)
++        self.assertEqual(400, response.status_int, response.text)
++
++    def test_seven_routes_lifecycle_and_safe_response_fields(self):
++        response = self.request('GET', 'checkpoint-capabilities')
++        self.assertEqual(200, response.status_int, response.text)
++        self.assertTrue(response.json['capabilities']['supported'])
++        response = self.request(
++            'POST',
++            'checkpoints',
++            {'checkpoint': {'request_id': uuids.request, 'name': 'A'}},
++        )
++        self.assertEqual(202, response.status_int, response.text)
++        cp = response.json['checkpoint']['id']
++        op = response.json['operation']['id']
++        self.complete(self.api.operation_get(self.ctx, uuids.instance, op))
++        for path in (
++            'checkpoints',
++            'checkpoints/' + cp,
++            'checkpoint-operations/' + op,
++        ):
++            response = self.request('GET', path)
++            self.assertEqual(200, response.status_int, response.text)
++            for forbidden in (
++                'compute',
++                'node',
++                'token',
++                'manifest',
++                'connection_info',
++                'logical_id',
++                'evidence',
++            ):
++                self.assertNotIn(forbidden, response.text)
++        response = self.request(
++            'POST',
++            'checkpoints/%s/action' % cp,
++            {'revert': {'request_id': uuids.revert_request}},
++        )
++        self.assertEqual(202, response.status_int, response.text)
++        self.complete(
++            self.api.operation_get(
++                self.ctx, uuids.instance, response.json['operation']['id']
++            )
++        )
++        response = self.request(
++            'DELETE',
++            'checkpoints/' + cp,
++            headers={'OpenStack-Checkpoint-Request-ID': uuids.delete_request},
++        )
++        self.assertEqual(202, response.status_int, response.text)
++        deleted_op = response.json['operation']['id']
++        self.complete(
++            self.api.operation_get(self.ctx, uuids.instance, deleted_op)
++        )
++        response = self.request('GET', 'checkpoint-operations/' + deleted_op)
++        self.assertEqual(200, response.status_int, response.text)
++        self.assertEqual('released', response.json['operation']['state'])
++
++    @ddt.data(True, None)
++    def test_create_memory_true_or_default(self, include_memory):
++        body = dict(request_id=uuids.request)
++        if include_memory is not None:
++            body['include_memory'] = include_memory
++        response = self.request('POST', 'checkpoints', {'checkpoint': body})
++        self.assertEqual(202, response.status_int, response.text)
++
++    @ddt.data(
++        {},
++        {'revert': {}},
++        {'revert': {'request_id': 'bad'}},
++        {
++            'revert': {
++                'request_id': 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa',
++                'target_state': 'SHUTOFF',
++            }
++        },
++    )
++    def test_strict_revert_schema(self, body):
++        response = self.request(
++            'POST', 'checkpoints/%s/action' % uuids.cp, body
++        )
++        self.assertEqual(400, response.status_int, response.text)
++
++    def test_missing_request_id_is_400(self):
++        response = self.request('POST', 'checkpoints', {'checkpoint': {}})
++        self.assertEqual(400, response.status_int, response.text)
++
++    def test_pagination_and_deleted_checkpoint_visibility(self):
++        first, op = self.create()
++        self.complete(op)
++        second, op = self.create(request_id=uuids.request2)
++        self.complete(op)
++        response = self.request('GET', 'checkpoints?limit=1')
++        self.assertEqual(
++            [first.uuid], [c['id'] for c in response.json['checkpoints']]
++        )
++        response = self.request(
++            'GET', 'checkpoints?limit=1000&marker=' + first.uuid
++        )
++        self.assertEqual(
++            [second.uuid], [c['id'] for c in response.json['checkpoints']]
++        )
++        deletion = self.api.delete(
++            self.ctx, uuids.instance, first.uuid, uuids.delete_request
++        )
++        self.complete(deletion)
++        response = self.request('GET', 'checkpoints/' + first.uuid)
++        self.assertEqual(404, response.status_int, response.text)
++        response = self.request('GET', 'checkpoints')
++        self.assertEqual(
++            [second.uuid], [c['id'] for c in response.json['checkpoints']]
++        )
++
++    @ddt.data(
++        ('disabled', 409),
++        ('quota', 413),
++        ('foreign', 404),
++        ('cell', 503),
++        ('reader', 403),
++        ('executor', 409),
++    )
++    @ddt.unpack
++    def test_public_error_statuses(self, case, code):
++        if case == 'disabled':
++            self.flags(enabled=False, group='checkpoint')
++        elif case == 'quota':
++            self.flags(max_artifact_bytes_per_project=0, group='checkpoint')
++        elif case == 'foreign':
++            self.ctx.project_id = 'foreign'
++        elif case == 'reader':
++            self.ctx.roles = ['reader']
++        elif case == 'executor':
++            self.task_rpc.checkpoint_probe.side_effect = None
++            self.task_rpc.checkpoint_probe.return_value = c.unsupported(
++                'executor_unsupported'
++            ).to_primitive()
++        else:
++            self.useFixture(
++                fixtures.MockPatchObject(
++                    objects.Instance,
++                    'get_by_uuid',
++                    side_effect=TimeoutError('private-backend-secret'),
++                )
++            )
++        response = self.request(
++            'POST',
++            'checkpoints',
++            {'checkpoint': {'request_id': uuids.request}},
++        )
++        self.assertEqual(code, response.status_int, response.text)
++        self.assertNotIn('private-backend-secret', response.text)
+diff --git a/nova/tests/unit/checkpoints/test_api.py b/nova/tests/unit/checkpoints/test_api.py
+new file mode 100644
+index 0000000..214cc9d
+--- /dev/null
++++ b/nova/tests/unit/checkpoints/test_api.py
+@@ -0,0 +1,371 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from unittest import mock
++
++import ddt
++from oslo_utils.fixture import uuidsentinel as uuids
++
++from nova.checkpoints import compute
++from nova.checkpoints import coordinator
++from nova.checkpoints import quota
++from nova import context
++from nova.db.api import checkpoints as quota_db
++from nova.db.main import api as db_api
++from nova.db.main import checkpoints as db
++from nova import exception
++from nova import objects
++from nova import test
++from nova.tests import fixtures
++from nova.tests.unit.checkpoints import fake_executor
++from nova.tests.unit.checkpoints import test_cell_db
++
++
++class APIFixture(test.TestCase):
++    NUMBER_OF_CELLS = 2
++
++    def setUp(self):
++        super().setUp()
++        from nova.checkpoints import api
++
++        self.flags(
++            enabled=True,
++            max_artifact_bytes_per_project=16384,
++            group='checkpoint',
++        )
++        self.useFixture(fixtures.RealPolicyFixture())
++        self.ctx = context.RequestContext(
++            'actor', 'project', roles=['member', 'reader']
++        )
++        self.cell = self.cell_mappings['cell1']
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            test_cell_db.make_instance(ctx)
++            objects.Service(
++                ctx, host='compute', binary='nova-compute', topic='compute'
++            ).create()
++        objects.InstanceMapping(
++            self.ctx,
++            instance_uuid=uuids.instance,
++            cell_mapping=self.cell,
++            project_id='project',
++        ).create()
++        self.driver = fake_executor.FakeCheckpointDriver()
++        self.executor = compute.ComputeExecutor(self.driver, 'compute')
++        self.compute_rpc = mock.Mock()
++        self.compute_rpc.checkpoint_probe.side_effect = lambda *a, **kw: (
++            self.executor.probe(*a, **kw).to_primitive()
++        )
++        self.compute_rpc.checkpoint_execute.side_effect = self.executor.execute
++        self.ledger = quota.QuotaLedger()
++        self.coordinator = coordinator.Coordinator(
++            self.compute_rpc, self.ledger
++        )
++        self.task_rpc = mock.Mock()
++        self.task_rpc.checkpoint_probe.side_effect = lambda *a, **kw: (
++            self.coordinator.probe(*a, **kw).to_primitive()
++        )
++        self.api = api.API(conductor_api=self.task_rpc, ledger=self.ledger)
++
++    def create(self, request_id=uuids.request, **kw):
++        return self.api.create(
++            self.ctx, uuids.instance, dict(request_id=request_id, **kw)
++        )
++
++    def complete(self, op):
++        self.coordinator.run(self.ctx, op.instance_uuid, op.uuid, 1)
++
++    def usage(self):
++        return quota_db.get_usage(self.ctx, 'project')
++
++
++@ddt.ddt
++class CheckpointAPITest(APIFixture):
++    def test_exact_replay_after_disabled_returns_durable_operation(self):
++        cp, op = self.create(name='A')
++        self.assertTrue(op.quota_ready)
++        self.flags(enabled=False, group='checkpoint')
++        cp2, op2 = self.create(name='A', include_memory=True)
++        self.assertEqual((cp.uuid, op.uuid), (cp2.uuid, op2.uuid))
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++        self.assertEqual(1, self.task_rpc.checkpoint_probe.call_count)
++
++    def test_replay_actor_and_payload_are_not_transferable(self):
++        cp, op = self.create(name='A')
++        other = context.RequestContext(
++            'other', 'project', roles=['member', 'reader']
++        )
++        self.assertRaises(
++            exception.NotFound,
++            self.api.create,
++            other,
++            uuids.instance,
++            dict(name='A', request_id=uuids.request),
++        )
++        self.assertRaises(exception.CheckpointConflict, self.create, name='B')
++        self.assertRaises(
++            exception.CheckpointConflict,
++            self.api.delete,
++            self.ctx,
++            uuids.instance,
++            cp.uuid,
++            uuids.request,
++        )
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++
++    def test_disabled_create_does_not_probe_or_charge(self):
++        self.flags(enabled=False, group='checkpoint')
++        self.assertRaises(exception.CheckpointNotSupported, self.create)
++        self.task_rpc.checkpoint_probe.assert_not_called()
++        self.assertEqual(0, self.usage()['checkpoint_count'])
++
++    def test_reader_denied_before_probe(self):
++        self.ctx.roles = ['reader']
++        self.assertRaises(exception.PolicyNotAuthorized, self.create)
++        self.task_rpc.checkpoint_probe.assert_not_called()
++
++    def test_foreign_project_admin_cannot_read_or_charge(self):
++        self.ctx = context.RequestContext(
++            'admin',
++            'foreign',
++            is_admin=True,
++            roles=['admin', 'member', 'reader'],
++        )
++        self.assertRaises(exception.NotFound, self.create)
++        self.task_rpc.checkpoint_probe.assert_not_called()
++
++    def test_admin_does_not_bypass_ordinary_guard(self):
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            db.guard_acquire(ctx, uuids.instance, 'stop')
++        self.ctx.is_admin = True
++        self.assertRaises(exception.CheckpointConflict, self.create)
++        self.assertEqual(0, self.usage()['checkpoint_count'])
++
++    @ddt.data('bdm', 'host', 'key', 'network')
++    def test_probe_then_db_fingerprint_change_aborts_ticket(self, change):
++        def probe(*args, **kwargs):
++            result = self.coordinator.probe(*args, **kwargs)
++            with context.target_cell(self.ctx, self.cell) as ctx:
++                if change == 'bdm':
++                    bdm = (
++                        objects.BlockDeviceMapping.get_by_volume_and_instance(
++                            ctx, uuids.volume, uuids.instance
++                        )
++                    )
++                    db_api.block_device_mapping_update(
++                        ctx, bdm.id, {'disk_bus': 'scsi'}
++                    )
++                elif change == 'host':
++                    db_api.instance_update(
++                        ctx, uuids.instance, {'host': 'moved'}
++                    )
++                elif change == 'key':
++                    db_api.instance_update(
++                        ctx,
++                        uuids.instance,
++                        {'key_data': 'different-public-key'},
++                    )
++                else:
++                    db_api.virtual_interface_create(
++                        ctx,
++                        dict(
++                            uuid=uuids.port,
++                            instance_uuid=uuids.instance,
++                            address='fa:16:3e:aa:bb:cc',
++                        ),
++                    )
++            return result.to_primitive()
++
++        self.task_rpc.checkpoint_probe.side_effect = probe
++        self.assertRaises(exception.CheckpointConflict, self.create)
++        self.assertEqual(0, self.usage()['checkpoint_count'])
++        self.assertEqual([], self.driver.executed)
++
++    def test_delete_disabled_replay_and_operation_tombstone(self):
++        cp, op = self.create()
++        self.complete(op)
++        self.flags(enabled=False, group='checkpoint')
++        deletion = self.api.delete(
++            self.ctx, uuids.instance, cp.uuid, uuids.delete_request
++        )
++        self.complete(deletion)
++        replay = self.api.delete(
++            self.ctx, uuids.instance, cp.uuid, uuids.delete_request
++        )
++        self.assertEqual(deletion.uuid, replay.uuid)
++        self.assertEqual(
++            'released',
++            self.api.operation_get(
++                self.ctx, uuids.instance, deletion.uuid
++            ).state,
++        )
++        self.assertEqual(0, self.usage()['checkpoint_count'])
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            db_api.instance_destroy(ctx, uuids.instance)
++        self.assertRaises(
++            exception.InstanceNotFound,
++            self.api.operation_get,
++            self.ctx,
++            uuids.instance,
++            deletion.uuid,
++        )
++
++    @ddt.data(None, 'cell0')
++    def test_unassigned_cell_or_cell0_is_not_empty_success(self, cell):
++        mapping = objects.InstanceMapping.get_by_instance_uuid(
++            self.ctx, uuids.instance
++        )
++        if cell:
++            mapping.cell_mapping = self.cell_mappings[cell]
++            mapping.save()
++        else:
++            objects.InstanceMapping._save_in_db(
++                self.ctx, uuids.instance, {'cell_id': None}
++            )
++        self.assertRaises(
++            exception.CheckpointUnavailable,
++            self.api.list,
++            self.ctx,
++            uuids.instance,
++        )
++
++    def test_wrong_server_marker_not_visible(self):
++        cp, op = self.create()
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            test_cell_db.make_instance(
++                ctx, uuids.other, uuids.bdm2, uuids.vol2
++            )
++        objects.InstanceMapping(
++            self.ctx,
++            instance_uuid=uuids.other,
++            cell_mapping=self.cell,
++            project_id='project',
++        ).create()
++        self.assertRaises(
++            exception.NotFound,
++            self.api.list,
++            self.ctx,
++            uuids.other,
++            marker=cp.uuid,
++        )
++
++    def test_uppercase_request_uuid_replays_same_operation(self):
++        cp, op = self.create()
++        other_cp, other_op = self.create(request_id=uuids.request.upper())
++        self.assertEqual((cp.uuid, op.uuid), (other_cp.uuid, other_op.uuid))
++
++    def test_lost_admit_reply_retains_ticket_and_replay_finishes_confirmation(
++        self,
++    ):
++        admit = objects.InstanceCheckpointOperation.admit
++
++        def lost_reply(*args):
++            admit(*args)
++            raise TimeoutError('reply lost')
++
++        with mock.patch.object(
++            objects.InstanceCheckpointOperation,
++            'admit',
++            side_effect=lost_reply,
++        ):
++            self.assertRaises(exception.CheckpointUnavailable, self.create)
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++        cp, op = self.create()
++        self.assertTrue(op.quota_ready)
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++
++    def test_conductor_dispatch_loss_does_not_cancel_accepted_operation(self):
++        self.task_rpc.checkpoint_run.side_effect = TimeoutError(
++            'dispatch lost'
++        )
++        cp, op = self.create()
++        self.assertTrue(op.quota_ready)
++        self.assertEqual(1, self.usage()['checkpoint_count'])
++        self.assertEqual('creating', cp.status)
++
++    def test_cell_unavailable_is_not_empty_list(self):
++        with mock.patch.object(
++            objects.Instance,
++            'get_by_uuid',
++            side_effect=TimeoutError('cell private detail'),
++        ):
++            self.assertRaises(
++                exception.CheckpointUnavailable,
++                self.api.list,
++                self.ctx,
++                uuids.instance,
++            )
++
++    def test_existing_operation_rejects_wrong_ticket_binding_before_effect(
++        self,
++    ):
++        cp, op = self.create()
++        self.complete(op)
++        ticket = self.ledger.get(self.ctx, op.quota_ticket_id)
++        ticket.instance_uuid = uuids.other
++        before = list(self.driver.executed)
++        with mock.patch.object(self.ledger, 'get', return_value=ticket):
++            self.assertRaises(
++                exception.CheckpointConflict,
++                self.api.delete,
++                self.ctx,
++                uuids.instance,
++                cp.uuid,
++                uuids.delete_request,
++            )
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            operation = objects.InstanceCheckpointOperation.get_by_uuid(
++                ctx, db.guard_get(ctx, uuids.instance)['operation_id']
++            )
++            self.assertFalse(operation.quota_ready)
++        self.assertEqual(before, self.driver.executed)
++
++    def test_winning_ticket_in_other_cell_not_admitted_here(self):
++        reserve = self.ledger.reserve
++
++        def other_cell(context, admission):
++            ticket = reserve(context, admission)
++            ticket.cell_uuid = self.cell_mappings['cell2'].uuid
++            return ticket
++
++        with mock.patch.object(self.ledger, 'reserve', side_effect=other_cell):
++            self.assertRaises(exception.CheckpointConflict, self.create)
++        with context.target_cell(self.ctx, self.cell) as ctx:
++            self.assertEqual(
++                [],
++                list(
++                    objects.InstanceCheckpointList.get_by_instance_uuid(
++                        ctx, uuids.instance
++                    )
++                ),
++            )
++
++    def test_original_create_ticket_operation_must_match_checkpoint(self):
++        cp, op = self.create()
++        self.complete(op)
++        ticket = self.ledger.get(self.ctx, op.quota_ticket_id)
++        ticket.operation_id = uuids.other_operation
++        with mock.patch.object(self.ledger, 'get', return_value=ticket):
++            self.assertRaises(
++                exception.CheckpointConflict,
++                self.api.delete,
++                self.ctx,
++                uuids.instance,
++                cp.uuid,
++                uuids.delete_request,
++            )
++
++    def test_system_context_rejected_before_request_key(self):
++        self.ctx = context.RequestContext(
++            'system-admin', roles=['admin'], system_scope='all'
++        )
++        self.assertRaises(exception.NotFound, self.create)
++        self.task_rpc.checkpoint_probe.assert_not_called()
+diff --git a/nova/tests/unit/policies/test_server_checkpoints.py b/nova/tests/unit/policies/test_server_checkpoints.py
+new file mode 100644
+index 0000000..df82e31
+--- /dev/null
++++ b/nova/tests/unit/policies/test_server_checkpoints.py
+@@ -0,0 +1,52 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import ddt
++
++from nova import context
++from nova import exception
++from nova import test
++from nova.tests import fixtures
++
++
++@ddt.ddt
++class ServerCheckpointPolicyTest(test.NoDBTestCase):
++    def setUp(self):
++        super().setUp()
++        self.useFixture(fixtures.RealPolicyFixture())
++
++    @ddt.data('capabilities', 'index', 'show', 'operation_show')
++    def test_reader_allowed_in_project_only(self, action):
++        ctx = context.RequestContext('reader', 'project', roles=['reader'])
++        name = 'os_compute_api:server_checkpoints:' + action
++        self.assertTrue(ctx.can(name, target={'project_id': 'project'}))
++        self.assertRaises(
++            exception.PolicyNotAuthorized,
++            ctx.can,
++            name,
++            target={'project_id': 'other'},
++        )
++
++    @ddt.data('create', 'revert', 'delete')
++    def test_member_required_in_project(self, action):
++        name = 'os_compute_api:server_checkpoints:' + action
++        member = context.RequestContext(
++            'member', 'project', roles=['member', 'reader']
++        )
++        reader = context.RequestContext('reader', 'project', roles=['reader'])
++        self.assertTrue(member.can(name, target={'project_id': 'project'}))
++        self.assertRaises(
++            exception.PolicyNotAuthorized,
++            reader.can,
++            name,
++            target={'project_id': 'project'},
++        )
